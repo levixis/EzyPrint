@@ -1,0 +1,19 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    
+    // Specific rules for the orders path
+    match /orders/{userId}/{orderId}/{fileName} {
+      // Allow students to upload files only to their own order folder
+      allow write: if request.auth != null && request.auth.uid == userId;
+
+      // Allow authenticated users to read (shop owner logic handled in app)
+      allow read: if request.auth != null;
+    }
+
+    // Deny all other paths by default
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

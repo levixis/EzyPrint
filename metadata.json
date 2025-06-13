@@ -1,0 +1,6 @@
+{
+  "name": "EzyPrint",
+  "description": "A web application for students to upload documents for printing, make payments, and track their orders. Printing shop staff can manage incoming print jobs.",
+  "requestFramePermissions": [],
+  "prompt": ""
+}
