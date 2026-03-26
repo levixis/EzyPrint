@@ -100,15 +100,22 @@ const ShopOrderDetailsModal: React.FC<ShopOrderDetailsModalProps> = ({
 
       const blobUrl = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
-      link.href = blobUrl;
-      link.download = downloadName;
       link.style.display = 'none';
       document.body.appendChild(link);
-      link.click();
+      // Set attributes AFTER appending to DOM for Chrome compatibility
+      link.href = blobUrl;
+      link.setAttribute('download', downloadName);
+      // Use a real MouseEvent instead of .click() — Chrome honors the
+      // download attribute more reliably with a dispatched MouseEvent
+      link.dispatchEvent(new MouseEvent('click', {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+      }));
       setTimeout(() => {
         document.body.removeChild(link);
         window.URL.revokeObjectURL(blobUrl);
-      }, 200);
+      }, 300);
     } catch (error: unknown) {
       console.error("[ShopOrderDetailsModal] Error downloading file:", error);
       setDownloadError(`Download failed for "${file.fileName}": ${error instanceof Error ? error.message : "Unknown error"}`);
