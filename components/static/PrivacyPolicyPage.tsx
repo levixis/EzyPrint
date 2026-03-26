@@ -1,14 +1,19 @@
 
-import React from 'react';
+
+import React, { useEffect } from 'react';
 import { Card } from '../common/Card';
 
 const PrivacyPolicyPage: React.FC = () => {
+  useEffect(() => {
+    window.scrollTo(0, 0);
+  }, []);
+
   return (
-    <div className="max-w-3xl mx-auto py-8 px-4">
+    <div className="max-w-3xl mx-auto pt-24 pb-8 px-4">
       <Card title="Privacy Policy" className="bg-brand-secondary/80 backdrop-blur-sm">
         <div className="prose prose-sm sm:prose lg:prose-lg xl:prose-xl max-w-none text-brand-lightText space-y-4">
           <p><strong>Last Updated: {new Date().toLocaleDateString()}</strong></p>
-          
+
           <h2 className="text-brand-primary">1. Introduction</h2>
           <p>Welcome to EzyPrint ("we," "our," or "us"). We are committed to protecting your privacy. This Privacy Policy explains how we collect, use, disclose, and safeguard your information when you use our application.</p>
 
@@ -50,7 +55,7 @@ const PrivacyPolicyPage: React.FC = () => {
 
           <h2 className="text-brand-primary">6. Your Data Rights</h2>
           <p>You may have rights to access, correct, or delete your personal information, subject to applicable laws. Please contact us to make such requests.</p>
-          
+
           <h2 className="text-brand-primary">7. Cookies and Tracking Technologies</h2>
           <p>We may use cookies and similar tracking technologies to enhance your experience. You can control cookie preferences through your browser settings.</p>
 
@@ -59,7 +64,7 @@ const PrivacyPolicyPage: React.FC = () => {
 
           <h2 className="text-brand-primary">9. Contact Us</h2>
           <p>If you have any questions about this Privacy Policy, please contact us through the "Contact Us" page or at [Your Support Email Address].</p>
-          <p className="italic text-brand-muted">This is a template. Please replace with your own comprehensive Privacy Policy reviewed by a legal professional.</p>
+
         </div>
       </Card>
     </div>

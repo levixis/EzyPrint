@@ -7,23 +7,6 @@ const NotificationBell: React.FC = () => {
   const [isOpen, setIsOpen] = useState(false);
   const bellRef = useRef<HTMLDivElement>(null);
 
-  if (!currentUser) return null; 
-
-  const currentNotifications = getNotificationsForCurrentUser();
-  const unreadCount = currentNotifications.filter(n => !n.read).length;
-
-  const toggleDropdown = () => {
-    setIsOpen(!isOpen);
-  };
-
-  const handleMarkAsRead = (id: string) => {
-    markNotificationAsRead(id);
-  };
-  
-  const handleMarkAllAsRead = () => {
-    currentNotifications.filter(n => !n.read).forEach(n => markNotificationAsRead(n.id));
-  };
-
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
       if (bellRef.current && !bellRef.current.contains(event.target as Node)) {
@@ -35,6 +18,23 @@ const NotificationBell: React.FC = () => {
       document.removeEventListener('mousedown', handleClickOutside);
     };
   }, []);
+
+  if (!currentUser) return null;
+
+  const currentNotifications = getNotificationsForCurrentUser();
+  const unreadCount = currentNotifications.filter(n => !n.read).length;
+
+  const toggleDropdown = () => {
+    setIsOpen(!isOpen);
+  };
+
+  const handleMarkAsRead = (id: string) => {
+    markNotificationAsRead(id);
+  };
+
+  const handleMarkAllAsRead = () => {
+    currentNotifications.filter(n => !n.read).forEach(n => markNotificationAsRead(n.id));
+  };
 
   return (
     <div className="relative" ref={bellRef}>

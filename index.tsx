@@ -1,5 +1,6 @@
 // Assuming App.tsx is in the same directory or adjust path as needed
-import App from './App'; 
+import './index.css';
+import App from './App';
 import { AppProvider } from './contexts/AppContext';
 
 // React 19 style imports for client rendering

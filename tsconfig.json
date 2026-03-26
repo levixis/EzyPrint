@@ -23,6 +23,7 @@
     /* For Vite client types */
     "types": ["vite/client"] 
   },
-  "include": ["**/*.ts", "**/*.tsx"], // Adjusted to include all .ts and .tsx files
+  "include": ["**/*.ts", "**/*.tsx"],
+  "exclude": ["vite.config.ts"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

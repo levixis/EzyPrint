@@ -1,15 +1,17 @@
 
 export enum UserType {
   STUDENT = 'STUDENT',
-  SHOP_OWNER = 'SHOP_OWNER', 
+  SHOP_OWNER = 'SHOP_OWNER',
+  ADMIN = 'ADMIN',
 }
 
 export interface User {
-  id: string; 
+  id: string;
   type: UserType;
   name?: string;
-  email?: string; 
-  shopId?: string; 
+  email?: string;
+  shopId?: string;
+  hasStudentPass?: boolean;
 }
 
 export interface ShopPricing {
@@ -41,12 +43,14 @@ export interface PayoutMethod {
 }
 
 export interface ShopProfile {
-  id: string; 
-  ownerUserId: string; 
+  id: string;
+  ownerUserId: string;
   name: string;
-  address: string; 
+  address: string;
   customPricing: ShopPricing;
-  isOpen: boolean; 
+  isOpen: boolean;
+  isApproved: boolean; // Admin must approve before shop is visible to students
+  isArchived?: boolean; // Admin can archive shops — hides from students but keeps data
   payoutMethods?: PayoutMethod[]; // Updated to support multiple payout methods
 }
 
@@ -57,37 +61,49 @@ export enum PrintColor {
 
 export enum OrderStatus {
   PENDING_PAYMENT = 'PENDING_PAYMENT',
-  PENDING_APPROVAL = 'PENDING_APPROVAL', 
+  PENDING_APPROVAL = 'PENDING_APPROVAL',
   PRINTING = 'PRINTING',
   READY_FOR_PICKUP = 'READY_FOR_PICKUP',
   COMPLETED = 'COMPLETED',
   CANCELLED = 'CANCELLED',
-  PAYMENT_FAILED = 'PAYMENT_FAILED', 
+  PAYMENT_FAILED = 'PAYMENT_FAILED',
 }
 
 export interface PrintOptions {
   copies: number;
   color: PrintColor;
-  pages: number; 
+  pages: number;
   doubleSided: boolean;
-  startPage?: number; 
-  endPage?: number;   
+  startPage?: number;
+  endPage?: number;
+}
+
+export interface OrderFile {
+  fileName: string;
+  fileType: string;
+  fileStoragePath?: string;
+  fileSizeBytes?: number;
+  isFileDeleted?: boolean;
+  pageCount: number;
+  color: PrintColor;
+  copies: number;
+  doubleSided: boolean;
 }
 
 export interface DocumentOrder {
-  id: string; 
-  userId: string; 
-  shopId: string; 
-  fileName: string;
-  fileType: string;
-  // fileObject?: File; // Removed: File object will not be stored in Firestore
-  fileStoragePath?: string; // Added: Path to the file in Firebase Storage
-  fileSizeBytes?: number;   // Added: Size of the uploaded file
-  isFileDeleted?: boolean;  // Added: Flag to indicate if file was auto-deleted from storage
-  uploadedAt: string; // Timestamp for when the order was created/file info recorded
+  id: string;
+  userId: string;
+  shopId: string;
+  fileName: string;      // Legacy: first file name (backward compat)
+  fileType: string;       // Legacy: first file type (backward compat)
+  fileStoragePath?: string; // Legacy: first file storage path
+  fileSizeBytes?: number;   // Legacy: first file size
+  isFileDeleted?: boolean;  // Legacy: first file deletion flag
+  files?: OrderFile[];      // NEW: array of files in this order
+  uploadedAt: string;
   printOptions: PrintOptions;
   status: OrderStatus;
-  priceDetails: { 
+  priceDetails: {
     pageCost: number;
     baseFee: number;
     totalPrice: number;
@@ -106,5 +122,39 @@ export interface NotificationMessage {
   type: 'success' | 'info' | 'warning' | 'error';
   targetUserType?: UserType;
   targetUserId?: string;
-  targetShopId?: string; 
+  targetShopId?: string;
+  recipientUserId?: string; // Resolved user ID for Firestore routing
 }
+
+export enum PayoutStatus {
+  PENDING = 'PENDING',
+  PAID = 'PAID',
+  CONFIRMED = 'CONFIRMED',
+  DISPUTED = 'DISPUTED',
+}
+
+export interface ShopPayout {
+  id: string;
+  shopId: string;
+  shopName: string;
+  amount: number;
+  adminNote?: string;
+  shopOwnerNote?: string;
+  status: PayoutStatus;
+  createdAt: string;
+  paidAt?: string;
+  confirmedAt?: string;
+}
+
+export type AppView =
+  | 'landing'
+  | 'login'
+  | 'studentDashboard'
+  | 'shopDashboard'
+  | 'adminDashboard'
+  | 'privacy'
+  | 'terms'
+  | 'refund'
+  | 'shipping'
+  | 'contact'
+  | 'getPass';

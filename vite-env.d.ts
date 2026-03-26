@@ -39,9 +39,10 @@ interface ImportMetaEnv {
    */
   readonly SSR: boolean;
 
-  // You can add other custom environment variables prefixed with VITE_
-  // e.g., readonly VITE_API_URL: string;
-  // readonly VITE_MY_VARIABLE: string;
+  /**
+   * Razorpay public key ID for payment gateway integration.
+   */
+  readonly VITE_RAZORPAY_KEY_ID: string;
 }
 
 interface ImportMeta {

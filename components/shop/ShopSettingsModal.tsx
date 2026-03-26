@@ -1,11 +1,11 @@
-
 import React, { useState, useEffect, useRef } from 'react';
 import { Modal } from '../common/Modal';
 import { Button } from '../common/Button';
 import { Input } from '../common/Input';
 import { Select } from '../common/Select';
 import { ShopProfile, ShopPricing, PayoutMethod, PayoutMethodType } from '../../types';
-import { calculateBaseFee } from '../../contexts/AppContext';
+import { useAppContext } from '../../contexts/AppContext';
+import { calculateBaseFee } from '../../utils/pricing';
 import { Card } from '../common/Card';
 
 interface ShopSettingsModalProps {
@@ -30,6 +30,7 @@ const EMPTY_PAYOUT_METHOD_FORM: Partial<PayoutMethod> & { type: PayoutMethodType
 };
 
 const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, shop, onSaveSettings }) => {
+  const { deleteOwnShopAccount } = useAppContext();
   const [bwPriceInput, setBwPriceInput] = useState(String(shop.customPricing.bwPerPage));
   const [colorPriceInput, setColorPriceInput] = useState(String(shop.customPricing.colorPerPage));
   const [isShopOpen, setIsShopOpen] = useState(shop.isOpen);
@@ -39,6 +40,8 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
 
   const [error, setError] = useState('');
   const [formError, setFormError] = useState('');
+  const [showDeleteAccountConfirm, setShowDeleteAccountConfirm] = useState(false);
+  const [isDeletingAccount, setIsDeletingAccount] = useState(false);
 
   const prevIsOpen = useRef(isOpen);
   const prevShopId = useRef(shop.id);
@@ -265,7 +268,7 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
 
         <div>
           <h4 className="text-lg font-semibold text-brand-primary mb-2">Custom Per-Page Print Pricing</h4>
-          <p className="text-sm text-brand-lightText mb-3">Set your shop's rates for printing. Base fees are standard and cannot be changed by shops. Enter 0 or leave blank if a type is not offered (but at least one must be &ge; 0).</p>
+          <p className="text-sm text-gray-600 dark:text-gray-400 mb-3">Set your shop's rates for printing. Base fees are standard and cannot be changed by shops. Enter 0 or leave blank if a type is not offered (but at least one must be &ge; 0).</p>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <Input
               label="Black & White (per page)"
@@ -292,7 +295,7 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
 
         <div>
             <h4 className="text-lg font-semibold text-brand-primary mb-2">Payout Methods</h4>
-            <p className="text-sm text-brand-lightText mb-3">Manage your bank accounts or UPI IDs for receiving payments. Mark one as primary.</p>
+            <p className="text-sm text-gray-600 dark:text-gray-400 mb-3">Manage your bank accounts or UPI IDs for receiving payments. Mark one as primary.</p>
 
             {currentPayoutMethods.length > 0 && (
                 <div className="space-y-3 mb-4">
@@ -301,7 +304,7 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
                            <div className="p-3">
                             <div className="flex justify-between items-start">
                                 <div>
-                                    <p className="font-semibold text-brand-text">{method.nickname} {method.isPrimary && <span className="text-xs text-status-success bg-status-success/20 px-1.5 py-0.5 rounded-full ml-1">Primary</span>}</p>
+                                    <p className="font-semibold text-gray-900 dark:text-white">{method.nickname} {method.isPrimary && <span className="text-xs text-status-success bg-status-success/20 px-1.5 py-0.5 rounded-full ml-1">Primary</span>}</p>
                                     <p className="text-xs text-brand-muted">
                                         {method.type === 'UPI' ? `UPI: ${method.upiId}` : `Bank: ${method.bankName} (...${(method.accountNumber || '').slice(-4)})`}
                                     </p>
@@ -348,7 +351,7 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
                     )}
                     <div className="flex items-center pt-2">
                         <input id="isPrimaryPayout" name="isPrimary" type="checkbox" checked={editingPayoutMethod.isPrimary || false} onChange={handlePayoutFormChange} className="h-4 w-4 text-brand-primary bg-brand-secondaryLight border-brand-muted rounded focus:ring-brand-primary focus:ring-offset-brand-secondary"/>
-                        <label htmlFor="isPrimaryPayout" className="ml-2 block text-sm text-brand-lightText">Set as primary payout method</label>
+                        <label htmlFor="isPrimaryPayout" className="ml-2 block text-sm text-gray-600 dark:text-gray-400">Set as primary payout method</label>
                     </div>
                     <div className="flex justify-end space-x-2 pt-3">
                         <Button variant="ghost" onClick={handleCancelEditPayoutMethod}>Cancel</Button>
@@ -361,16 +364,78 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
 
         <div>
             <h4 className="text-lg font-semibold text-brand-primary mb-2 mt-4">Standard Base Fee Structure</h4>
-            <p className="text-sm text-brand-lightText mb-3">
+            <p className="text-sm text-gray-600 dark:text-gray-400 mb-3">
                 A tiered base fee is automatically added to each order based on the total cost of the printed pages (before base fee). This fee is fixed.
             </p>
-            <ul className="list-disc list-inside text-sm text-brand-lightText space-y-1 bg-brand-secondaryLight/50 p-3 rounded-md border border-brand-muted/30">
+            <ul className="list-disc list-inside text-sm text-gray-600 dark:text-gray-400 space-y-1 bg-brand-secondaryLight/50 p-3 rounded-md border border-brand-muted/30">
                 {baseFeeTiers.map(tier => (
                     <li key={tier.range}>For page costs in range <strong>{tier.range}</strong>, Base Fee = <strong>
                         {`₹${tier.fee.toFixed(2)}`}
                     </strong></li>
                 ))}
             </ul>
+        </div>
+
+        {/* Danger Zone */}
+        <div className="mt-6 pt-6 border-t border-red-200 dark:border-red-900/40">
+          <div className="flex items-center gap-3 mb-3">
+            <div className="w-8 h-8 rounded-lg bg-red-100 dark:bg-red-900/30 flex items-center justify-center">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4 text-red-600 dark:text-red-400">
+                <path fillRule="evenodd" d="M12 2.25c-5.385 0-9.75 4.365-9.75 9.75s4.365 9.75 9.75 9.75 9.75-4.365 9.75-9.75S17.385 2.25 12 2.25Zm-1.72 6.97a.75.75 0 1 0-1.06 1.06L10.94 12l-1.72 1.72a.75.75 0 1 0 1.06 1.06L12 13.06l1.72 1.72a.75.75 0 1 0 1.06-1.06L13.06 12l1.72-1.72a.75.75 0 1 0-1.06-1.06L12 10.94l-1.72-1.72Z" clipRule="evenodd" />
+              </svg>
+            </div>
+            <div>
+              <h4 className="text-base font-bold text-red-700 dark:text-red-400">Danger Zone</h4>
+              <p className="text-xs text-gray-500 dark:text-gray-400">Irreversible actions</p>
+            </div>
+          </div>
+
+          {!showDeleteAccountConfirm ? (
+            <button
+              onClick={() => setShowDeleteAccountConfirm(true)}
+              className="w-full py-2.5 px-4 rounded-lg border-2 border-red-300 dark:border-red-800 text-red-600 dark:text-red-400 text-sm font-medium hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
+            >
+              Delete My Shop & Account
+            </button>
+          ) : (
+            <div className="bg-red-50 dark:bg-red-900/20 rounded-xl p-4 border border-red-200 dark:border-red-800/40 space-y-3">
+              <div className="flex items-start gap-2">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-5 h-5 text-red-500 mt-0.5 flex-shrink-0">
+                  <path fillRule="evenodd" d="M9.401 3.003c1.155-2 4.043-2 5.197 0l7.355 12.748c1.154 2-.29 4.5-2.599 4.5H4.645c-2.309 0-3.752-2.5-2.598-4.5L9.4 3.003ZM12 8.25a.75.75 0 0 1 .75.75v3.75a.75.75 0 0 1-1.5 0V9a.75.75 0 0 1 .75-.75Zm0 8.25a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Z" clipRule="evenodd" />
+                </svg>
+                <div>
+                  <p className="text-sm font-semibold text-red-700 dark:text-red-400">Are you sure?</p>
+                  <p className="text-xs text-red-600/70 dark:text-red-400/70 mt-1">
+                    This will permanently delete your shop "{shop.name}" and your account. All order history will be lost. This action cannot be undone.
+                  </p>
+                </div>
+              </div>
+              <div className="flex gap-2">
+                <Button
+                  onClick={async () => {
+                    setIsDeletingAccount(true);
+                    await deleteOwnShopAccount();
+                    setIsDeletingAccount(false);
+                  }}
+                  variant="danger"
+                  size="sm"
+                  fullWidth
+                  disabled={isDeletingAccount}
+                >
+                  {isDeletingAccount ? 'Deleting...' : 'Yes, Delete Everything'}
+                </Button>
+                <Button
+                  onClick={() => setShowDeleteAccountConfirm(false)}
+                  variant="ghost"
+                  size="sm"
+                  fullWidth
+                  disabled={isDeletingAccount}
+                >
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="pt-6 flex justify-end space-x-3 border-t border-brand-muted/20 mt-6">

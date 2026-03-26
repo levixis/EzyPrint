@@ -1,10 +1,15 @@
 
-import React from 'react';
+
+import React, { useEffect } from 'react';
 import { Card } from '../common/Card';
 
 const RefundPolicyPage: React.FC = () => {
+  useEffect(() => {
+    window.scrollTo(0, 0);
+  }, []);
+
   return (
-    <div className="max-w-3xl mx-auto py-8 px-4">
+    <div className="max-w-3xl mx-auto pt-24 pb-8 px-4">
       <Card title="Cancellation and Refund Policy" className="bg-brand-secondary/80 backdrop-blur-sm">
         <div className="prose prose-sm sm:prose lg:prose-lg xl:prose-xl max-w-none text-brand-lightText space-y-4">
           <p><strong>Last Updated: {new Date().toLocaleDateString()}</strong></p>
@@ -20,7 +25,7 @@ const RefundPolicyPage: React.FC = () => {
             <li>Shop owners may cancel an order under certain circumstances (e.g., inability to fulfill the print job as specified, issues with the uploaded file, violation of terms).</li>
             <li>If a shop owner cancels an order after payment has been made, a full refund will typically be processed for the student.</li>
           </ul>
-           <p><strong>By EzyPrint:</strong></p>
+          <p><strong>By EzyPrint:</strong></p>
           <ul>
             <li>EzyPrint reserves the right to cancel any order if there is a violation of our Terms and Conditions, suspected fraudulent activity, or other critical issues.</li>
           </ul>
@@ -31,9 +36,9 @@ const RefundPolicyPage: React.FC = () => {
           <ul>
             <li><strong>Order Cancellation by Shop or EzyPrint:</strong> If an order is cancelled by the print shop or EzyPrint after the student has made payment, a full refund of the total amount paid will be issued to the student's original payment method.</li>
             <li><strong>Print Quality Issues:</strong> If there are significant defects in the print quality (e.g., smudging, incorrect colors not attributable to file issues, missing pages) attributable to the print shop, students should contact the print shop directly within [e.g., 24-48 hours] of pickup with photographic evidence.
-                <ul>
-                    <li>The print shop will assess the issue. If the fault lies with the shop, they may offer a reprint or EzyPrint may facilitate a partial or full refund upon confirmation from the shop.</li>
-                </ul>
+              <ul>
+                <li>The print shop will assess the issue. If the fault lies with the shop, they may offer a reprint or EzyPrint may facilitate a partial or full refund upon confirmation from the shop.</li>
+              </ul>
             </li>
             <li><strong>Incorrect Order Fulfilled:</strong> If the student receives an order that does not match their confirmed print options (e.g., wrong number of copies, incorrect paper type if specified and offered), they should report it to the print shop or EzyPrint support.</li>
           </ul>
@@ -52,10 +57,10 @@ const RefundPolicyPage: React.FC = () => {
 
           <h2 className="text-brand-primary">4. Base Fee</h2>
           <p>EzyPrint's base fee is generally non-refundable unless the order is cancelled by EzyPrint or the Shop before any significant processing, or in cases of complete non-delivery of service attributable to EzyPrint or the Shop.</p>
-          
+
           <h2 className="text-brand-primary">5. Contact</h2>
           <p>For any questions regarding cancellations or refunds, please contact us.</p>
-          <p className="italic text-brand-muted">This is a template. Please replace with your own comprehensive Cancellation and Refund Policy reviewed by a legal professional, considering specific operational details and consumer rights.</p>
+
         </div>
       </Card>
     </div>

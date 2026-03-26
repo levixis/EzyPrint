@@ -1,134 +1,671 @@
-
-import { onSchedule, ScheduledEvent } from "firebase-functions/v2/scheduler"; // Correct import for ScheduledEvent
-import * as logger from "firebase-functions/logger"; // Correct import for v2 logger
+import { onCall, HttpsError } from "firebase-functions/v2/https";
+import { onDocumentUpdated } from "firebase-functions/v2/firestore";
+import { onSchedule } from "firebase-functions/v2/scheduler";
 import * as admin from "firebase-admin";
+import Razorpay from "razorpay";
+import * as crypto from "crypto";
 
 admin.initializeApp();
-
 const db = admin.firestore();
-const storage = admin.storage();
 
-// Define a type for the order data as used within this function
-interface DocumentOrderInFunction {
-  fileName: string;
-  fileStoragePath?: string;
-  isFileDeleted?: boolean;
-  uploadedAt?: string; // Used in query
-  // Add other fields from DocumentOrder if needed by function logic in future
+// Lazy-initialize Razorpay to avoid module-load crash when env vars aren't yet available
+let _razorpay: Razorpay | null = null;
+function getRazorpay(): Razorpay {
+  if (!_razorpay) {
+    _razorpay = new Razorpay({
+      key_id: process.env.RAZORPAY_KEY_ID || "",
+      key_secret: process.env.RAZORPAY_KEY_SECRET || "",
+    });
+  }
+  return _razorpay;
 }
 
+// ---------- Pricing Logic (mirrored from frontend) ----------
 
-// Scheduled function to run, for example, every day at 3 AM.
-export const autoDeleteOldOrderFiles = onSchedule(
-  {
-    schedule: "every day 03:00",
-    timeZone: "Asia/Kolkata",
-  },
-  async (event: ScheduledEvent) => { // Type the event
-    logger.info("Starting autoDeleteOldOrderFiles function run", {
-      eventTime: event.scheduleTime, // Corrected from event.time to event.scheduleTime
-      configuredSchedule: "every day 03:00",
-      configuredTimeZone: "Asia/Kolkata",
+interface ShopPricing {
+  bwPerPage: number;
+  colorPerPage: number;
+}
+
+interface PrintOptions {
+  pages: number;
+  copies: number;
+  color: string;
+  doubleSided: boolean;
+}
+
+interface OrderFileData {
+  fileName: string;
+  fileType: string;
+  fileStoragePath?: string;
+  fileSizeBytes?: number;
+  isFileDeleted?: boolean;
+  pageCount: number;
+  color: string;
+  copies: number;
+  doubleSided: boolean;
+}
+
+function calculateBaseFee(pageCost: number): number {
+  if (pageCost <= 0) return 0;
+  if (pageCost <= 5) return 2;
+  if (pageCost <= 30) return 3;
+  if (pageCost <= 70) return 4;
+  return 5;
+}
+
+function calculateFilePageCost(
+  pageCount: number,
+  color: string,
+  copies: number,
+  doubleSided: boolean,
+  shopPricing: ShopPricing
+): number {
+  if (pageCount <= 0 || copies <= 0) return 0;
+  const singleSideRate = color === "COLOR" ? shopPricing.colorPerPage : shopPricing.bwPerPage;
+  if (doubleSided && pageCount > 1) {
+    const fullSheets = Math.floor(pageCount / 2);
+    const remainderPages = pageCount % 2;
+    const doubleSideSheetRate = singleSideRate * 1.5;
+    const singleCopyCost = (fullSheets * doubleSideSheetRate) + (remainderPages * singleSideRate);
+    return singleCopyCost * copies;
+  }
+  return pageCount * singleSideRate * copies;
+}
+
+function calculateOrderPrice(
+  printOptions: PrintOptions,
+  shopPricing: ShopPricing,
+  hasStudentPass: boolean = false
+): { pageCost: number; baseFee: number; totalPrice: number } {
+  const { pages, copies, color, doubleSided } = printOptions;
+  if (pages <= 0 || copies <= 0) {
+    return { pageCost: 0, baseFee: 0, totalPrice: 0 };
+  }
+
+  const singleSideRate =
+    color === "COLOR" ? shopPricing.colorPerPage : shopPricing.bwPerPage;
+
+  let totalCost: number;
+  if (doubleSided && pages > 1) {
+    const fullSheets = Math.floor(pages / 2);
+    const remainderPages = pages % 2;
+    const doubleSideSheetRate = singleSideRate * 1.5;
+    const singleCopyCost = (fullSheets * doubleSideSheetRate) + (remainderPages * singleSideRate);
+    totalCost = singleCopyCost * copies;
+  } else {
+    totalCost = pages * singleSideRate * copies;
+  }
+
+  const calculatedPageCost = totalCost;
+  let calculatedBaseFee = calculateBaseFee(calculatedPageCost);
+
+  if (hasStudentPass && calculatedPageCost <= 30) {
+    calculatedBaseFee = 0;
+  }
+
+  const calculatedTotalPrice = calculatedPageCost + calculatedBaseFee;
+
+  return {
+    pageCost: parseFloat(calculatedPageCost.toFixed(2)),
+    baseFee: parseFloat(calculatedBaseFee.toFixed(2)),
+    totalPrice: parseFloat(calculatedTotalPrice.toFixed(2)),
+  };
+}
+
+/**
+ * Calculate price for multi-file orders with per-file settings.
+ */
+function calculateMultiFilePrice(
+  files: OrderFileData[],
+  shopPricing: ShopPricing,
+  hasStudentPass: boolean = false
+): { pageCost: number; baseFee: number; totalPrice: number } {
+  if (files.length === 0) {
+    return { pageCost: 0, baseFee: 0, totalPrice: 0 };
+  }
+
+  let totalPageCost = 0;
+  for (const file of files) {
+    if (file.copies <= 0 || file.pageCount <= 0) continue;
+    totalPageCost += calculateFilePageCost(
+      file.pageCount,
+      file.color,
+      file.copies,
+      file.doubleSided,
+      shopPricing
+    );
+  }
+
+  let calculatedBaseFee = calculateBaseFee(totalPageCost);
+  if (hasStudentPass && totalPageCost <= 30) {
+    calculatedBaseFee = 0;
+  }
+
+  const calculatedTotalPrice = totalPageCost + calculatedBaseFee;
+
+  return {
+    pageCost: parseFloat(totalPageCost.toFixed(2)),
+    baseFee: parseFloat(calculatedBaseFee.toFixed(2)),
+    totalPrice: parseFloat(calculatedTotalPrice.toFixed(2)),
+  };
+}
+
+// ---------- Cloud Functions ----------
+
+/**
+ * createOrder — Creates a Razorpay order for a print order.
+ * Recalculates price server-side to prevent client-side manipulation.
+ */
+export const createOrder = onCall(
+  { region: "asia-south1", cors: true },
+  async (request) => {
+    // Auth check
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "You must be logged in.");
+    }
+
+    const { orderId } = request.data;
+    if (!orderId) {
+      throw new HttpsError("invalid-argument", "orderId is required.");
+    }
+
+    // Fetch order from Firestore
+    const orderDoc = await db.collection("orders").doc(orderId).get();
+    if (!orderDoc.exists) {
+      throw new HttpsError("not-found", "Order not found.");
+    }
+
+    const orderData = orderDoc.data()!;
+
+    // Verify the order belongs to this user
+    if (orderData.userId !== request.auth.uid) {
+      throw new HttpsError(
+        "permission-denied",
+        "You can only pay for your own orders."
+      );
+    }
+
+    // Verify order is in PENDING_PAYMENT status
+    if (orderData.status !== "PENDING_PAYMENT") {
+      throw new HttpsError(
+        "failed-precondition",
+        `Order is not awaiting payment. Current status: ${orderData.status}`
+      );
+    }
+
+    // Fetch shop pricing from Firestore
+    const shopDoc = await db.collection("shops").doc(orderData.shopId).get();
+    if (!shopDoc.exists) {
+      throw new HttpsError("not-found", "Shop not found.");
+    }
+
+    const shopData = shopDoc.data()!;
+
+    // Fetch user data to check student pass
+    const userDoc = await db
+      .collection("users")
+      .doc(request.auth.uid)
+      .get();
+    const hasStudentPass = userDoc.exists
+      ? userDoc.data()?.hasStudentPass === true
+      : false;
+
+    // Recalculate price server-side
+    // Use multi-file pricing if files[] array exists, else fall back to legacy
+    let verifiedPrice: { pageCost: number; baseFee: number; totalPrice: number };
+    const filesArray = orderData.files as OrderFileData[] | undefined;
+    if (filesArray && filesArray.length > 0) {
+      verifiedPrice = calculateMultiFilePrice(
+        filesArray,
+        shopData.customPricing as ShopPricing,
+        hasStudentPass
+      );
+    } else {
+      verifiedPrice = calculateOrderPrice(
+        orderData.printOptions as PrintOptions,
+        shopData.customPricing as ShopPricing,
+        hasStudentPass
+      );
+    }
+
+    const amountInPaise = Math.round(verifiedPrice.totalPrice * 100);
+
+    if (amountInPaise <= 0) {
+      throw new HttpsError(
+        "failed-precondition",
+        "Order amount must be greater than zero."
+      );
+    }
+
+    // Create Razorpay order
+    const razorpayOrder = await getRazorpay().orders.create({
+      amount: amountInPaise,
+      currency: "INR",
+      receipt: orderId.slice(-40),
+      notes: {
+        orderId: orderId,
+        shopId: orderData.shopId,
+        userId: request.auth.uid,
+        type: "print_order",
+      },
     });
 
-    const fiveDaysAgo = new Date();
-    fiveDaysAgo.setDate(fiveDaysAgo.getDate() - 5);
-    const fiveDaysAgoISO = fiveDaysAgo.toISOString();
+    // Update order with server-verified price and razorpay order ID
+    await db.collection("orders").doc(orderId).update({
+      priceDetails: verifiedPrice,
+      razorpayOrderId: razorpayOrder.id,
+    });
+
+    return {
+      razorpayOrderId: razorpayOrder.id,
+      amount: amountInPaise,
+      currency: "INR",
+      verifiedPrice: verifiedPrice,
+    };
+  }
+);
+
+/**
+ * verifyPayment — Verifies Razorpay payment signature and updates order status.
+ */
+export const verifyPayment = onCall(
+  { region: "asia-south1", cors: true },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "You must be logged in.");
+    }
+
+    const {
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+      orderId,
+    } = request.data;
+
+    if (
+      !razorpay_order_id ||
+      !razorpay_payment_id ||
+      !razorpay_signature ||
+      !orderId
+    ) {
+      throw new HttpsError(
+        "invalid-argument",
+        "Missing payment verification parameters."
+      );
+    }
+
+    // Verify signature using HMAC SHA256
+    const keySecret = process.env.RAZORPAY_KEY_SECRET || "";
+    const generatedSignature = crypto
+      .createHmac("sha256", keySecret)
+      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+      .digest("hex");
+
+    if (generatedSignature !== razorpay_signature) {
+      // Signature mismatch - potential tampering
+      await db.collection("orders").doc(orderId).update({
+        status: "PAYMENT_FAILED",
+        paymentAttemptedAt: new Date().toISOString(),
+      });
+
+      throw new HttpsError(
+        "failed-precondition",
+        "Payment verification failed. Signature mismatch."
+      );
+    }
+
+    // Signature is valid — update order
+    const orderDoc = await db.collection("orders").doc(orderId).get();
+    if (!orderDoc.exists) {
+      throw new HttpsError("not-found", "Order not found.");
+    }
+
+    const orderData = orderDoc.data()!;
+    if (orderData.userId !== request.auth.uid) {
+      throw new HttpsError(
+        "permission-denied",
+        "You can only verify your own orders."
+      );
+    }
+
+    await db.collection("orders").doc(orderId).update({
+      status: "PENDING_APPROVAL",
+      razorpayPaymentId: razorpay_payment_id,
+      paymentAttemptedAt: new Date().toISOString(),
+    });
+
+    return { success: true, message: "Payment verified successfully." };
+  }
+);
+
+/**
+ * createPassOrder — Creates a Razorpay order for Student Pass purchase.
+ */
+export const createPassOrder = onCall(
+  { region: "asia-south1", cors: true },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "You must be logged in.");
+    }
+
+    // Verify user is a student
+    const userDoc = await db
+      .collection("users")
+      .doc(request.auth.uid)
+      .get();
+    if (!userDoc.exists) {
+      throw new HttpsError("not-found", "User profile not found.");
+    }
+
+    const userData = userDoc.data()!;
+    if (userData.type !== "STUDENT") {
+      throw new HttpsError(
+        "permission-denied",
+        "Only students can purchase a Student Pass."
+      );
+    }
+
+    if (userData.hasStudentPass === true) {
+      throw new HttpsError(
+        "failed-precondition",
+        "You already have an active Student Pass."
+      );
+    }
+
+    const amountInPaise = 4900; // ₹49
+
+    // Create Razorpay order
+    const razorpayOrder = await getRazorpay().orders.create({
+      amount: amountInPaise,
+      currency: "INR",
+      receipt: `ps_${request.auth.uid.slice(-12)}_${Date.now()}`.slice(0, 40),
+      notes: {
+        userId: request.auth.uid,
+        type: "student_pass",
+      },
+    });
+
+    return {
+      razorpayOrderId: razorpayOrder.id,
+      amount: amountInPaise,
+      currency: "INR",
+    };
+  }
+);
+
+/**
+ * verifyPassPayment — Verifies Student Pass payment and activates the pass.
+ */
+export const verifyPassPayment = onCall(
+  { region: "asia-south1", cors: true },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "You must be logged in.");
+    }
+
+    const {
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+    } = request.data;
+
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      throw new HttpsError(
+        "invalid-argument",
+        "Missing payment verification parameters."
+      );
+    }
+
+    // Verify signature
+    const keySecret = process.env.RAZORPAY_KEY_SECRET || "";
+    const generatedSignature = crypto
+      .createHmac("sha256", keySecret)
+      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+      .digest("hex");
+
+    if (generatedSignature !== razorpay_signature) {
+      throw new HttpsError(
+        "failed-precondition",
+        "Payment verification failed. Signature mismatch."
+      );
+    }
+
+    // Activate Student Pass
+    await db.collection("users").doc(request.auth.uid).update({
+      hasStudentPass: true,
+      studentPassPaymentId: razorpay_payment_id,
+      studentPassActivatedAt: new Date().toISOString(),
+    });
+
+    return { success: true, message: "Student Pass activated successfully!" };
+  }
+);
+
+/**
+ * onOrderStatusChange — Firestore trigger that auto-deletes uploaded files from
+ * Firebase Storage when an order is marked as COMPLETED or CANCELLED.
+ * This is a production safety net — the client also attempts deletion,
+ * but this ensures cleanup even if the client fails.
+ */
+export const onOrderStatusChange = onDocumentUpdated(
+  { document: "orders/{orderId}", region: "asia-south1" },
+  async (event) => {
+    const beforeData = event.data?.before.data();
+    const afterData = event.data?.after.data();
+
+    if (!beforeData || !afterData) return;
+
+    const oldStatus = beforeData.status;
+    const newStatus = afterData.status;
+
+    // Only trigger on status transitions to COMPLETED or CANCELLED
+    if (oldStatus === newStatus) return;
+    if (newStatus !== "COMPLETED" && newStatus !== "CANCELLED") return;
+
+    const orderId = event.params.orderId;
+
+    // --- AUTO-REFUND: Issue Razorpay refund when a PAID order is CANCELLED ---
+    if (newStatus === "CANCELLED" && afterData.razorpayPaymentId) {
+      console.log(`[onOrderStatusChange] Order #${orderId.slice(-6)} cancelled with payment ${afterData.razorpayPaymentId}. Initiating automatic refund...`);
+
+      try {
+        const refund = await getRazorpay().payments.refund(afterData.razorpayPaymentId, {
+          speed: "normal", // "normal" for 5-7 day refund, "optimum" for instant if eligible
+          notes: {
+            orderId: orderId,
+            reason: "Order cancelled",
+          },
+        });
+
+        // Record refund details on the order document
+        await db.collection("orders").doc(orderId).update({
+          refundId: refund.id,
+          refundStatus: refund.status, // "processed" or "pending"
+          refundAmount: (refund.amount || 0) / 100, // Convert paise to rupees
+          refundedAt: new Date().toISOString(),
+        });
+
+        console.log(`[onOrderStatusChange] Refund ${refund.id} initiated for order #${orderId.slice(-6)}. Status: ${refund.status}, Amount: ₹${((refund.amount || 0) / 100).toFixed(2)}`);
+
+        // Create a notification for the student about the refund
+        try {
+          await db.collection("notifications").add({
+            message: `Refund of ₹${((refund.amount || 0) / 100).toFixed(2)} has been initiated for cancelled order #${orderId.slice(-6)}. It will be credited to your original payment method within 5-7 business days.`,
+            type: "info",
+            recipientUserId: afterData.userId,
+            orderId: orderId,
+            read: false,
+            timestamp: new Date().toISOString(),
+          });
+        } catch (notifError: any) {
+          console.warn(`[onOrderStatusChange] Failed to create refund notification:`, notifError.message);
+        }
+      } catch (refundError: any) {
+        console.error(`[onOrderStatusChange] REFUND FAILED for order #${orderId.slice(-6)}, payment ${afterData.razorpayPaymentId}:`, refundError.message);
+
+        // Mark order as needing manual refund so admin can investigate
+        await db.collection("orders").doc(orderId).update({
+          refundStatus: "FAILED",
+          refundError: refundError.message || "Unknown refund error",
+          refundedAt: new Date().toISOString(),
+        });
+
+        // Notify admin about the failed refund
+        try {
+          await db.collection("notifications").add({
+            message: `⚠️ AUTO-REFUND FAILED for order #${orderId.slice(-6)} (Payment: ${afterData.razorpayPaymentId}). Manual refund required. Error: ${refundError.message}`,
+            type: "error",
+            targetUserType: "ADMIN",
+            read: false,
+            timestamp: new Date().toISOString(),
+          });
+        } catch (notifError: any) {
+          console.warn(`[onOrderStatusChange] Failed to create admin refund-failure notification:`, notifError.message);
+        }
+      }
+    }
+
+    // --- FILE CLEANUP: Delete uploaded files from Storage ---
+    const bucket = admin.storage().bucket();
+    const filesArray = afterData.files as OrderFileData[] | undefined;
+
+    if (filesArray && filesArray.length > 0) {
+      // Multi-file order: delete all files
+      for (const fileEntry of filesArray) {
+        if (fileEntry.fileStoragePath && !fileEntry.isFileDeleted) {
+          try {
+            const storageFile = bucket.file(fileEntry.fileStoragePath);
+            const [exists] = await storageFile.exists();
+            if (exists) {
+              await storageFile.delete();
+              console.log(`[onOrderStatusChange] Deleted file: ${fileEntry.fileStoragePath} for order ${orderId}`);
+            }
+          } catch (error: any) {
+            console.error(`[onOrderStatusChange] Failed to delete file ${fileEntry.fileStoragePath}:`, error.message);
+          }
+        }
+      }
+      // Mark all files as deleted
+      const updatedFiles = filesArray.map(f => ({ ...f, isFileDeleted: true }));
+      await db.collection("orders").doc(orderId).update({
+        files: updatedFiles,
+        isFileDeleted: true,
+      });
+    } else {
+      // Legacy single-file order
+      const fileStoragePath = afterData.fileStoragePath;
+      const isFileDeleted = afterData.isFileDeleted;
+      if (fileStoragePath && !isFileDeleted) {
+        try {
+          const storageFile = bucket.file(fileStoragePath);
+          const [exists] = await storageFile.exists();
+          if (exists) {
+            await storageFile.delete();
+            console.log(`[onOrderStatusChange] Deleted file: ${fileStoragePath} for order ${orderId}`);
+          }
+          await db.collection("orders").doc(orderId).update({ isFileDeleted: true });
+        } catch (error: any) {
+          console.error(`[onOrderStatusChange] Failed to delete file for order ${orderId}:`, error.message);
+        }
+      } else {
+        console.log(`[onOrderStatusChange] No file to clean up for order ${orderId}`);
+      }
+    }
+  }
+);
+
+/**
+ * cleanupAbandonedOrders — Scheduled CRON job that runs every hour.
+ * Scans for orders stuck in PENDING_PAYMENT for more than 2 hours,
+ * deletes their uploaded files from Firebase Storage, and marks them CANCELLED.
+ * This prevents the "ghost file" storage cost attack.
+ */
+export const cleanupAbandonedOrders = onSchedule(
+  {
+    schedule: "every 1 hours",
+    region: "asia-south1",
+    timeoutSeconds: 300,
+  },
+  async () => {
+    const cutoffTime = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(); // 2 hours ago
+
+    console.log(`[cleanupAbandonedOrders] Running cleanup. Cutoff time: ${cutoffTime}`);
 
     try {
-      const ordersSnapshot = await db
+      // Query orders that are PENDING_PAYMENT and were created before the cutoff
+      const abandonedOrdersSnapshot = await db
         .collection("orders")
-        .where("uploadedAt", "<=", fiveDaysAgoISO)
-        .where("fileStoragePath", "!=", null)
-        .where("isFileDeleted", "==", false)
+        .where("status", "==", "PENDING_PAYMENT")
+        .where("uploadedAt", "<", cutoffTime)
         .get();
 
-      if (ordersSnapshot.empty) {
-        logger.info("No old order files found to delete.");
+      if (abandonedOrdersSnapshot.empty) {
+        console.log("[cleanupAbandonedOrders] No abandoned orders found.");
         return;
       }
 
-      const storageDeletePromises: Promise<{
-        orderId: string;
-        filePath: string;
-        success: boolean;
-        error?: Error;
-      }>[] = [];
+      console.log(`[cleanupAbandonedOrders] Found ${abandonedOrdersSnapshot.size} abandoned order(s).`);
 
-      ordersSnapshot.forEach((docSnap: admin.firestore.QueryDocumentSnapshot) => { // Type docSnap
-        const order = docSnap.data() as DocumentOrderInFunction; // Use defined type
+      const bucket = admin.storage().bucket();
+      let deletedCount = 0;
+      let errorCount = 0;
 
-        if (order.fileStoragePath) {
-          logger.info(
-            `Queueing file for deletion: ${order.fileStoragePath} for order ${docSnap.id}`
-          );
-          const fileRef = storage.bucket().file(order.fileStoragePath);
-          storageDeletePromises.push(
-            fileRef
-              .delete()
-              .then(() => ({
-                orderId: docSnap.id,
-                filePath: order.fileStoragePath!,
-                success: true,
-              }))
-              .catch((error: Error) => ({ // Type error
-                orderId: docSnap.id,
-                filePath: order.fileStoragePath!,
-                success: false,
-                error: error,
-              }))
-          );
-        }
-      });
+      for (const orderDoc of abandonedOrdersSnapshot.docs) {
+        const orderData = orderDoc.data();
+        const orderId = orderDoc.id;
 
-      if (storageDeletePromises.length === 0) {
-        logger.info("No files were eligible for deletion attempt in this run after path filtering.");
-        return;
-      }
-
-      const deletionResults = await Promise.allSettled(storageDeletePromises);
-
-      const batch = db.batch();
-      let filesMarkedInFirestoreCount = 0;
-
-      deletionResults.forEach((result) => {
-        if (result.status === 'fulfilled') {
-          const { orderId, filePath, success, error } = result.value;
-          const orderDocRef = db.collection("orders").doc(orderId);
-
-          if (success) {
-            logger.info(
-              `Successfully deleted file from Storage: ${filePath}. Marking in Firestore for order ${orderId}.`
-            );
-            batch.update(orderDocRef, { isFileDeleted: true });
-            filesMarkedInFirestoreCount++;
+        try {
+          // Delete all files from Storage (multi-file or legacy)
+          const filesArr = orderData.files as OrderFileData[] | undefined;
+          if (filesArr && filesArr.length > 0) {
+            for (const fileEntry of filesArr) {
+              if (fileEntry.fileStoragePath && !fileEntry.isFileDeleted) {
+                const storageFile = bucket.file(fileEntry.fileStoragePath);
+                const [exists] = await storageFile.exists();
+                if (exists) {
+                  await storageFile.delete();
+                  console.log(`[cleanupAbandonedOrders] Deleted file: ${fileEntry.fileStoragePath}`);
+                }
+              }
+            }
+            const updatedFiles = filesArr.map(f => ({ ...f, isFileDeleted: true }));
+            await db.collection("orders").doc(orderId).update({
+              status: "CANCELLED",
+              files: updatedFiles,
+              isFileDeleted: true,
+              shopNotes: "Auto-cancelled: payment not completed within 2 hours.",
+              cancelledAt: new Date().toISOString(),
+            });
           } else {
-            logger.error(
-              `Failed to delete file from Storage: ${filePath} for order ${orderId}. Marking in Firestore.`,
-              error
-            );
-            batch.update(orderDocRef, { isFileDeleted: true, fileDeletionError: error?.message || String(error) });
-            filesMarkedInFirestoreCount++;
+            // Legacy single-file cleanup
+            if (orderData.fileStoragePath && !orderData.isFileDeleted) {
+              const storageFile = bucket.file(orderData.fileStoragePath);
+              const [exists] = await storageFile.exists();
+              if (exists) {
+                await storageFile.delete();
+                console.log(`[cleanupAbandonedOrders] Deleted file: ${orderData.fileStoragePath}`);
+              }
+            }
+            await db.collection("orders").doc(orderId).update({
+              status: "CANCELLED",
+              isFileDeleted: true,
+              shopNotes: "Auto-cancelled: payment not completed within 2 hours.",
+              cancelledAt: new Date().toISOString(),
+            });
           }
-        } else {
-          logger.error("Unexpected promise rejection in deletionResults processing:", result.reason);
-        }
-      });
 
-      if (filesMarkedInFirestoreCount > 0) {
-        await batch.commit();
-        logger.info(
-          `Successfully processed and batched Firestore updates for ${filesMarkedInFirestoreCount} orders.`
-        );
-      } else {
-        logger.info("No Firestore updates were made in this run.");
+          deletedCount++;
+          console.log(`[cleanupAbandonedOrders] Cancelled abandoned order #${orderId.slice(-6)}`);
+        } catch (orderError: any) {
+          errorCount++;
+          console.error(`[cleanupAbandonedOrders] Error processing order ${orderId}:`, orderError.message);
+        }
       }
 
-    } catch (error: any) { // Type error
-      logger.error("Error in autoDeleteOldOrderFiles function:", error);
-      // Consider re-throwing if retries are desired: throw error;
+      console.log(`[cleanupAbandonedOrders] Cleanup complete. Cancelled: ${deletedCount}, Errors: ${errorCount}`);
+    } catch (error: any) {
+      console.error("[cleanupAbandonedOrders] Fatal error during cleanup:", error.message);
     }
-    // Implicitly return undefined (Promise<void>)
-    return;
   }
 );

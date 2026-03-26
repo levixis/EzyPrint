@@ -5,14 +5,14 @@ interface BaseSharedInputProps {
   label?: string;
   error?: string;
   containerClassName?: string;
-  leftIcon?: React.ReactNode; 
+  leftIcon?: React.ReactNode;
   id?: string;
-  className?: string; 
+  className?: string;
 }
 
 // Props when the component is a standard input element
 interface StandardInputProps extends BaseSharedInputProps, Omit<React.InputHTMLAttributes<HTMLInputElement>, 'id' | 'className' | 'type'> {
-  type?: Exclude<React.HTMLInputTypeAttribute, 'textarea'>; 
+  type?: Exclude<React.HTMLInputTypeAttribute, 'textarea'>;
 }
 
 // Props when the component is a textarea element
@@ -22,8 +22,8 @@ interface TextareaInputProps extends BaseSharedInputProps, Omit<React.TextareaHT
 
 export type InputProps = StandardInputProps | TextareaInputProps;
 
-export const Input: React.FC<InputProps> = ({ label, id, error, containerClassName = '', className ='', leftIcon, ...props }) => {
-  const commonInputVisualClass = `w-full px-3 py-2.5 bg-brand-secondaryLight border border-brand-muted rounded-lg text-brand-text placeholder-brand-muted focus:ring-brand-primary focus:border-brand-primary sm:text-sm shadow-sm ${error ? 'border-status-error focus:ring-status-error' : ''}`;
+export const Input: React.FC<InputProps> = ({ label, id, error, containerClassName = '', className = '', leftIcon, ...props }) => {
+  const commonInputVisualClass = `w-full px-3 py-2.5 bg-brand-secondaryLight dark:bg-brand-dark-surfaceHighlight border border-brand-muted dark:border-brand-dark-border rounded-lg text-brand-text dark:text-brand-dark-text placeholder-brand-muted dark:placeholder-brand-dark-textSecondary focus:ring-brand-primary focus:border-brand-primary sm:text-sm shadow-sm transition-colors duration-200 ${error ? 'border-status-error focus:ring-status-error' : ''}`;
 
   if (props.type === 'textarea') {
     // Type is known to be 'textarea' here, so we cast props to TextareaInputProps

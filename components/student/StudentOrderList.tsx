@@ -9,19 +9,17 @@ interface StudentOrderListProps {
 }
 
 const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
-  const { updateOrderStatus } = useAppContext();
   const [paymentOrder, setPaymentOrder] = useState<DocumentOrder | null>(null);
+  const { updateOrderStatus } = useAppContext();
 
   const handlePayNow = (order: DocumentOrder) => {
     setPaymentOrder(order);
   };
 
-  const handlePaymentSuccess = (orderId: string) => { // Removed razorpayOrderId from signature
-    updateOrderStatus(orderId, OrderStatus.PENDING_APPROVAL, { 
-      paymentAttemptedAt: new Date().toISOString(),
-      // razorpayOrderId removed
-      actingUserType: UserType.STUDENT 
-    });
+  const handlePaymentSuccess = (_orderId: string) => {
+    // The Cloud Function (verifyPayment) already updates the order to PENDING_APPROVAL in Firestore.
+    // The onSnapshot listener will propagate the change. No need to call updateOrderStatus here,
+    // which would cause duplicate notifications.
     setPaymentOrder(null);
   };
 
@@ -33,11 +31,21 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
     setPaymentOrder(null);
   };
 
-  if (orders.length === 0) {
+  const handleCancelOrder = (order: DocumentOrder) => {
+    if (window.confirm("Are you sure you want to cancel this order? It will be hidden from your list.")) {
+      updateOrderStatus(order.id, OrderStatus.CANCELLED, {
+        actingUserType: UserType.STUDENT
+      });
+    }
+  };
+
+  const visibleOrders = orders.filter(o => o.status !== OrderStatus.CANCELLED);
+
+  if (visibleOrders.length === 0) {
     return <p className="text-brand-lightText text-center py-6">No orders found.</p>;
   }
 
-  const sortedOrders = [...orders].sort((a, b) => {
+  const sortedOrders = [...visibleOrders].sort((a, b) => {
     if (a.status === OrderStatus.PENDING_PAYMENT && b.status !== OrderStatus.PENDING_PAYMENT) return -1;
     if (a.status !== OrderStatus.PENDING_PAYMENT && b.status === OrderStatus.PENDING_PAYMENT) return 1;
     if (a.status === OrderStatus.PAYMENT_FAILED && b.status !== OrderStatus.PAYMENT_FAILED) return -1;
@@ -48,7 +56,7 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
   return (
     <div className="space-y-6">
       {sortedOrders.map(order => (
-        <StudentOrderCard key={order.id} order={order} onPayNow={handlePayNow} />
+        <StudentOrderCard key={order.id} order={order} onPayNow={handlePayNow} onCancelOrder={handleCancelOrder} />
       ))}
       {paymentOrder && (
         <PaymentModal

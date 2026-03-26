@@ -3,9 +3,17 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
+    // Helper function to check if user is admin
+    function isAdmin() {
+      return request.auth != null && 
+             exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.type == 'ADMIN';
+    }
+
     // Users can read and write their own profile
+    // Admin can read/write any user profile (for account conversion)
     match /users/{userId} {
-      allow read, write: if request.auth != null && request.auth.uid == userId;
+      allow read, write: if request.auth != null && (request.auth.uid == userId || isAdmin());
     }
 
     // Shops
@@ -17,8 +25,16 @@ service cloud.firestore {
       // Ensure the ownerUserId in the new shop document matches the authenticated user
       allow create: if request.auth != null && request.auth.uid == request.resource.data.ownerUserId;
 
-      // Only the owner of the shop can update or delete it
-      allow update, delete: if request.auth != null && request.auth.uid == resource.data.ownerUserId;
+      // Only the owner of the shop (or admin) can update it
+      // PRICING VALIDATION: bwPerPage and colorPerPage must be >= 0 to prevent
+      // negative pricing attacks that could crash Razorpay or create free orders
+      allow update: if request.auth != null &&
+        (request.auth.uid == resource.data.ownerUserId || isAdmin()) &&
+        request.resource.data.customPricing.bwPerPage >= 0 &&
+        request.resource.data.customPricing.colorPerPage >= 0;
+
+      // Only the owner or admin can delete
+      allow delete: if request.auth != null && (request.auth.uid == resource.data.ownerUserId || isAdmin());
     }
 
     // Orders
@@ -28,12 +44,41 @@ service cloud.firestore {
 
       // Students can read/update their own orders
       // Shop owners can read/update orders for their shop
+      // Admin can read/update any order
       allow read, update: if request.auth != null && 
                           (request.auth.uid == resource.data.userId || 
-                           (get(/databases/$(database)/documents/shops/$(resource.data.shopId)).data.ownerUserId == request.auth.uid));
+                           resource.data.shopId == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.shopId ||
+                           isAdmin());
       
       // Deletion of orders might be restricted or handled by functions
-      allow delete: if false; // Example: prevent client-side deletion
+      allow delete: if false;
+    }
+
+    // Payouts — admin creates, admin and shop owners can read their own
+    match /payouts/{payoutId} {
+      // Admin can do anything with payouts
+      allow read, write: if request.auth != null && isAdmin();
+      
+      // Shop owners can read payouts for their shop and update status (confirm/dispute)
+      allow read: if request.auth != null && 
+                  resource.data.shopId == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.shopId;
+      allow update: if request.auth != null && 
+                    resource.data.shopId == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.shopId;
+    }
+
+    // Notifications — Firestore-backed cross-user notification system
+    match /notifications/{notificationId} {
+      // Users can read their own notifications (filtered by recipientUserId)
+      allow read: if request.auth != null && resource.data.recipientUserId == request.auth.uid;
+
+      // Any authenticated user can create notifications (for cross-user communication)
+      allow create: if request.auth != null;
+
+      // Users can update their own notifications (e.g., mark as read)
+      allow update: if request.auth != null && resource.data.recipientUserId == request.auth.uid;
+
+      // Only admin or backend Cloud Functions can delete notifications
+      allow delete: if isAdmin();
     }
   }
 }

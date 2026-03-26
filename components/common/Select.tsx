@@ -13,11 +13,11 @@ export const Select: React.FC<SelectProps> = ({ label, id, error, containerClass
       {label && <label htmlFor={id} className="block text-sm font-medium text-brand-lightText mb-1.5">{label}</label>}
       <select
         id={id}
-        className={`w-full px-3 py-2.5 bg-brand-secondaryLight border border-brand-muted rounded-lg text-brand-text focus:ring-brand-primary focus:border-brand-primary sm:text-sm shadow-sm appearance-none ${error ? 'border-status-error focus:ring-status-error' : ''} ${className}`}
+        className={`w-full px-3 py-2.5 bg-brand-secondaryLight dark:bg-brand-dark-surfaceHighlight border border-brand-muted dark:border-brand-dark-border rounded-lg text-brand-text dark:text-brand-dark-text focus:ring-brand-primary focus:border-brand-primary sm:text-sm shadow-sm appearance-none transition-colors duration-200 ${error ? 'border-status-error focus:ring-status-error' : ''} ${className}`}
         {...props}
       >
         {options.map(option => (
-          <option key={option.value} value={option.value} className="bg-brand-secondary text-brand-text">
+          <option key={option.value} value={option.value} className="bg-brand-secondary dark:bg-brand-dark-surface text-brand-text dark:text-brand-dark-text">
             {option.label}
           </option>
         ))}

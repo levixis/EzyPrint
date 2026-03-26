@@ -1,10 +1,15 @@
 
-import React from 'react';
+
+import React, { useEffect } from 'react';
 import { Card } from '../common/Card';
 
 const TermsConditionsPage: React.FC = () => {
+  useEffect(() => {
+    window.scrollTo(0, 0);
+  }, []);
+
   return (
-    <div className="max-w-3xl mx-auto py-8 px-4">
+    <div className="max-w-3xl mx-auto pt-24 pb-8 px-4">
       <Card title="Terms and Conditions" className="bg-brand-secondary/80 backdrop-blur-sm">
         <div className="prose prose-sm sm:prose lg:prose-lg xl:prose-xl max-w-none text-brand-lightText space-y-4">
           <p><strong>Last Updated: {new Date().toLocaleDateString()}</strong></p>
@@ -31,25 +36,25 @@ const TermsConditionsPage: React.FC = () => {
             <li>Payments are processed through Razorpay. EzyPrint is not responsible for any issues arising from the payment gateway.</li>
             <li>EzyPrint will facilitate payouts to shop owners based on the agreed terms, minus the applicable base fees. Shop owners are responsible for providing accurate payout information.</li>
           </ul>
-          
+
           <h2 className="text-brand-primary">6. Intellectual Property</h2>
           <p>The Service and its original content, features, and functionality are and will remain the exclusive property of EzyPrint and its licensors. Uploaded documents remain the intellectual property of their respective owners.</p>
 
           <h2 className="text-brand-primary">7. Limitation of Liability</h2>
           <p>In no event shall EzyPrint, nor its directors, employees, partners, agents, suppliers, or affiliates, be liable for any indirect, incidental, special, consequential or punitive damages, including without limitation, loss of profits, data, use, goodwill, or other intangible losses, resulting from your access to or use of or inability to access or use the Service.</p>
-          
+
           <h2 className="text-brand-primary">8. Disclaimer</h2>
           <p>Your use of the Service is at your sole risk. The Service is provided on an "AS IS" and "AS AVAILABLE" basis. The Service is provided without warranties of any kind, whether express or implied.</p>
 
           <h2 className="text-brand-primary">9. Governing Law</h2>
           <p>These Terms shall be governed and construed in accordance with the laws of [Your Jurisdiction, e.g., India], without regard to its conflict of law provisions.</p>
-          
+
           <h2 className="text-brand-primary">10. Changes to Terms</h2>
           <p>We reserve the right, at our sole discretion, to modify or replace these Terms at any time. We will provide notice of any changes by posting the new Terms on this page.</p>
 
           <h2 className="text-brand-primary">11. Contact Us</h2>
           <p>If you have any questions about these Terms, please contact us via the "Contact Us" page or at [Your Support Email Address].</p>
-          <p className="italic text-brand-muted">This is a template. Please replace with your own comprehensive Terms and Conditions reviewed by a legal professional.</p>
+
         </div>
       </Card>
     </div>

@@ -1,0 +1,59 @@
+{"users": [
+{
+  "localId": "5zLeJOBcpGcf8dRiinZiciARBaH3",
+  "email": "harshvardhanjha339@gmail.com",
+  "emailVerified": true,
+  "displayName": "Levixis",
+  "photoUrl": "https://lh3.googleusercontent.com/a/ACg8ocJQXCnSL37y4IHZe87qIDOXczZRBCzR4W7mlksOVsdDWY51PvM=s96-c",
+  "lastSignedInAt": "1774539344609",
+  "createdAt": "1749746563495",
+  "providerUserInfo": [
+    {
+      "providerId": "google.com",
+      "rawId": "105427929087816456136",
+      "email": "harshvardhanjha339@gmail.com",
+      "displayName": "Levixis",
+      "photoUrl": "https://lh3.googleusercontent.com/a/ACg8ocId7y_1-a4l-UtccWYmXoncmea7AriaDpuI46bDBNKLT0_149vfzQ=s96-c"
+    }
+  ]
+},
+{
+  "localId": "F4bs0TNy6oRrKJ7n4i51lRBvdp23",
+  "email": "shop@test.com",
+  "emailVerified": false,
+  "passwordHash": "1JiTHl9C1/5CvZNULUiK6b4VHCNpY4fJeBqdfrtQYer60l4R/3JClXOrBGHiE54A2CqEhBVvGru5kVl87/BgNA==",
+  "salt": "hnRXa6SuUHzbEA==",
+  "displayName": "Shop",
+  "lastSignedInAt": "1774541003089",
+  "createdAt": "1774541003089",
+  "providerUserInfo": []
+},
+{
+  "localId": "LNEk1TV9NrTAXxbZtxHOc4s5E3G2",
+  "email": "student@test.com",
+  "emailVerified": false,
+  "passwordHash": "NM+l+2fIuGyKu4/1vN0PMkxvlvvI3627NswEAnHte9n3JBuY7ur9hZw4hFMP7vpxII51xra+O77uZ7tSktlE5g==",
+  "salt": "tQ+1uowd/8a+ig==",
+  "displayName": "Student",
+  "lastSignedInAt": "1774541076882",
+  "createdAt": "1774541076882",
+  "providerUserInfo": []
+},
+{
+  "localId": "tPUedbA0o9ZP0ID6lZLlyqAz5O23",
+  "email": "zkewns@gmail.com",
+  "emailVerified": true,
+  "displayName": "Zkewns",
+  "photoUrl": "https://lh3.googleusercontent.com/a/ACg8ocJYVUiwRmAnfhib6rDkHDBAGYbGThgIOdBn92EE0I-jYTGwdQ=s96-c",
+  "lastSignedInAt": "1749820946218",
+  "createdAt": "1749820946218",
+  "providerUserInfo": [
+    {
+      "providerId": "google.com",
+      "rawId": "111356643891432941992",
+      "email": "zkewns@gmail.com",
+      "displayName": "Zkewns",
+      "photoUrl": "https://lh3.googleusercontent.com/a/ACg8ocJYVUiwRmAnfhib6rDkHDBAGYbGThgIOdBn92EE0I-jYTGwdQ=s96-c"
+    }
+  ]
+}]}

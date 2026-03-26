@@ -1,63 +1,49 @@
 
 
-import React, { createContext, useState, useContext, useCallback, ReactNode, useEffect } from 'react';
-import { DocumentOrder, NotificationMessage, OrderStatus, User, UserType, ShopProfile, ShopPricing, PrintOptions, PrintColor, PayoutMethod } from '../types';
-import { DEFAULT_SHOP_PRICING } from '../constants';
+
+import React, { createContext, useState, useContext, useCallback, useMemo, ReactNode, useEffect, useRef } from 'react';
+import { DocumentOrder, OrderFile, NotificationMessage, OrderStatus, User, UserType, ShopProfile, ShopPricing, PayoutMethod, AppView, ShopPayout, PayoutStatus, PrintColor } from '../types';
+import { DEFAULT_SHOP_PRICING, ADMIN_EMAILS } from '../constants';
 import {
   auth,
-  db, 
-  storage, 
+  db,
+  storage,
   GoogleAuthProvider,
   signInWithPopup,
   signOut,
   onAuthStateChanged,
   createUserWithEmailAndPassword,
-  signInWithEmailAndPassword as firebaseSignInWithEmailAndPassword, 
+  signInWithEmailAndPassword as firebaseSignInWithEmailAndPassword,
   doc,
   setDoc,
   getDoc,
-  updateDoc, 
-  collection, 
-  query, // Added for querying
-  where,   // Added for querying
-  orderBy, // Added for querying
+  updateDoc,
+  deleteDoc,
+  collection,
+  query,
+  where,
+  orderBy,
+  limit,
+  addDoc,
   FirebaseUser,
-  storageRef,         
-  uploadBytesResumable, 
-  // getDownloadURL, // Removed as unused in this file; it's used elsewhere via firebase.ts
+  storageRef,
+  uploadBytesResumable,
   updateProfile,
-  onSnapshot 
+  onSnapshot,
+  deleteObject,
+  runTransaction
 } from '../firebase';
 
-// --- Helper: New Base Fee Logic ---
-export const calculateBaseFee = (pageCost: number): number => {
-  if (pageCost <= 0) return 0;
-  if (pageCost <= 5) return 2;
-  if (pageCost <= 30) return 3;
-  if (pageCost <= 70) return 4;
-  return 5;
+// Helper to safely extract error messages from unknown error types
+const getErrorMessage = (err: unknown): string => {
+  if (err instanceof Error) return err.message;
+  if (typeof err === 'string') return err;
+  return 'An unexpected error occurred.';
 };
 
-export const calculateOrderPrice = (
-  printOptions: PrintOptions,
-  shopPricing: ShopPricing
-): DocumentOrder['priceDetails'] => {
-  const { pages, copies, color, doubleSided } = printOptions;
-  if (pages <= 0 || copies <= 0) return { pageCost: 0, baseFee: 0, totalPrice: 0 };
-
-  let perPageRate = color === PrintColor.COLOR ? shopPricing.colorPerPage : shopPricing.bwPerPage;
-  if (doubleSided) perPageRate *= 1.8;
-
-  const calculatedPageCost = pages * perPageRate * copies;
-  const calculatedBaseFee = calculateBaseFee(calculatedPageCost);
-  const calculatedTotalPrice = calculatedPageCost + calculatedBaseFee;
-
-  return {
-    pageCost: parseFloat(calculatedPageCost.toFixed(2)),
-    baseFee: parseFloat(calculatedBaseFee.toFixed(2)),
-    totalPrice: parseFloat(calculatedTotalPrice.toFixed(2)),
-  };
-};
+// Pricing utilities — imported from dedicated module for clean HMR
+import { calculateBaseFee, calculateOrderPrice, calculateMultiFileOrderPrice } from '../utils/pricing';
+export { calculateBaseFee, calculateOrderPrice, calculateMultiFileOrderPrice };
 
 interface AppContextType {
   currentUser: User | null;
@@ -67,38 +53,75 @@ interface AppContextType {
 
   signInWithGoogle: () => Promise<void>;
   signUpWithEmailPassword: (email: string, password: string, displayName: string) => Promise<{ success: boolean; message?: string }>;
-  signInWithEmailAndPassword: (email: string, password: string) => Promise<{ success: boolean; message?: string; errorCode?: string }>; 
-  completeStudentProfileCreation: (authUser: FirebaseUser, displayName?: string) => Promise<{success: boolean; message?: string}>;
-  completeShopOwnerProfileCreation: (authUser: FirebaseUser, shopDetails: { shopName: string; shopAddress: string }, displayName?:string) => Promise<{success: boolean; message?: string; shopId?: string}>;
+  signInWithEmailAndPassword: (email: string, password: string) => Promise<{ success: boolean; message?: string; errorCode?: string }>;
+  completeStudentProfileCreation: (authUser: FirebaseUser, displayName?: string) => Promise<{ success: boolean; message?: string }>;
+  completeShopOwnerProfileCreation: (authUser: FirebaseUser, shopDetails: { shopName: string; shopAddress: string }, displayName?: string) => Promise<{ success: boolean; message?: string; shopId?: string }>;
   logoutUser: () => Promise<void>;
+  upgradeToStudentPass: () => Promise<{ success: boolean; message?: string }>;
+  cancelStudentPass: () => Promise<{ success: boolean; message?: string }>;
 
   shops: ShopProfile[];
-  isLoadingShops: boolean; // Added for shop loading state
+  isLoadingShops: boolean;
   getShopById: (shopId: string) => ShopProfile | undefined;
-  registerShop: (shopName: string, shopAddress: string, ownerUserId: string, initialPricing: ShopPricing) => Promise<ShopProfile | null>; 
-  updateShopSettings: (shopId: string, newSettings: { pricing: ShopPricing; isOpen: boolean; payoutMethods?: PayoutMethod[] }) => Promise<void>; 
+  registerShop: (shopName: string, shopAddress: string, ownerUserId: string, initialPricing: ShopPricing) => Promise<ShopProfile | null>;
+  updateShopSettings: (shopId: string, newSettings: { pricing: ShopPricing; isOpen: boolean; payoutMethods?: PayoutMethod[] }) => Promise<void>;
 
   orders: DocumentOrder[];
-  getOrdersForCurrentUser: () => DocumentOrder[]; // This will now use the Firestore-populated 'orders' state
+  allOrders: DocumentOrder[]; // Admin: all orders across all shops
+  getOrdersForCurrentUser: () => DocumentOrder[];
 
   notifications: NotificationMessage[];
-  addOrder: (orderData: Omit<DocumentOrder, 'id' | 'uploadedAt' | 'priceDetails' | 'status' | 'fileStoragePath' | 'fileSizeBytes' | 'isFileDeleted'> & { priceDetailsInput: Pick<DocumentOrder, 'shopId' | 'printOptions'>; fileObject: File }) => Promise<{success: boolean, orderId?: string}>; 
-  updateOrderStatus: (orderId: string, status: OrderStatus, details?: { shopNotes?: string; paymentAttemptedAt?: string; actingUserType?: UserType }) => Promise<DocumentOrder | undefined>; 
+  addOrder: (orderData: {
+    userId: string;
+    shopId: string;
+    fileInputs: { file: File; fileType: string; pageCount: number; color: PrintColor; copies: number; doubleSided: boolean }[];
+  }) => Promise<{ success: boolean, orderId?: string }>;
+  updateOrderStatus: (orderId: string, status: OrderStatus, details?: { shopNotes?: string; paymentAttemptedAt?: string; actingUserType?: UserType }) => Promise<DocumentOrder | undefined>;
 
   addNotification: (notification: Omit<NotificationMessage, 'id' | 'timestamp' | 'read'>) => void;
   markNotificationAsRead: (notificationId: string) => void;
   getNotificationsForCurrentUser: () => NotificationMessage[];
+
+  currentView: AppView;
+  navigateTo: (view: AppView) => void;
+
+  // Admin payout functions
+  payouts: ShopPayout[];
+  createPayout: (shopId: string, shopName: string, amount: number, adminNote?: string) => Promise<{ success: boolean; message?: string }>;
+  requestPayout: (shopId: string, shopName: string, amount: number, shopOwnerNote?: string) => Promise<{ success: boolean; message?: string }>;
+  markPayoutPaid: (payoutId: string) => Promise<{ success: boolean; message?: string }>;
+  confirmPayout: (payoutId: string) => Promise<{ success: boolean; message?: string }>;
+  disputePayout: (payoutId: string, shopOwnerNote: string) => Promise<{ success: boolean; message?: string }>;
+
+  // Admin shop management
+  approveShop: (shopId: string) => Promise<{ success: boolean; message?: string }>;
+  rejectShop: (shopId: string) => Promise<{ success: boolean; message?: string }>;
+  deleteShopAndOwner: (shopId: string, ownerUserId: string) => Promise<{ success: boolean; message?: string }>;
+  archiveShop: (shopId: string) => Promise<{ success: boolean; message?: string }>;
+  unarchiveShop: (shopId: string) => Promise<{ success: boolean; message?: string }>;
+  approvedShops: ShopProfile[]; // Only approved & non-archived shops (for student view)
+
+  // Shop owner self-delete
+  deleteOwnShopAccount: () => Promise<{ success: boolean; message?: string }>;
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
 
+// Valid status transitions map — prevents invalid state changes
+const VALID_STATUS_TRANSITIONS: Record<string, string[]> = {
+  [OrderStatus.PENDING_PAYMENT]: [OrderStatus.PENDING_APPROVAL, OrderStatus.PAYMENT_FAILED, OrderStatus.CANCELLED],
+  [OrderStatus.PENDING_APPROVAL]: [OrderStatus.PRINTING, OrderStatus.READY_FOR_PICKUP, OrderStatus.COMPLETED, OrderStatus.CANCELLED],
+  [OrderStatus.PRINTING]: [OrderStatus.READY_FOR_PICKUP, OrderStatus.COMPLETED, OrderStatus.CANCELLED],
+  [OrderStatus.READY_FOR_PICKUP]: [OrderStatus.COMPLETED, OrderStatus.CANCELLED],
+  [OrderStatus.COMPLETED]: [], // Terminal state
+  [OrderStatus.CANCELLED]: [], // Terminal state
+  [OrderStatus.PAYMENT_FAILED]: [OrderStatus.PENDING_PAYMENT, OrderStatus.CANCELLED], // Can retry or cancel
+};
+
 // Helper function to clean payout methods array
 const cleanPayoutMethods = (methods?: PayoutMethod[]): PayoutMethod[] => {
   if (!methods) return [];
-  // This filter ensures that the array itself does not contain null/undefined PayoutMethod objects.
-  // The properties *within* each PayoutMethod object are assumed to be cleaned before this point
-  // (e.g., in ShopSettingsModal before calling onSaveSettings).
-  return methods.filter(method => method !== null && method !== undefined); 
+  return methods.filter(method => method !== null && method !== undefined);
 };
 
 export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
@@ -106,63 +129,137 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [isLoadingAuth, setIsLoadingAuth] = useState<boolean>(true);
   const [pendingFirebaseProfileCreationUser, setPendingFirebaseProfileCreationUser] = useState<FirebaseUser | null>(null);
 
-  const [shops, setShops] = useState<ShopProfile[]>([]); 
-  const [isLoadingShops, setIsLoadingShops] = useState<boolean>(true); // Initial state for shop loading
-  const [orders, setOrders] = useState<DocumentOrder[]>([]); 
-  const [notifications, setNotifications] = useState<NotificationMessage[]>([]);
+  // Stable refs to break the dependency cycle: shops → addNotification → shops useEffect
+  const addNotificationRef = useRef<(notification: Omit<NotificationMessage, 'id' | 'timestamp' | 'read'>) => void>(() => {});
+  const shopsRef = useRef<ShopProfile[]>([]);
+  const currentUserRef = useRef<User | null>(null);
 
-  const addNotification = useCallback((notificationData: Omit<NotificationMessage, 'id' | 'timestamp' | 'read'>) => {
-    const newNotification: NotificationMessage = {
-      ...notificationData,
-      id: Date.now().toString() + Math.random().toString(16).slice(2),
-      timestamp: new Date().toISOString(),
-      read: false,
-    };
-    setNotifications(prev => [newNotification, ...prev].slice(0, 20));
+  const [shops, setShops] = useState<ShopProfile[]>([]);
+  const [isLoadingShops, setIsLoadingShops] = useState<boolean>(true);
+  const [orders, setOrders] = useState<DocumentOrder[]>([]);
+  const [allOrders, setAllOrders] = useState<DocumentOrder[]>([]); // Admin: all orders
+  const [payouts, setPayouts] = useState<ShopPayout[]>([]);
+  const [firestoreNotifications, setFirestoreNotifications] = useState<NotificationMessage[]>([]);
+  const [localNotifications, setLocalNotifications] = useState<NotificationMessage[]>([]);
+  const [currentView, setCurrentView] = useState<AppView>('landing');
+
+  // Merged notifications: Firestore (persistent, cross-user) + local (session-only toasts)
+  const notifications = useMemo(() => {
+    return [...localNotifications, ...firestoreNotifications]
+      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+  }, [localNotifications, firestoreNotifications]);
+
+  const navigateTo = useCallback((view: AppView) => {
+    setCurrentView(view);
+    window.scrollTo(0, 0);
   }, []);
 
-  // Shop data listener
+  const addNotification = useCallback((notificationData: Omit<NotificationMessage, 'id' | 'timestamp' | 'read'>) => {
+    const timestamp = new Date().toISOString();
+
+    // Determine the recipient for Firestore persistence
+    // Use shopsRef to avoid depending on shops state (which would cause re-render cycles)
+    let recipientUserId = notificationData.targetUserId;
+    if (!recipientUserId && notificationData.targetShopId) {
+      const shop = shopsRef.current.find(s => s.id === notificationData.targetShopId);
+      recipientUserId = shop?.ownerUserId;
+    }
+
+    if (recipientUserId) {
+      // Persist to Firestore — the onSnapshot listener will deliver it to the recipient
+      const firestoreNotif = {
+        ...notificationData,
+        recipientUserId,
+        timestamp,
+        read: false,
+      };
+      addDoc(collection(db, "notifications"), firestoreNotif).catch(err => {
+        console.error("[AppContext] Failed to persist notification:", err);
+      });
+    } else {
+      // Local-only notification (error toasts, confirmations for the acting user)
+      const localNotif: NotificationMessage = {
+        ...notificationData,
+        id: `local_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+        timestamp,
+        read: false,
+      };
+      setLocalNotifications(prev => [localNotif, ...prev].slice(0, 20));
+    }
+  }, []);
+
+  // Keep the ref in sync with the latest addNotification
   useEffect(() => {
-    setIsLoadingShops(true); // Set loading true when effect runs or refreshes
-    console.log("[AppContext/ShopListenerEffect] Setting up Firestore listener for 'shops' collection.");
+    addNotificationRef.current = addNotification;
+  }, [addNotification]);
+
+  // Keep shopsRef in sync so addNotification can look up shop owners without depending on shops state
+  useEffect(() => {
+    shopsRef.current = shops;
+  }, [shops]);
+
+  // Keep currentUserRef in sync so addOrder reads the latest hasStudentPass without a stale closure
+  useEffect(() => {
+    currentUserRef.current = currentUser;
+  }, [currentUser]);
+
+  // Shop data listener — uses addNotificationRef to avoid re-subscribing when addNotification changes
+  useEffect(() => {
+    setIsLoadingShops(true);
     const shopsCollectionRef = collection(db, "shops");
     const unsubscribeShops = onSnapshot(shopsCollectionRef, (querySnapshot) => {
-        const fetchedShops: ShopProfile[] = [];
-        querySnapshot.forEach((doc) => {
-            fetchedShops.push({ id: doc.id, ...doc.data() } as ShopProfile);
-        });
-        console.log(`[AppContext/ShopListenerEffect] Shop data updated from Firestore listener. Found ${fetchedShops.length} shops.`);
-        setShops(fetchedShops); 
-        setIsLoadingShops(false); // Set loading false after data is fetched
-    }, (error) => {
-        console.error("[AppContext/ShopListenerEffect] Error listening to shops collection:", error);
-        addNotification({ message: "Error updating shop list from Firestore. Please try refreshing.", type: 'error' });
-        setShops([]); 
-        setIsLoadingShops(false); // Set loading false even on error
+      const fetchedShops: ShopProfile[] = [];
+      querySnapshot.forEach((doc) => {
+        fetchedShops.push({ id: doc.id, ...doc.data() } as ShopProfile);
+      });
+      setShops(fetchedShops);
+      setIsLoadingShops(false);
+    }, (_error) => {
+      addNotificationRef.current({ message: "Error updating shop list from Firestore. Please try refreshing.", type: 'error' });
+      setShops([]);
+      setIsLoadingShops(false);
     });
     return () => {
-        console.log("[AppContext/ShopListenerEffect] Unsubscribing from Firestore 'shops' listener.");
-        unsubscribeShops();
+      unsubscribeShops();
     };
-  }, [addNotification]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
 
   // Orders listener - dynamically queries based on currentUser
+  // Uses addNotificationRef to avoid re-subscribing when addNotification identity changes
   useEffect(() => {
     if (!currentUser) {
-      setOrders([]); // Clear orders if no user is logged in
+      setOrders([]);
+      setAllOrders([]);
       return;
+    }
+
+    // Admin: listen to ALL orders
+    if (currentUser.type === UserType.ADMIN) {
+      const allOrdersQuery = query(collection(db, "orders"), orderBy("uploadedAt", "desc"));
+      const unsubscribeAllOrders = onSnapshot(allOrdersQuery, (querySnapshot) => {
+        const fetchedOrders: DocumentOrder[] = [];
+        querySnapshot.forEach((doc) => {
+          fetchedOrders.push({ id: doc.id, ...doc.data() } as DocumentOrder);
+        });
+        setAllOrders(fetchedOrders);
+        setOrders(fetchedOrders); // Also set orders for compatibility
+      }, (_error) => {
+        addNotificationRef.current({ message: "Error fetching all orders.", type: 'error' });
+        setAllOrders([]);
+        setOrders([]);
+      });
+      return () => unsubscribeAllOrders();
     }
 
     let ordersQuery;
     if (currentUser.type === UserType.STUDENT) {
       ordersQuery = query(collection(db, "orders"), where("userId", "==", currentUser.id), orderBy("uploadedAt", "desc"));
-      console.log(`[AppContext/OrdersListenerEffect] Setting up Firestore listener for student orders. UserID: ${currentUser.id}`);
     } else if (currentUser.type === UserType.SHOP_OWNER && currentUser.shopId) {
       ordersQuery = query(collection(db, "orders"), where("shopId", "==", currentUser.shopId), orderBy("uploadedAt", "desc"));
-      console.log(`[AppContext/OrdersListenerEffect] Setting up Firestore listener for shop orders. ShopID: ${currentUser.shopId}`);
     } else {
-      setOrders([]); // Clear orders if user type or shopId is missing
+      setOrders([]);
       return;
     }
 
@@ -171,61 +268,156 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       querySnapshot.forEach((doc) => {
         fetchedOrders.push({ id: doc.id, ...doc.data() } as DocumentOrder);
       });
-      console.log(`[AppContext/OrdersListenerEffect] Orders data updated. Fetched ${fetchedOrders.length} orders.`);
       setOrders(fetchedOrders);
-    }, (error) => {
-      console.error("[AppContext/OrdersListenerEffect] Error listening to orders collection:", error);
-      addNotification({ message: "Error fetching your orders. Please try again.", type: 'error' });
-      setOrders([]); // Set to empty on error
+    }, (_error) => {
+      addNotificationRef.current({ message: "Error fetching your orders. Please try again.", type: 'error' });
+      setOrders([]);
     });
 
     return () => {
-      console.log("[AppContext/OrdersListenerEffect] Unsubscribing from Firestore 'orders' listener.");
       unsubscribeOrders();
     };
-  }, [currentUser, addNotification]); // Re-run when currentUser changes
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentUser]);
 
+
+  // Payouts listener - for admin (all payouts) and shop owners (their payouts)
+  useEffect(() => {
+    if (!currentUser) {
+      setPayouts([]);
+      return;
+    }
+
+    let payoutsQuery;
+    if (currentUser.type === UserType.ADMIN) {
+      payoutsQuery = query(collection(db, "payouts"), orderBy("createdAt", "desc"));
+    } else if (currentUser.type === UserType.SHOP_OWNER && currentUser.shopId) {
+      payoutsQuery = query(collection(db, "payouts"), where("shopId", "==", currentUser.shopId), orderBy("createdAt", "desc"));
+    } else {
+      setPayouts([]);
+      return;
+    }
+
+    const unsubscribePayouts = onSnapshot(payoutsQuery, (querySnapshot) => {
+      const fetchedPayouts: ShopPayout[] = [];
+      querySnapshot.forEach((doc) => {
+        fetchedPayouts.push({ id: doc.id, ...doc.data() } as ShopPayout);
+      });
+      setPayouts(fetchedPayouts);
+    }, (error) => {
+      console.error("Error fetching payouts:", error);
+      setPayouts([]);
+    });
+
+    return () => unsubscribePayouts();
+  }, [currentUser]);
+
+
+  // Notifications listener - real-time Firestore notifications for the current user
+  useEffect(() => {
+    if (!currentUser) {
+      setFirestoreNotifications([]);
+      return;
+    }
+
+    const notifQuery = query(
+      collection(db, "notifications"),
+      where("recipientUserId", "==", currentUser.id),
+      orderBy("timestamp", "desc"),
+      limit(50)
+    );
+
+    const unsubscribeNotifs = onSnapshot(notifQuery, (querySnapshot) => {
+      const fetched: NotificationMessage[] = [];
+      querySnapshot.forEach((docSnap) => {
+        fetched.push({ id: docSnap.id, ...docSnap.data() } as NotificationMessage);
+      });
+      setFirestoreNotifications(fetched);
+    }, (error) => {
+      console.error("[AppContext] Error listening to notifications:", error);
+    });
+
+    return () => unsubscribeNotifs();
+  }, [currentUser]);
 
   useEffect(() => {
     setIsLoadingAuth(true);
+    const notifyError = (msg: string) => addNotificationRef.current({ message: msg, type: 'error' });
     const unsubscribe = onAuthStateChanged(auth, async (authUser) => {
       if (authUser) {
         try {
-          const userDocRef = doc(db, "users", authUser.uid);
-          const userDocSnap = await getDoc(userDocRef);
+          // Check if this user's email is in the admin list
+          const isAdmin = authUser.email && ADMIN_EMAILS.includes(authUser.email.toLowerCase());
 
-          if (userDocSnap.exists()) {
-            const userData = userDocSnap.data() as User;
-            setCurrentUserInternal(userData);
-            setPendingFirebaseProfileCreationUser(null); 
+          if (isAdmin) {
+            // Check if admin profile exists in Firestore
+            const userDocRef = doc(db, "users", authUser.uid);
+            const userDocSnap = await getDoc(userDocRef);
+
+            if (userDocSnap.exists()) {
+              const existingData = userDocSnap.data() as User;
+              if (existingData.type !== UserType.ADMIN) {
+                // Overwrite existing profile as Admin
+                // If they had a shopId, we leave the shop data in Firestore (it stays accessible)
+                const adminProfile: User = {
+                  id: authUser.uid,
+                  name: authUser.displayName || existingData.name || 'Admin',
+                  type: UserType.ADMIN,
+                  email: authUser.email || existingData.email,
+                };
+                await setDoc(userDocRef, adminProfile);
+                setCurrentUserInternal(adminProfile);
+              } else {
+                setCurrentUserInternal(existingData);
+              }
+            } else {
+              // Create admin profile
+              const adminProfile: User = {
+                id: authUser.uid,
+                name: authUser.displayName || 'Admin',
+                type: UserType.ADMIN,
+                email: authUser.email || undefined,
+              };
+              await setDoc(userDocRef, adminProfile);
+              setCurrentUserInternal(adminProfile);
+            }
+            setPendingFirebaseProfileCreationUser(null);
           } else {
-            setCurrentUserInternal(null);
-            setPendingFirebaseProfileCreationUser(authUser);
-            console.log(`[AppContext/onAuthStateChanged] Firebase user ${authUser.uid} authenticated, but no profile in Firestore. Setting as pending.`);
+            // Non-admin user: existing logic
+            const userDocRef = doc(db, "users", authUser.uid);
+            const userDocSnap = await getDoc(userDocRef);
+
+            if (userDocSnap.exists()) {
+              const userData = userDocSnap.data() as User;
+              setCurrentUserInternal(userData);
+              setPendingFirebaseProfileCreationUser(null);
+            } else {
+              setCurrentUserInternal(null);
+              setPendingFirebaseProfileCreationUser(authUser);
+            }
           }
         } catch (error) {
-          console.error("[AppContext/onAuthStateChanged] Error processing auth state:", error);
-          addNotification({ message: "Error loading your profile.", type: 'error' });
+          notifyError("Error loading your profile.");
           setCurrentUserInternal(null);
           setPendingFirebaseProfileCreationUser(null);
         } finally {
           setIsLoadingAuth(false);
         }
-      } else { 
+      } else {
         setCurrentUserInternal(null);
         setPendingFirebaseProfileCreationUser(null);
         setIsLoadingAuth(false);
-        console.log("[AppContext/onAuthStateChanged] No Firebase user authenticated.");
       }
     });
     return () => unsubscribe();
-  }, [addNotification]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
 
-  const handleAuthError = (error: any, context: string): { message: string; errorCode?: string } => {
-    console.error(`[AppContext] ${context} Error:`, error.code, error.message);
+  const handleAuthError = (error: unknown): { message: string; errorCode?: string } => {
     let message = `Authentication failed. Please try again.`;
-    const errorCode = error.code;
+    const firebaseError = error as { code?: string; message?: string };
+    const errorCode = firebaseError.code;
 
     if (errorCode) {
       switch (errorCode) {
@@ -237,7 +429,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         case 'auth/weak-password': message = 'Password is too weak. Please choose a stronger password (at least 6 characters).'; break;
         case 'auth/operation-not-allowed': message = 'Email/password sign-in is not enabled. Contact support.'; break;
         case 'auth/invalid-credential': message = 'Invalid credentials. Please check your email and password, or Sign Up if you don\'t have an account.'; break;
-        default: message = error.message || 'An unexpected error occurred during authentication.';
+        default: message = firebaseError.message || 'An unexpected error occurred during authentication.';
       }
     }
     addNotification({ message, type: 'error' });
@@ -247,13 +439,16 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const signInWithGoogle = async (): Promise<void> => {
     setIsLoadingAuth(true);
     const provider = new GoogleAuthProvider();
+    provider.setCustomParameters({
+      prompt: 'select_account'
+    });
     try {
       await signInWithPopup(auth, provider);
-    } catch (error: any) {
-      handleAuthError(error, "Google Sign-In");
-      setCurrentUserInternal(null); 
+    } catch (err: unknown) {
+      handleAuthError(err);
+      setCurrentUserInternal(null);
       setPendingFirebaseProfileCreationUser(null);
-      setIsLoadingAuth(false); 
+      setIsLoadingAuth(false);
     }
   };
 
@@ -265,8 +460,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         await updateProfile(userCredential.user, { displayName });
       }
       return { success: true };
-    } catch (error: any) {
-      const { message } = handleAuthError(error, "Email/Password Sign-Up");
+    } catch (err: unknown) {
+      const { message } = handleAuthError(err);
       setCurrentUserInternal(null);
       setPendingFirebaseProfileCreationUser(null);
       setIsLoadingAuth(false);
@@ -279,8 +474,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     try {
       await firebaseSignInWithEmailAndPassword(auth, email, password);
       return { success: true };
-    } catch (error: any) {
-      const { message, errorCode } = handleAuthError(error, "Email/Password Sign-In");
+    } catch (err: unknown) {
+      const { message, errorCode } = handleAuthError(err);
       setCurrentUserInternal(null);
       setPendingFirebaseProfileCreationUser(null);
       setIsLoadingAuth(false);
@@ -288,55 +483,50 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
   };
 
-  const completeStudentProfileCreation = useCallback(async (authUser: FirebaseUser, displayName?: string): Promise<{success: boolean; message?: string}> => {
+  const completeStudentProfileCreation = useCallback(async (authUser: FirebaseUser, displayName?: string): Promise<{ success: boolean; message?: string }> => {
     setIsLoadingAuth(true);
     try {
-      const studentName = displayName || authUser.displayName || `Student ${authUser.uid.slice(0,6)}`;
-      const studentProfileData: User = { 
-        id: authUser.uid, 
-        name: studentName, 
+      const studentName = displayName || authUser.displayName || 'Student';
+      const studentProfileData: User = {
+        id: authUser.uid,
+        name: studentName,
         type: UserType.STUDENT,
-        // email is optional, only add if it exists to avoid undefined in Firestore
-        ...(authUser.email && { email: authUser.email }), 
+        ...(authUser.email && { email: authUser.email }),
       };
-      
+
       await setDoc(doc(db, "users", authUser.uid), studentProfileData);
-      
-      // Critical: Update context state immediately after successful Firestore write
+
       setCurrentUserInternal(studentProfileData);
       setPendingFirebaseProfileCreationUser(null);
 
-      addNotification({message: `Welcome, ${studentName}! Registration successful.`, type: 'success', targetUserId: studentProfileData.id});
-      return {success: true};
-    } catch (error: any) {
-      console.error("[AppContext/completeStudentProfileCreation] Error saving profile:", error);
-      const message = (error as Error).message || 'Could not save student profile to Firestore.';
-      addNotification({message: `Registration failed: ${message}`, type: 'error'});
+      addNotification({ message: `Welcome, ${studentName}! Registration successful.`, type: 'success', targetUserId: studentProfileData.id });
+      return { success: true };
+    } catch (err: unknown) {
+      const message = getErrorMessage(err);
+      addNotification({ message: `Registration failed: ${message}`, type: 'error' });
       try {
-        if (auth.currentUser) await signOut(auth); // Sign out if profile creation fails
-      } catch (signOutError) {
-        console.error("[AppContext/completeStudentProfileCreation] Error signing out user after profile save failure:", signOutError);
+        if (auth.currentUser) await signOut(auth);
+      } catch (signOutErr) {
+        console.warn('[AppContext] Failed to sign out after profile creation error:', getErrorMessage(signOutErr));
       }
-      return {success: false, message};
+      return { success: false, message };
     } finally {
       setIsLoadingAuth(false);
     }
   }, [addNotification]);
-  
+
   const registerShop = useCallback(async (shopName: string, shopAddress: string, ownerUserId: string, initialPricing: ShopPricing): Promise<ShopProfile | null> => {
-    const shopDocRef = doc(collection(db, "shops")); 
+    const shopDocRef = doc(collection(db, "shops"));
     const newShopId = shopDocRef.id;
 
     const newShopData: ShopProfile = {
-      id: newShopId, ownerUserId, name: shopName, address: shopAddress, customPricing: initialPricing, isOpen: true, payoutMethods: []
+      id: newShopId, ownerUserId, name: shopName, address: shopAddress, customPricing: initialPricing, isOpen: true, isApproved: false, payoutMethods: []
     };
     try {
-      await setDoc(shopDocRef, newShopData); 
-      console.log(`[AppContext/registerShop] Shop registered successfully in Firestore. ID: ${newShopId}`);
-      return newShopData; 
-    } catch (error: any) {
-      console.error("[AppContext/registerShop] Error saving shop to Firestore:", error);
-      addNotification({ message: `Failed to register shop: ${error.message}`, type: 'error' });
+      await setDoc(shopDocRef, newShopData);
+      return newShopData;
+    } catch (err: unknown) {
+      addNotification({ message: `Failed to register shop: ${getErrorMessage(err)}`, type: 'error' });
       return null;
     }
   }, [addNotification]);
@@ -345,246 +535,339 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     authUser: FirebaseUser,
     shopDetails: { shopName: string; shopAddress: string },
     displayName?: string
-  ): Promise<{success: boolean; message?: string; shopId?: string}> => {
+  ): Promise<{ success: boolean; message?: string; shopId?: string }> => {
     setIsLoadingAuth(true);
 
     const trimmedShopName = shopDetails.shopName.trim();
     if (!trimmedShopName) {
       setIsLoadingAuth(false);
       const message = "Shop name cannot be empty.";
-      addNotification({message, type: 'error'});
-      return {success: false, message};
+      addNotification({ message, type: 'error' });
+      return { success: false, message };
     }
 
-    // Case-insensitive check for existing shop name
     if (shops.some(s => s.name.trim().toLowerCase() === trimmedShopName.toLowerCase())) {
       setIsLoadingAuth(false);
       const message = `A shop with the name "${trimmedShopName}" already exists. Please choose a different name.`;
-      addNotification({message, type: 'error'});
-      return {success: false, message};
+      addNotification({ message, type: 'error' });
+      return { success: false, message };
     }
 
     let newShop: ShopProfile | null = null;
     try {
       newShop = await registerShop(trimmedShopName, shopDetails.shopAddress, authUser.uid, DEFAULT_SHOP_PRICING);
-      
+
       if (!newShop || typeof newShop.id !== 'string' || newShop.id.trim() === '') {
-        console.error("[AppContext/completeShopOwnerProfileCreation] Failed to register shop or received invalid shop ID. newShop:", newShop);
         throw new Error("Failed to register shop profile in Firestore. Shop data or ID is null/invalid or not a string.");
       }
 
-      const ownerName = displayName || authUser.displayName || `Shop Owner ${authUser.uid.slice(0,6)}`;
-      
-      const shopOwnerProfileData: User = { 
-        id: authUser.uid, 
-        name: ownerName, 
+      const ownerName = displayName || authUser.displayName || 'Shop Owner';
+
+      const shopOwnerProfileData: User = {
+        id: authUser.uid,
+        name: ownerName,
         type: UserType.SHOP_OWNER,
-        shopId: newShop.id, 
+        shopId: newShop.id,
         ...(authUser.email && { email: authUser.email }),
       };
-      
-      await setDoc(doc(db, "users", authUser.uid), shopOwnerProfileData); 
+
+      await setDoc(doc(db, "users", authUser.uid), shopOwnerProfileData);
 
       setCurrentUserInternal(shopOwnerProfileData);
       setPendingFirebaseProfileCreationUser(null);
-      
-      addNotification({message: `Welcome, ${ownerName}! Shop '${newShop.name}' registered.`, type: 'success', targetUserId: shopOwnerProfileData.id});
-      return {success: true, shopId: newShop.id};
-    } catch (error: any) {
-      console.error("[AppContext/completeShopOwnerProfileCreation] Error saving profile/shop:", error);
-      const message = (error as Error).message || 'Could not save shop owner profile or shop details.';
-      addNotification({message: `Shop registration failed: ${message}`, type: 'error'});
+
+      addNotification({ message: `Welcome, ${ownerName}! Shop '${newShop.name}' registered and is pending admin approval.`, type: 'success', targetUserId: shopOwnerProfileData.id });
+      return { success: true, shopId: newShop.id };
+    } catch (err: unknown) {
+      const message = getErrorMessage(err);
+      addNotification({ message: `Shop registration failed: ${message}`, type: 'error' });
       try {
-        if (auth.currentUser) await signOut(auth); 
-      } catch (signOutError) {
-        console.error("[AppContext/completeShopOwnerProfileCreation] Error signing out user after profile/shop save failure:", signOutError);
+        if (auth.currentUser) await signOut(auth);
+      } catch (signOutErr) {
+        console.warn('[AppContext] Failed to sign out after shop registration error:', getErrorMessage(signOutErr));
       }
-      return {success: false, message};
+      return { success: false, message };
     } finally {
       setIsLoadingAuth(false);
     }
-  }, [registerShop, addNotification, shops]); // Added `shops` to dependency array
+  }, [registerShop, addNotification, shops]);
 
   const logoutUser = async (): Promise<void> => {
     setIsLoadingAuth(true);
     try {
       await signOut(auth);
-    } catch (error: any) {
-      handleAuthError(error, "Logout");
+    } catch (err: unknown) {
+      handleAuthError(err);
     } finally {
-      setIsLoadingAuth(false); 
+      setIsLoadingAuth(false);
+    }
+  };
+
+  const upgradeToStudentPass = async (): Promise<{ success: boolean; message?: string }> => {
+    if (!currentUser) return { success: false, message: "Not logged in" };
+
+    try {
+      if (currentUser.type !== UserType.STUDENT) {
+        return { success: false, message: "Only students can upgrade to Student Pass." };
+      }
+
+      const userRef = doc(db, "users", currentUser.id);
+      await updateDoc(userRef, { hasStudentPass: true });
+
+      setCurrentUserInternal(prev => prev ? { ...prev, hasStudentPass: true } : null);
+
+      addNotification({
+        message: "Congratulations! You have upgraded to Student Pass.",
+        type: 'success',
+        targetUserId: currentUser.id
+      });
+
+      return { success: true };
+    } catch (err: unknown) {
+      return { success: false, message: getErrorMessage(err) };
+    }
+  };
+
+  const cancelStudentPass = async (): Promise<{ success: boolean; message?: string }> => {
+    if (!currentUser) return { success: false, message: "Not logged in" };
+
+    try {
+      if (currentUser.type !== UserType.STUDENT) {
+        return { success: false, message: "Only students can cancel Student Pass." };
+      }
+
+      const userRef = doc(db, "users", currentUser.id);
+      await updateDoc(userRef, { hasStudentPass: false });
+
+      setCurrentUserInternal(prev => prev ? { ...prev, hasStudentPass: false } : null);
+
+      addNotification({
+        message: "Your Student Pass has been cancelled. You will no longer receive the service fee discount.",
+        type: 'info',
+        targetUserId: currentUser.id
+      });
+
+      return { success: true };
+    } catch (err: unknown) {
+      return { success: false, message: getErrorMessage(err) };
     }
   };
 
   const getShopById = useCallback((shopId: string) => shops.find(s => s.id === shopId), [shops]);
-  
+
   const updateShopSettings = useCallback(async (shopId: string, newSettings: { pricing: ShopPricing; isOpen: boolean; payoutMethods?: PayoutMethod[] }) => {
     try {
-        const shopRef = doc(db, "shops", shopId);
-        // PayoutMethods are assumed to be cleaned by the caller (ShopSettingsModal)
-        // cleanPayoutMethods here just ensures the array itself is valid
-        const updateData: Partial<ShopProfile> = {
-            customPricing: newSettings.pricing,
-            isOpen: newSettings.isOpen,
-            payoutMethods: cleanPayoutMethods(newSettings.payoutMethods),
-        };
-        await updateDoc(shopRef, updateData);
-        const shopFromState = shops.find(s => s.id === shopId);
-        addNotification({ 
-            message: `Settings updated for shop ${shopFromState?.name || shopId}.`, 
-            type: 'success', 
-            targetShopId: shopId, 
-            ...(shopFromState?.ownerUserId && { targetUserId: shopFromState.ownerUserId }) 
-        });
-    } catch (error: any) {
-        console.error(`[AppContext/updateShopSettings] Error updating shop ${shopId} in Firestore:`, error);
-        addNotification({ message: `Failed to update shop settings: ${error.message}`, type: 'error', targetShopId: shopId });
+      const shopRef = doc(db, "shops", shopId);
+      const updateData: Partial<ShopProfile> = {
+        customPricing: newSettings.pricing,
+        isOpen: newSettings.isOpen,
+        payoutMethods: cleanPayoutMethods(newSettings.payoutMethods),
+      };
+      await updateDoc(shopRef, updateData);
+      const shopFromState = shops.find(s => s.id === shopId);
+      addNotification({
+        message: `Settings updated for shop ${shopFromState?.name || shopId}.`,
+        type: 'success',
+        targetShopId: shopId,
+        ...(shopFromState?.ownerUserId && { targetUserId: shopFromState.ownerUserId })
+      });
+    } catch (err: unknown) {
+      addNotification({ message: `Failed to update shop settings: ${getErrorMessage(err)}`, type: 'error', targetShopId: shopId });
     }
   }, [addNotification, shops]);
 
 
   const addOrder = useCallback(async (
-    orderData: Omit<DocumentOrder, 'id' | 'uploadedAt' | 'priceDetails' | 'status' | 'fileStoragePath' | 'fileSizeBytes' | 'isFileDeleted'> & { priceDetailsInput: Pick<DocumentOrder, 'shopId' | 'printOptions'>; fileObject: File }
-  ): Promise<{success: boolean, orderId?: string}> => {
-    const { fileObject, priceDetailsInput, ...serializableOrderData } = orderData;
+    orderData: {
+      userId: string;
+      shopId: string;
+      fileInputs: { file: File; fileType: string; pageCount: number; color: PrintColor; copies: number; doubleSided: boolean }[];
+    }
+  ): Promise<{ success: boolean, orderId?: string }> => {
+    const { userId, shopId, fileInputs } = orderData;
 
-    const targetShop = getShopById(priceDetailsInput.shopId);
+    if (!fileInputs || fileInputs.length === 0) {
+      addNotification({ message: "No files selected.", type: 'error', targetUserId: userId });
+      return { success: false };
+    }
+
+    const targetShop = getShopById(shopId);
     if (!targetShop) {
-      addNotification({message: "Error placing order: Selected shop not found.", type: 'error', targetUserId: serializableOrderData.userId});
-      return {success: false};
+      addNotification({ message: "Error placing order: Selected shop not found.", type: 'error', targetUserId: userId });
+      return { success: false };
     }
     if (!targetShop.isOpen) {
-      addNotification({message: `Error placing order: Shop '${targetShop.name}' is currently closed.`, type: 'error', targetUserId: serializableOrderData.userId});
-      return {success: false};
+      addNotification({ message: `Error placing order: Shop '${targetShop.name}' is currently closed.`, type: 'error', targetUserId: userId });
+      return { success: false };
     }
 
-    const calculatedPriceDetails = calculateOrderPrice(priceDetailsInput.printOptions, targetShop.customPricing);
-    
+    // Calculate price using multi-file pricing (per-file copies, color, doubleSided)
+    const hasStudentPass = currentUserRef.current?.hasStudentPass ?? false;
+    const calculatedPriceDetails = calculateMultiFileOrderPrice(
+      fileInputs.map(f => ({ pageCount: f.pageCount, color: f.color, copies: f.copies, doubleSided: f.doubleSided })),
+      targetShop.customPricing,
+      hasStudentPass
+    );
+
     const orderDocRef = doc(collection(db, "orders"));
     const orderId = orderDocRef.id;
     const uploadedAtTimestamp = new Date().toISOString();
-    
-    let actualFileStoragePath: string | undefined = undefined;
-    let fileSizeBytesValue: number | undefined = undefined;
 
-    if (fileObject && serializableOrderData.userId) {
-      const filePath = `orders/${serializableOrderData.userId}/${orderId}/${fileObject.name}`;
+    // Upload all files
+    const uploadedFiles: OrderFile[] = [];
+    addNotification({ message: `Uploading ${fileInputs.length} file(s)...`, type: 'info', targetUserId: userId });
+
+    for (let i = 0; i < fileInputs.length; i++) {
+      const fi = fileInputs[i];
+      const filePath = `orders/${userId}/${orderId}/${fi.file.name}`;
       const fileRef = storageRef(storage, filePath);
-      fileSizeBytesValue = fileObject.size;
-      
+
       try {
-        addNotification({ message: `Uploading ${fileObject.name}...`, type: 'info', targetUserId: serializableOrderData.userId });
-        const uploadTask = uploadBytesResumable(fileRef, fileObject);
-        await new Promise<void>((resolve, reject) => {
-          uploadTask.on('state_changed',
-            (_snapshot) => { /* TODO: Progress reporting */ },
-            (error) => { 
-              console.error("[AppContext/addOrder] File upload error:", error);
-              reject(error); 
-            },
-            () => { actualFileStoragePath = filePath; resolve(); }
-          );
+        const uploadTask = uploadBytesResumable(fileRef, fi.file, {
+          contentType: fi.file.type || 'application/octet-stream',
+          customMetadata: { originalFileName: fi.file.name },
         });
-      } catch (uploadError: any) {
-        addNotification({ message: `Failed to upload file: ${uploadError.message}. Please try again.`, type: 'error', targetUserId: serializableOrderData.userId });
-        return {success: false};
+        await new Promise<void>((resolve, reject) => {
+          uploadTask.on('state_changed', null, reject, () => resolve());
+        });
+
+        uploadedFiles.push({
+          fileName: fi.file.name,
+          fileType: fi.fileType,
+          fileStoragePath: filePath,
+          fileSizeBytes: fi.file.size,
+          isFileDeleted: false,
+          pageCount: fi.pageCount,
+          color: fi.color,
+          copies: fi.copies,
+          doubleSided: fi.doubleSided,
+        });
+      } catch (uploadError: unknown) {
+        addNotification({ message: `Failed to upload ${fi.file.name}: ${getErrorMessage(uploadError)}`, type: 'error', targetUserId: userId });
+        return { success: false };
       }
-    } else {
-        addNotification({ message: "File or user information missing, cannot upload.", type: 'error', targetUserId: serializableOrderData.userId });
-        return {success: false};
     }
 
-    if (!actualFileStoragePath) {
-        addNotification({ message: `Order for ${serializableOrderData.fileName} could not be placed due to file upload issue.`, type: 'error', targetUserId: serializableOrderData.userId });
-        return {success: false};
+    if (uploadedFiles.length === 0) {
+      addNotification({ message: "No files were uploaded successfully.", type: 'error', targetUserId: userId });
+      return { success: false };
     }
 
-    let orderingUserName = `User ${serializableOrderData.userId.slice(0,6)}`;
-    try {
-        const userDocRefFs = doc(db, "users", serializableOrderData.userId); 
-        const userDocSnap = await getDoc(userDocRefFs); 
-        if(userDocSnap.exists()){ orderingUserName = (userDocSnap.data() as User).name || orderingUserName; }
-    } catch(e) { console.warn("[AppContext/addOrder] Could not fetch ordering user's name", e)}
+    // Aggregate values for legacy printOptions
+    const totalPages = uploadedFiles.reduce((sum, f) => sum + f.pageCount, 0);
+    const totalCopies = uploadedFiles.reduce((sum, f) => sum + f.copies, 0);
+    const primaryColor = uploadedFiles[0].color;
+    const anyDoubleSided = uploadedFiles.some(f => f.doubleSided);
 
     const newOrder: DocumentOrder = {
-      ...serializableOrderData, 
-      id: orderId, 
-      uploadedAt: uploadedAtTimestamp, 
-      status: OrderStatus.PENDING_PAYMENT,
-      priceDetails: calculatedPriceDetails, 
-      shopId: priceDetailsInput.shopId, 
-      fileStoragePath: actualFileStoragePath, 
-      fileSizeBytes: fileSizeBytesValue, 
+      id: orderId,
+      userId,
+      shopId,
+      // Legacy fields from first file
+      fileName: uploadedFiles[0].fileName,
+      fileType: uploadedFiles[0].fileType,
+      fileStoragePath: uploadedFiles[0].fileStoragePath,
+      fileSizeBytes: uploadedFiles[0].fileSizeBytes,
       isFileDeleted: false,
+      // New multi-file array
+      files: uploadedFiles,
+      uploadedAt: uploadedAtTimestamp,
+      status: OrderStatus.PENDING_PAYMENT,
+      priceDetails: calculatedPriceDetails,
+      printOptions: {
+        copies: totalCopies,
+        color: primaryColor,
+        pages: totalPages,
+        doubleSided: anyDoubleSided,
+      },
     };
-    
+
     try {
-        await setDoc(orderDocRef, newOrder); 
-        addNotification({ message: `Order #${newOrder.id.slice(-6)} for ${newOrder.fileName} (₹${newOrder.priceDetails.totalPrice}) placed at ${targetShop.name}. Proceed to payment.`, orderId: newOrder.id, type: 'info', targetUserId: newOrder.userId });
-        addNotification({ message: `New job #${newOrder.id.slice(-6)} (${newOrder.fileName}) awaits payment. Customer: ${orderingUserName}.`, orderId: newOrder.id, type: 'info', targetShopId: newOrder.shopId });
-        return {success: true, orderId: newOrder.id};
-    } catch (firestoreError: any) {
-        console.error("[AppContext/addOrder] Error saving order to Firestore:", firestoreError);
-        addNotification({ message: `Failed to save order details: ${firestoreError.message}. Please try again.`, type: 'error', targetUserId: serializableOrderData.userId });
-        return {success: false};
+      await setDoc(orderDocRef, newOrder);
+      const fileLabel = uploadedFiles.length === 1 ? uploadedFiles[0].fileName : `${uploadedFiles.length} files`;
+      addNotification({ message: `Order #${orderId.slice(-6)} for ${fileLabel} (₹${calculatedPriceDetails.totalPrice}) placed at ${targetShop.name}. Proceed to payment.`, orderId, type: 'info', targetUserId: userId });
+      return { success: true, orderId };
+    } catch (firestoreError: unknown) {
+      addNotification({ message: `Failed to save order details: ${getErrorMessage(firestoreError)}. Please try again.`, type: 'error', targetUserId: userId });
+      return { success: false };
     }
 
   }, [addNotification, getShopById]);
 
   const updateOrderStatus = useCallback(async (orderId: string, status: OrderStatus, details?: { shopNotes?: string; paymentAttemptedAt?: string; actingUserType?: UserType }): Promise<DocumentOrder | undefined> => {
     const orderDocRef = doc(db, "orders", orderId);
-    let updatedOrderInstance: DocumentOrder | undefined;
 
     try {
-      const updatePayload: Partial<DocumentOrder> = { status };
-      if (details?.shopNotes !== undefined) updatePayload.shopNotes = details.shopNotes;
-      if (details?.paymentAttemptedAt) updatePayload.paymentAttemptedAt = details.paymentAttemptedAt;
-      if (status === OrderStatus.READY_FOR_PICKUP) {
-        const currentOrderSnap = await getDoc(orderDocRef);
-        if (currentOrderSnap.exists()) {
-            const currentOrderData = currentOrderSnap.data() as DocumentOrder;
-            if (!currentOrderData.pickupCode) {
-                 updatePayload.pickupCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-            }
-            updatedOrderInstance = { ...currentOrderData, ...updatePayload };
-        } else {
-            console.error(`[AppContext/updateOrderStatus] Order ${orderId} not found in Firestore for update.`);
-            return undefined;
+      // Use Firestore transaction for atomic read-then-write
+      const updatedOrderInstance = await runTransaction(db, async (transaction) => {
+        const orderSnap = await transaction.get(orderDocRef);
+
+        if (!orderSnap.exists()) {
+          throw new Error(`Order #${orderId.slice(-6)} not found.`);
         }
-      } else {
-         const currentOrderSnap = await getDoc(orderDocRef);
-         if (currentOrderSnap.exists()) {
-             updatedOrderInstance = { ...currentOrderSnap.data() as DocumentOrder, ...updatePayload };
-         }
+
+        const currentOrderData = orderSnap.data() as DocumentOrder;
+        const currentStatus = currentOrderData.status;
+
+        // Validate status transition
+        const allowedTransitions = VALID_STATUS_TRANSITIONS[currentStatus];
+        if (!allowedTransitions || !allowedTransitions.includes(status)) {
+          throw new Error(
+            `Invalid status transition: cannot move from "${currentStatus.replace(/_/g, ' ')}" to "${status.replace(/_/g, ' ')}".`
+          );
+        }
+
+        // Build update payload
+        const updatePayload: Partial<DocumentOrder> = { status };
+        if (details?.shopNotes !== undefined) updatePayload.shopNotes = details.shopNotes;
+        if (details?.paymentAttemptedAt) updatePayload.paymentAttemptedAt = details.paymentAttemptedAt;
+        if (status === OrderStatus.READY_FOR_PICKUP && !currentOrderData.pickupCode) {
+          updatePayload.pickupCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+        }
+
+        // Atomic write inside transaction
+        transaction.update(orderDocRef, updatePayload);
+
+        return { ...currentOrderData, ...updatePayload };
+      });
+
+      // --- Auto-cleanup: Delete file from Storage when order is COMPLETED ---
+      if (status === OrderStatus.COMPLETED && updatedOrderInstance?.fileStoragePath && !updatedOrderInstance?.isFileDeleted) {
+        try {
+          const fileRef = storageRef(storage, updatedOrderInstance.fileStoragePath);
+          await deleteObject(fileRef);
+          await updateDoc(orderDocRef, { isFileDeleted: true });
+          console.log(`[AppContext] Auto-deleted file for completed order #${orderId.slice(-6)}`);
+        } catch (deleteError: unknown) {
+          console.warn(`[AppContext] Failed to auto-delete file for order #${orderId.slice(-6)}:`, getErrorMessage(deleteError));
+        }
       }
-      
-      await updateDoc(orderDocRef, updatePayload);
-      console.log(`[AppContext/updateOrderStatus] Order ${orderId} successfully updated to status ${status} in Firestore.`);
-      
+
+      // Send notifications
       if (updatedOrderInstance) {
         const targetShop = getShopById(updatedOrderInstance.shopId);
-        let studentUserName = `User ${updatedOrderInstance.userId.slice(0,6)}`;
-         try {
-          const userDocRefFs = doc(db, "users", updatedOrderInstance.userId); 
-          const userDocSnap = await getDoc(userDocRefFs); 
-          if(userDocSnap.exists()){ studentUserName = (userDocSnap.data() as User).name || studentUserName; }
-        } catch(e) { console.warn("[AppContext/updateOrderStatus] Could not fetch student user's name for notification", e)}
+        let studentUserName = 'Student';
+        try {
+          const userDocRefFs = doc(db, "users", updatedOrderInstance.userId);
+          const userDocSnap = await getDoc(userDocRefFs);
+          if (userDocSnap.exists()) { studentUserName = (userDocSnap.data() as User).name || studentUserName; }
+        } catch (e) { console.warn("[AppContext/updateOrderStatus] Could not fetch student user's name for notification", e) }
 
         let studentMessage = `Order #${orderId.slice(-6)} (${updatedOrderInstance.fileName}) at ${targetShop?.name || 'shop'} is now ${status.replace(/_/g, ' ').toLowerCase()}.`;
-        let shopMessage = `Order #${orderId.slice(-6)} (${updatedOrderInstance.fileName}) by ${studentUserName} is now ${status.replace(/_/g, ' ').toLowerCase()}.`;
+        const shopMessage = `Order #${orderId.slice(-6)} (${updatedOrderInstance.fileName}) by ${studentUserName} is now ${status.replace(/_/g, ' ').toLowerCase()}.`;
         let type: NotificationMessage['type'] = 'info';
 
-        if (status === OrderStatus.PENDING_APPROVAL) { 
+        if (status === OrderStatus.PENDING_APPROVAL) {
           type = 'success';
           addNotification({ message: shopMessage, orderId, type, targetShopId: updatedOrderInstance.shopId });
           addNotification({ message: studentMessage, orderId, type, targetUserId: updatedOrderInstance.userId });
-        } else if (status === OrderStatus.PAYMENT_FAILED) { 
+        } else if (status === OrderStatus.PAYMENT_FAILED) {
           type = 'error';
           addNotification({ message: shopMessage, orderId, type, targetShopId: updatedOrderInstance.shopId });
           addNotification({ message: studentMessage, orderId, type, targetUserId: updatedOrderInstance.userId });
         } else if (details?.actingUserType === UserType.SHOP_OWNER) {
           if (status === OrderStatus.READY_FOR_PICKUP) {
-            studentMessage += ` Pickup code: ${updatedOrderInstance.pickupCode}`; 
+            studentMessage += ` Pickup code: ${updatedOrderInstance.pickupCode}`;
             type = 'success';
           } else if (status === OrderStatus.CANCELLED) {
             studentMessage = `Order #${orderId.slice(-6)} has been cancelled by ${targetShop?.name || 'the shop'}.`;
@@ -594,42 +877,314 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           addNotification({ message: studentMessage, orderId, type, targetUserId: updatedOrderInstance.userId });
         }
       }
-      return updatedOrderInstance; 
-    } catch (firestoreError: any) {
-      console.error(`[AppContext/updateOrderStatus] Error updating order ${orderId} in Firestore:`, firestoreError);
-      addNotification({ message: `Failed to update order status: ${firestoreError.message}`, type: 'error' });
+      return updatedOrderInstance;
+    } catch (err: unknown) {
+      addNotification({ message: `Failed to update order status: ${getErrorMessage(err)}`, type: 'error' });
       return undefined;
     }
   }, [addNotification, getShopById]);
 
+  // --- Admin Payout Functions ---
+  const createPayout = useCallback(async (shopId: string, shopName: string, amount: number, adminNote?: string): Promise<{ success: boolean; message?: string }> => {
+    if (!currentUser || currentUser.type !== UserType.ADMIN) {
+      return { success: false, message: "Only admins can create payouts." };
+    }
+    if (amount <= 0) {
+      return { success: false, message: "Amount must be greater than 0." };
+    }
+    try {
+      const payoutDocRef = doc(collection(db, "payouts"));
+      const newPayout: ShopPayout = {
+        id: payoutDocRef.id,
+        shopId,
+        shopName,
+        amount,
+        adminNote: adminNote || '',
+        status: PayoutStatus.PAID,
+        createdAt: new Date().toISOString(),
+        paidAt: new Date().toISOString(),
+      };
+      await setDoc(payoutDocRef, newPayout);
+      addNotification({ message: `Payout of ₹${amount.toFixed(2)} created for ${shopName}.`, type: 'success' });
+      return { success: true };
+    } catch (err: unknown) {
+      const message = getErrorMessage(err);
+      addNotification({ message: `Failed to create payout: ${message}`, type: 'error' });
+      return { success: false, message };
+    }
+  }, [currentUser, addNotification]);
+
+  const requestPayout = useCallback(async (shopId: string, shopName: string, amount: number, shopOwnerNote?: string): Promise<{ success: boolean; message?: string }> => {
+    if (!currentUser || currentUser.type !== UserType.SHOP_OWNER) {
+      return { success: false, message: "Only shop owners can request payouts." };
+    }
+    if (amount <= 0) {
+      return { success: false, message: "Amount must be greater than 0." };
+    }
+    try {
+      const payoutDocRef = doc(collection(db, "payouts"));
+      const newPayout: ShopPayout = {
+        id: payoutDocRef.id,
+        shopId,
+        shopName,
+        amount,
+        shopOwnerNote: shopOwnerNote || '',
+        status: PayoutStatus.PENDING,
+        createdAt: new Date().toISOString(),
+      };
+      await setDoc(payoutDocRef, newPayout);
+      addNotification({ message: `Payout request of ₹${amount.toFixed(2)} submitted. Admin will review and process it.`, type: 'success', targetShopId: shopId });
+      // Notify admin about the request
+      addNotification({ message: `${shopName} has requested a payout of ₹${amount.toFixed(2)}.`, type: 'info', targetUserId: 'ADMIN' });
+      return { success: true };
+    } catch (err: unknown) {
+      const message = getErrorMessage(err);
+      addNotification({ message: `Failed to request payout: ${message}`, type: 'error' });
+      return { success: false, message };
+    }
+  }, [currentUser, addNotification]);
+
+  const markPayoutPaid = useCallback(async (payoutId: string): Promise<{ success: boolean; message?: string }> => {
+    if (!currentUser || currentUser.type !== UserType.ADMIN) {
+      return { success: false, message: "Only admins can mark payouts as paid." };
+    }
+    try {
+      const payoutRef = doc(db, "payouts", payoutId);
+      await updateDoc(payoutRef, {
+        status: PayoutStatus.PAID,
+        paidAt: new Date().toISOString(),
+      });
+      addNotification({ message: `Payout marked as paid.`, type: 'success' });
+      return { success: true };
+    } catch (err: unknown) {
+      return { success: false, message: getErrorMessage(err) };
+    }
+  }, [currentUser, addNotification]);
+
+  const confirmPayout = useCallback(async (payoutId: string): Promise<{ success: boolean; message?: string }> => {
+    if (!currentUser || currentUser.type !== UserType.SHOP_OWNER) {
+      return { success: false, message: "Only shop owners can confirm payouts." };
+    }
+    try {
+      const payoutRef = doc(db, "payouts", payoutId);
+      await updateDoc(payoutRef, {
+        status: PayoutStatus.CONFIRMED,
+        confirmedAt: new Date().toISOString(),
+      });
+      addNotification({ message: `Payout confirmed! Thank you.`, type: 'success', targetUserId: currentUser.id });
+      return { success: true };
+    } catch (err: unknown) {
+      return { success: false, message: getErrorMessage(err) };
+    }
+  }, [currentUser, addNotification]);
+
+  const disputePayout = useCallback(async (payoutId: string, shopOwnerNote: string): Promise<{ success: boolean; message?: string }> => {
+    if (!currentUser || currentUser.type !== UserType.SHOP_OWNER) {
+      return { success: false, message: "Only shop owners can dispute payouts." };
+    }
+    try {
+      const payoutRef = doc(db, "payouts", payoutId);
+      await updateDoc(payoutRef, {
+        status: PayoutStatus.DISPUTED,
+        shopOwnerNote,
+      });
+      addNotification({ message: `Payout disputed. Admin has been notified.`, type: 'warning', targetUserId: currentUser.id });
+      return { success: true };
+    } catch (err: unknown) {
+      return { success: false, message: getErrorMessage(err) };
+    }
+  }, [currentUser, addNotification]);
+
   const markNotificationAsRead = useCallback((notificationId: string) => {
-    setNotifications(prev => prev.map(n => (n.id === notificationId ? { ...n, read: true } : n)));
+    if (notificationId.startsWith('local_')) {
+      // Local notification — update local state
+      setLocalNotifications(prev => prev.map(n => (n.id === notificationId ? { ...n, read: true } : n)));
+    } else {
+      // Firestore notification — update in database (onSnapshot will propagate the change)
+      updateDoc(doc(db, "notifications", notificationId), { read: true }).catch(err => {
+        console.error("[AppContext] Failed to mark notification as read:", err);
+      });
+    }
   }, []);
 
   const getNotificationsForCurrentUser = useCallback(() => {
-    if (!currentUser) return [];
-    return notifications.filter(n => {
-      if (n.targetUserId === currentUser.id) return true;
-      if (currentUser.type === UserType.SHOP_OWNER && n.targetShopId === currentUser.shopId && !n.targetUserId) return true;
-      return false;
-    }).sort((a,b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-  }, [notifications, currentUser]);
+    // Firestore listener already filters by recipientUserId for the current user.
+    // Local notifications are session-scoped for the current user by nature.
+    // Both are merged in the `notifications` useMemo.
+    return notifications;
+  }, [notifications]);
 
   const getOrdersForCurrentUser = useCallback(() => {
     return orders;
   }, [orders]);
 
+  // Admin shop management functions
+  const approveShop = useCallback(async (shopId: string): Promise<{ success: boolean; message?: string }> => {
+    if (!currentUser || currentUser.type !== UserType.ADMIN) {
+      return { success: false, message: "Only admins can approve shops." };
+    }
+    try {
+      const shopRef = doc(db, "shops", shopId);
+      await updateDoc(shopRef, { isApproved: true });
+      addNotification({ message: `Shop approved successfully.`, type: 'success' });
+      // Notify shop owner
+      const shop = shops.find(s => s.id === shopId);
+      if (shop) {
+        addNotification({
+          message: `Your shop "${shop.name}" has been approved by the admin! You can now accept orders.`,
+          type: 'success',
+          targetUserId: shop.ownerUserId,
+          targetShopId: shopId,
+        });
+      }
+      return { success: true };
+    } catch (err: unknown) {
+      const message = getErrorMessage(err);
+      addNotification({ message: `Failed to approve shop: ${message}`, type: 'error' });
+      return { success: false, message };
+    }
+  }, [currentUser, addNotification, shops]);
+
+  const rejectShop = useCallback(async (shopId: string): Promise<{ success: boolean; message?: string }> => {
+    if (!currentUser || currentUser.type !== UserType.ADMIN) {
+      return { success: false, message: "Only admins can reject shops." };
+    }
+    try {
+      const shop = shops.find(s => s.id === shopId);
+      // Delete the shop document
+      await deleteDoc(doc(db, "shops", shopId));
+      // Also delete the owner's user profile so they can re-register
+      if (shop) {
+        await deleteDoc(doc(db, "users", shop.ownerUserId));
+        addNotification({
+          message: `Shop "${shop.name}" registration was rejected.`,
+          type: 'warning',
+          targetUserId: shop.ownerUserId,
+        });
+      }
+      addNotification({ message: `Shop rejected and removed.`, type: 'info' });
+      return { success: true };
+    } catch (err: unknown) {
+      const message = getErrorMessage(err);
+      addNotification({ message: `Failed to reject shop: ${message}`, type: 'error' });
+      return { success: false, message };
+    }
+  }, [currentUser, addNotification, shops]);
+
+  const deleteShopAndOwner = useCallback(async (shopId: string, ownerUserId: string): Promise<{ success: boolean; message?: string }> => {
+    if (!currentUser || currentUser.type !== UserType.ADMIN) {
+      return { success: false, message: "Only admins can delete shops." };
+    }
+    try {
+      // Delete the shop
+      await deleteDoc(doc(db, "shops", shopId));
+      // Delete the owner's user profile
+      await deleteDoc(doc(db, "users", ownerUserId));
+      addNotification({ message: `Shop and owner account deleted.`, type: 'success' });
+      return { success: true };
+    } catch (err: unknown) {
+      const message = getErrorMessage(err);
+      addNotification({ message: `Failed to delete shop: ${message}`, type: 'error' });
+      return { success: false, message };
+    }
+  }, [currentUser, addNotification]);
+
+  // Archive / Unarchive shop (admin)
+  const archiveShop = useCallback(async (shopId: string): Promise<{ success: boolean; message?: string }> => {
+    if (!currentUser || currentUser.type !== UserType.ADMIN) {
+      return { success: false, message: "Only admins can archive shops." };
+    }
+    try {
+      const shopRef = doc(db, "shops", shopId);
+      await updateDoc(shopRef, { isArchived: true, isOpen: false });
+      const shop = shops.find(s => s.id === shopId);
+      addNotification({ message: `Shop "${shop?.name || shopId}" has been archived.`, type: 'info' });
+      if (shop) {
+        addNotification({
+          message: `Your shop "${shop.name}" has been archived by the admin. It is no longer visible to students.`,
+          type: 'warning',
+          targetUserId: shop.ownerUserId,
+          targetShopId: shopId,
+        });
+      }
+      return { success: true };
+    } catch (err: unknown) {
+      const message = getErrorMessage(err);
+      addNotification({ message: `Failed to archive shop: ${message}`, type: 'error' });
+      return { success: false, message };
+    }
+  }, [currentUser, addNotification, shops]);
+
+  const unarchiveShop = useCallback(async (shopId: string): Promise<{ success: boolean; message?: string }> => {
+    if (!currentUser || currentUser.type !== UserType.ADMIN) {
+      return { success: false, message: "Only admins can unarchive shops." };
+    }
+    try {
+      const shopRef = doc(db, "shops", shopId);
+      await updateDoc(shopRef, { isArchived: false });
+      const shop = shops.find(s => s.id === shopId);
+      addNotification({ message: `Shop "${shop?.name || shopId}" has been unarchived.`, type: 'success' });
+      if (shop) {
+        addNotification({
+          message: `Your shop "${shop.name}" has been restored by the admin. You can now accept orders again.`,
+          type: 'success',
+          targetUserId: shop.ownerUserId,
+          targetShopId: shopId,
+        });
+      }
+      return { success: true };
+    } catch (err: unknown) {
+      const message = getErrorMessage(err);
+      addNotification({ message: `Failed to unarchive shop: ${message}`, type: 'error' });
+      return { success: false, message };
+    }
+  }, [currentUser, addNotification, shops]);
+
+  // Shop owner self-delete account
+  const deleteOwnShopAccount = useCallback(async (): Promise<{ success: boolean; message?: string }> => {
+    if (!currentUser || currentUser.type !== UserType.SHOP_OWNER || !currentUser.shopId) {
+      return { success: false, message: "Only shop owners can delete their own account." };
+    }
+    try {
+      // Delete the shop document
+      await deleteDoc(doc(db, "shops", currentUser.shopId));
+      // Delete the user profile document
+      await deleteDoc(doc(db, "users", currentUser.id));
+      // Sign out
+      await signOut(auth);
+      addNotification({ message: "Your shop account has been deleted.", type: 'info' });
+      return { success: true };
+    } catch (err: unknown) {
+      const message = getErrorMessage(err);
+      addNotification({ message: `Failed to delete account: ${message}`, type: 'error' });
+      return { success: false, message };
+    }
+  }, [currentUser, addNotification]);
+
+  // Approved shops — only approved and non-archived shops visible to students
+  const approvedShops = useMemo(() => shops.filter(s => s.isApproved && !s.isArchived), [shops]);
+
+  const contextValue = useMemo(() => ({
+    currentUser, isLoadingAuth, pendingFirebaseProfileCreationUser, setPendingFirebaseProfileCreationUser,
+    signInWithGoogle, signUpWithEmailPassword, signInWithEmailAndPassword: signInWithEmailAndPasswordInternal,
+    completeStudentProfileCreation, completeShopOwnerProfileCreation, logoutUser,
+    shops, isLoadingShops, getShopById, registerShop, updateShopSettings,
+    orders, allOrders, getOrdersForCurrentUser,
+    notifications,
+    addOrder, updateOrderStatus,
+    addNotification, markNotificationAsRead, getNotificationsForCurrentUser,
+    currentView, navigateTo, upgradeToStudentPass, cancelStudentPass,
+    payouts, createPayout, requestPayout, markPayoutPaid, confirmPayout, disputePayout,
+    approveShop, rejectShop, deleteShopAndOwner, archiveShop, unarchiveShop, approvedShops,
+    deleteOwnShopAccount
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }), [
+    currentUser, isLoadingAuth, pendingFirebaseProfileCreationUser,
+    shops, isLoadingShops, orders, allOrders, notifications, currentView, payouts, approvedShops
+  ]);
+
   return (
-    <AppContext.Provider value={{
-        currentUser, isLoadingAuth, pendingFirebaseProfileCreationUser, setPendingFirebaseProfileCreationUser,
-        signInWithGoogle, signUpWithEmailPassword, signInWithEmailAndPassword: signInWithEmailAndPasswordInternal,
-        completeStudentProfileCreation, completeShopOwnerProfileCreation, logoutUser,
-        shops, isLoadingShops, getShopById, registerShop, updateShopSettings,
-        orders, getOrdersForCurrentUser,
-        notifications,
-        addOrder, updateOrderStatus,
-        addNotification, markNotificationAsRead, getNotificationsForCurrentUser,
-    }}>
+    <AppContext.Provider value={contextValue}>
       {children}
     </AppContext.Provider>
   );

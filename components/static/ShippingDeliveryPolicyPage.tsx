@@ -1,10 +1,15 @@
 
-import React from 'react';
+
+import React, { useEffect } from 'react';
 import { Card } from '../common/Card';
 
 const ShippingDeliveryPolicyPage: React.FC = () => {
+  useEffect(() => {
+    window.scrollTo(0, 0);
+  }, []);
+
   return (
-    <div className="max-w-3xl mx-auto py-8 px-4">
+    <div className="max-w-3xl mx-auto pt-24 pb-8 px-4">
       <Card title="Service Delivery Policy" className="bg-brand-secondary/80 backdrop-blur-sm">
         <div className="prose prose-sm sm:prose lg:prose-lg xl:prose-xl max-w-none text-brand-lightText space-y-4">
           <p><strong>Last Updated: {new Date().toLocaleDateString()}</strong></p>
@@ -33,16 +38,16 @@ const ShippingDeliveryPolicyPage: React.FC = () => {
             <li>Students should pick up their orders within a reasonable timeframe (e.g., [e.g., 7 days]) after receiving the "Ready for Pickup" notification. Shops may have their own policies regarding unclaimed orders.</li>
             <li>Valid identification along with the Pickup Code may be required by the print shop.</li>
           </ul>
-          
+
           <h2 className="text-brand-primary">5. Shop Operating Hours</h2>
           <p>Students should check the operating hours of the selected print shop before going for pickup. EzyPrint endeavors to display shop open/closed status, but it is the student's responsibility to verify pickup times.</p>
 
           <h2 className="text-brand-primary">6. Issues with Pickup</h2>
           <p>If a student encounters any issues during pickup (e.g., shop closed during stated hours, order not found despite notification), they should first try to resolve it with the print shop staff. If unresolved, contact EzyPrint support for assistance.</p>
-          
+
           <h2 className="text-brand-primary">7. Contact</h2>
           <p>For any questions regarding service delivery or pickup, please contact the respective print shop or EzyPrint support.</p>
-          <p className="italic text-brand-muted">This is a template. Please adapt it to accurately reflect your service model. Ensure clarity that this is a pickup-only service.</p>
+
         </div>
       </Card>
     </div>

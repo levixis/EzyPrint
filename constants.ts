@@ -13,3 +13,8 @@ export const DEFAULT_SHOP_PRICING = {
   bwPerPage: 1,
   colorPerPage: 3,
 };
+
+// Admin emails — users with these emails are auto-detected as admins on login
+export const ADMIN_EMAILS: string[] = [
+  'harshvardhanjha339@gmail.com',
+];
