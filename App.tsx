@@ -2,6 +2,7 @@
 
 
 import React, { useEffect, useRef } from 'react';
+import { initMobile } from './utils/mobile';
 import { UserType, AppView } from './types';
 import Header from './components/layout/Header';
 import StudentDashboard from './components/student/StudentDashboard';
@@ -40,6 +41,9 @@ const AppContent: React.FC = () => {
 
   // Valid views for each user type - these views don't require redirect
   const staticPages: AppView[] = ['privacy', 'terms', 'refund', 'shipping', 'contact'];
+
+  // Initialize mobile platform features (status bar, splash screen, etc.)
+  useEffect(() => { initMobile(); }, []);
 
   useEffect(() => {
     // Don't do anything while auth is still loading

@@ -22,3 +22,10 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Capacitor native build artifacts
+android/app/build/
+android/.gradle/
+android/build/
+ios/App/Pods/
+ios/DerivedData/

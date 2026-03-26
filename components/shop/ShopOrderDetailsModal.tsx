@@ -8,6 +8,7 @@ import { Input } from '../common/Input';
 import { storage, storageRef, getDownloadURL, getBlob } from '../../firebase';
 import { Spinner } from '../common/Spinner';
 import { getOrderFiles } from '../../utils/orderHelpers';
+import { downloadFileNative } from '../../utils/mobile';
 
 interface ShopOrderDetailsModalProps {
   order: DocumentOrder;
@@ -98,24 +99,8 @@ const ShopOrderDetailsModal: React.FC<ShopOrderDetailsModalProps> = ({
       }
       if (!downloadName) downloadName = 'download';
 
-      const blobUrl = window.URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.style.display = 'none';
-      document.body.appendChild(link);
-      // Set attributes AFTER appending to DOM for Chrome compatibility
-      link.href = blobUrl;
-      link.setAttribute('download', downloadName);
-      // Use a real MouseEvent instead of .click() — Chrome honors the
-      // download attribute more reliably with a dispatched MouseEvent
-      link.dispatchEvent(new MouseEvent('click', {
-        bubbles: true,
-        cancelable: true,
-        view: window,
-      }));
-      setTimeout(() => {
-        document.body.removeChild(link);
-        window.URL.revokeObjectURL(blobUrl);
-      }, 300);
+      // Use cross-platform download (native filesystem on mobile, blob URL on web)
+      await downloadFileNative(blob, downloadName);
     } catch (error: unknown) {
       console.error("[ShopOrderDetailsModal] Error downloading file:", error);
       setDownloadError(`Download failed for "${file.fileName}": ${error instanceof Error ? error.message : "Unknown error"}`);

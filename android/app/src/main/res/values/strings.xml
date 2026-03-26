@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">EzyPrint</string>
+    <string name="title_activity_main">EzyPrint</string>
+    <string name="package_name">com.ezyprint.app</string>
+    <string name="custom_url_scheme">com.ezyprint.app</string>
+</resources>

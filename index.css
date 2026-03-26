@@ -7,6 +7,23 @@
 @layer base {
   body {
     @apply bg-brand-bg text-brand-text dark:bg-brand-dark-bg dark:text-brand-dark-text font-sans antialiased transition-colors duration-300;
+    /* Safe area insets for iOS notch / Dynamic Island and Android gesture bar */
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+    /* Prevent overscroll bounce on mobile */
+    overscroll-behavior: none;
+    /* Prevent text selection on long-press for a more native feel */
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  /* Re-enable text selection on input/textarea so users can still select text */
+  input, textarea, [contenteditable] {
+    -webkit-user-select: text;
+    user-select: text;
   }
 }
 
