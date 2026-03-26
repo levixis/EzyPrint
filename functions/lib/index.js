@@ -36,7 +36,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.cleanupAbandonedOrders = exports.onOrderStatusChange = exports.verifyPassPayment = exports.createPassOrder = exports.verifyPayment = exports.createOrder = void 0;
+exports.onNewOrder = exports.cleanupAbandonedOrders = exports.onOrderStatusChange = exports.verifyPassPayment = exports.createPassOrder = exports.verifyPayment = exports.createOrder = void 0;
 const https_1 = require("firebase-functions/v2/https");
 const firestore_1 = require("firebase-functions/v2/firestore");
 const scheduler_1 = require("firebase-functions/v2/scheduler");
@@ -55,6 +55,90 @@ function getRazorpay() {
         });
     }
     return _razorpay;
+}
+// ---------- FCM Push Notification Helper ----------
+/**
+ * Send a push notification to a user's registered devices.
+ * Reads fcmTokens[] from the user's Firestore document and sends via FCM.
+ * Automatically cleans up invalid/expired tokens.
+ */
+async function sendPushToUser(userId, title, body, data) {
+    try {
+        const userDoc = await db.collection("users").doc(userId).get();
+        if (!userDoc.exists)
+            return;
+        const userData = userDoc.data();
+        const tokens = userData.fcmTokens || [];
+        if (tokens.length === 0) {
+            console.log(`[FCM] No FCM tokens for user ${userId.slice(-6)}, skipping push`);
+            return;
+        }
+        const message = {
+            notification: { title, body },
+            data: data || {},
+            android: {
+                notification: {
+                    channelId: "ezyprint_orders",
+                    priority: "high",
+                    sound: "default",
+                },
+            },
+            apns: {
+                payload: {
+                    aps: {
+                        alert: { title, body },
+                        sound: "default",
+                        badge: 1,
+                    },
+                },
+            },
+        };
+        // Send to all registered devices
+        const invalidTokens = [];
+        for (const token of tokens) {
+            try {
+                await admin.messaging().send({ ...message, token });
+                console.log(`[FCM] Push sent to token ${token.slice(-8)} for user ${userId.slice(-6)}`);
+            }
+            catch (err) {
+                // Token is invalid or expired — mark for cleanup
+                if (err.code === "messaging/invalid-registration-token" ||
+                    err.code === "messaging/registration-token-not-registered") {
+                    invalidTokens.push(token);
+                    console.warn(`[FCM] Invalid token ${token.slice(-8)}, will remove`);
+                }
+                else {
+                    console.error(`[FCM] Error sending to token ${token.slice(-8)}:`, err.message);
+                }
+            }
+        }
+        // Clean up invalid tokens
+        if (invalidTokens.length > 0) {
+            const validTokens = tokens.filter(t => !invalidTokens.includes(t));
+            await db.collection("users").doc(userId).update({ fcmTokens: validTokens });
+            console.log(`[FCM] Cleaned ${invalidTokens.length} invalid token(s) for user ${userId.slice(-6)}`);
+        }
+    }
+    catch (error) {
+        console.error(`[FCM] Failed to send push to user ${userId.slice(-6)}:`, error.message);
+    }
+}
+/**
+ * Send push to the shop owner by looking up the shop's ownerUserId.
+ */
+async function sendPushToShop(shopId, title, body, data) {
+    try {
+        const shopDoc = await db.collection("shops").doc(shopId).get();
+        if (!shopDoc.exists)
+            return;
+        const ownerUserId = shopDoc.data().ownerUserId;
+        if (ownerUserId) {
+            await sendPushToUser(ownerUserId, title, body, data);
+        }
+    }
+    catch (error) {
+        console.error(`[FCM] Failed to send push to shop ${shopId}:`, error.message);
+    }
 }
 function calculateBaseFee(pageCost) {
     if (pageCost <= 0)
@@ -337,12 +421,43 @@ exports.onOrderStatusChange = (0, firestore_1.onDocumentUpdated)({ document: "or
         return;
     const oldStatus = beforeData.status;
     const newStatus = afterData.status;
-    // Only trigger on status transitions to COMPLETED or CANCELLED
+    // Only trigger on actual status transitions
     if (oldStatus === newStatus)
         return;
+    const orderId = event.params.orderId;
+    const orderShortId = orderId.slice(-6);
+    const fileName = afterData.fileName || "document";
+    // --- PUSH NOTIFICATIONS for all status transitions ---
+    try {
+        if (newStatus === "PENDING_APPROVAL") {
+            await sendPushToUser(afterData.userId, "Payment Confirmed! ✅", `Order #${orderShortId} (${fileName}) — payment verified. Your print is queued.`, { orderId, type: "order_status" });
+            // Also notify the shopkeeper about the new paid order
+            await sendPushToShop(afterData.shopId, "New Paid Order! 🖨️", `Order #${orderShortId} (${fileName}) — ₹${afterData.priceDetails?.totalPrice?.toFixed(2) || "?"} paid. Ready to print.`, { orderId, type: "new_order" });
+        }
+        else if (newStatus === "PRINTING") {
+            await sendPushToUser(afterData.userId, "Printing Started 🖨️", `Order #${orderShortId} (${fileName}) is now being printed.`, { orderId, type: "order_status" });
+        }
+        else if (newStatus === "READY_FOR_PICKUP") {
+            const pickupCode = afterData.pickupCode || "";
+            await sendPushToUser(afterData.userId, "Ready for Pickup! 📦", `Order #${orderShortId} is ready! ${pickupCode ? `Pickup code: ${pickupCode}` : "Show your order ID."}`, { orderId, type: "order_status", pickupCode });
+        }
+        else if (newStatus === "COMPLETED") {
+            await sendPushToUser(afterData.userId, "Order Complete ✅", `Order #${orderShortId} (${fileName}) has been completed. Thank you!`, { orderId, type: "order_status" });
+        }
+        else if (newStatus === "CANCELLED") {
+            await sendPushToUser(afterData.userId, "Order Cancelled ❌", `Order #${orderShortId} (${fileName}) has been cancelled.${afterData.shopNotes ? " Reason: " + afterData.shopNotes : ""}`, { orderId, type: "order_status" });
+        }
+        else if (newStatus === "PAYMENT_FAILED") {
+            await sendPushToUser(afterData.userId, "Payment Failed ⚠️", `Payment failed for order #${orderShortId}. Please try again.`, { orderId, type: "order_status" });
+        }
+    }
+    catch (pushError) {
+        // Push notification failures should never break the main flow
+        console.error(`[onOrderStatusChange] Push notification error:`, pushError.message);
+    }
+    // --- AUTO-REFUND & FILE CLEANUP: Only for COMPLETED or CANCELLED ---
     if (newStatus !== "COMPLETED" && newStatus !== "CANCELLED")
         return;
-    const orderId = event.params.orderId;
     // --- AUTO-REFUND: Issue Razorpay refund when a PAID order is CANCELLED ---
     if (newStatus === "CANCELLED" && afterData.razorpayPaymentId) {
         console.log(`[onOrderStatusChange] Order #${orderId.slice(-6)} cancelled with payment ${afterData.razorpayPaymentId}. Initiating automatic refund...`);
@@ -533,6 +648,28 @@ exports.cleanupAbandonedOrders = (0, scheduler_1.onSchedule)({
     }
     catch (error) {
         console.error("[cleanupAbandonedOrders] Fatal error during cleanup:", error.message);
+    }
+});
+/**
+ * onNewOrder — Push notification to shopkeeper when a new order is created.
+ * Triggers when an order document is first written to Firestore.
+ */
+exports.onNewOrder = (0, firestore_1.onDocumentCreated)({ document: "orders/{orderId}", region: "asia-south1" }, async (event) => {
+    const orderData = event.data?.data();
+    if (!orderData)
+        return;
+    const orderId = event.params.orderId;
+    const orderShortId = orderId.slice(-6);
+    const fileName = orderData.fileName || "document";
+    const fileCount = orderData.files?.length || 1;
+    const totalPrice = orderData.priceDetails?.totalPrice?.toFixed(2) || "?";
+    const fileLabel = fileCount === 1 ? fileName : `${fileCount} files`;
+    // Notify the shopkeeper about the new order
+    try {
+        await sendPushToShop(orderData.shopId, "New Order Received! 📄", `Order #${orderShortId} (${fileLabel}) — ₹${totalPrice}. Awaiting payment.`, { orderId, type: "new_order" });
+    }
+    catch (error) {
+        console.error(`[onNewOrder] Push notification error:`, error.message);
     }
 });
 //# sourceMappingURL=index.js.map

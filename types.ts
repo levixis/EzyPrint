@@ -12,6 +12,7 @@ export interface User {
   email?: string;
   shopId?: string;
   hasStudentPass?: boolean;
+  fcmTokens?: string[]; // Push notification device tokens
 }
 
 export interface ShopPricing {

@@ -45,6 +45,9 @@ const getErrorMessage = (err: unknown): string => {
 import { calculateBaseFee, calculateOrderPrice, calculateMultiFileOrderPrice } from '../utils/pricing';
 export { calculateBaseFee, calculateOrderPrice, calculateMultiFileOrderPrice };
 
+// Push notification registration for native mobile
+import { registerPushNotifications, unregisterPushNotifications } from '../utils/pushNotifications';
+
 interface AppContextType {
   currentUser: User | null;
   isLoadingAuth: boolean;
@@ -202,6 +205,21 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   useEffect(() => {
     currentUserRef.current = currentUser;
   }, [currentUser]);
+
+  // Register for push notifications when user logs in (native platforms only)
+  useEffect(() => {
+    if (currentUser?.id) {
+      registerPushNotifications(currentUser.id, (title, body) => {
+        // Show in-app notification when push arrives while app is in foreground
+        addNotificationRef.current({ message: body || title, type: 'info' });
+      });
+    }
+    return () => {
+      if (currentUser?.id) {
+        unregisterPushNotifications(currentUser.id);
+      }
+    };
+  }, [currentUser?.id]);
 
   // Shop data listener — uses addNotificationRef to avoid re-subscribing when addNotification changes
   useEffect(() => {
