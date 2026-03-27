@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { Capacitor } from '@capacitor/core';
 import { Button } from '../common/Button';
 import { useAppContext } from '../../contexts/AppContext';
 import { getFunctions, httpsCallable } from 'firebase/functions';
@@ -48,7 +49,6 @@ const StudentPassPage: React.FC = () => {
         setErrorMessage('');
 
         try {
-            // Step 1: Create a server-side Razorpay order for the Student Pass
             const createPassOrderFn = httpsCallable(functions, 'createPassOrder');
             const result = await createPassOrderFn({});
             const data = result.data as {
@@ -59,34 +59,13 @@ const StudentPassPage: React.FC = () => {
 
             setStatusMessage('Opening payment gateway...');
 
-            // Step 2: Open Razorpay checkout with server-generated order ID
-            const options = {
+            const baseOptions: Record<string, unknown> = {
                 key: RAZORPAY_KEY_ID,
                 amount: data.amount,
                 currency: data.currency,
                 name: 'EzyPrint',
                 description: 'Student Pass - Monthly Subscription',
                 order_id: data.razorpayOrderId,
-                handler: async function (response: { razorpay_order_id: string; razorpay_payment_id: string; razorpay_signature: string }) {
-                    // Step 3: Verify payment server-side
-                    setStatusMessage('Verifying payment...');
-                    try {
-                        const verifyPassPaymentFn = httpsCallable(functions, 'verifyPassPayment');
-                        await verifyPassPaymentFn({
-                            razorpay_order_id: response.razorpay_order_id,
-                            razorpay_payment_id: response.razorpay_payment_id,
-                            razorpay_signature: response.razorpay_signature,
-                        });
-                        // Also update local state
-                        await upgradeToStudentPass();
-                    } catch (verifyError: unknown) {
-                        console.error('Pass payment verification failed:', verifyError);
-                        setErrorMessage('Payment verification failed. If you were charged, please contact support.');
-                    } finally {
-                        setIsProcessing(false);
-                        setStatusMessage('');
-                    }
-                },
                 prefill: {
                     name: currentUser?.name || '',
                     email: currentUser?.email || '',
@@ -98,23 +77,76 @@ const StudentPassPage: React.FC = () => {
                 theme: {
                     color: '#EAB308',
                 },
-                modal: {
-                    ondismiss: function () {
-                        setIsProcessing(false);
-                        setStatusMessage('');
-                    },
-                    escape: true,
-                    animation: true,
-                },
             };
 
-            const rzp = new (window as unknown as { Razorpay: new (opts: Record<string, unknown>) => { on: (event: string, cb: () => void) => void; open: () => void } }).Razorpay(options);
-            rzp.on('payment.failed', function () {
+            const verifyAndUpgrade = async (response: { razorpay_order_id: string; razorpay_payment_id: string; razorpay_signature: string }) => {
+                setStatusMessage('Verifying payment...');
+                try {
+                    const verifyPassPaymentFn = httpsCallable(functions, 'verifyPassPayment');
+                    await verifyPassPaymentFn({
+                        razorpay_order_id: response.razorpay_order_id,
+                        razorpay_payment_id: response.razorpay_payment_id,
+                        razorpay_signature: response.razorpay_signature,
+                    });
+                    await upgradeToStudentPass();
+                } catch (verifyError: unknown) {
+                    console.error('Pass payment verification failed:', verifyError);
+                    setErrorMessage('Payment verification failed. If you were charged, please contact support.');
+                } finally {
+                    setIsProcessing(false);
+                    setStatusMessage('');
+                }
+            };
+
+            const openWebCheckout = () => {
+                const webOptions = {
+                    ...baseOptions,
+                    handler: verifyAndUpgrade,
+                    modal: {
+                        ondismiss: function () {
+                            setIsProcessing(false);
+                            setStatusMessage('');
+                        },
+                        escape: true,
+                        animation: true,
+                    },
+                };
+                const rzp = new (window as unknown as { Razorpay: new (opts: Record<string, unknown>) => { on: (event: string, cb: () => void) => void; open: () => void } }).Razorpay(webOptions);
+                rzp.on('payment.failed', function () {
+                    setIsProcessing(false);
+                    setStatusMessage('');
+                    setErrorMessage('Payment failed. Please try again or use a different payment method.');
+                });
+                rzp.open();
+            };
+
+            // Try native Razorpay on mobile (detects UPI apps), fallback to web
+            if (Capacitor.isNativePlatform()) {
                 setIsProcessing(false);
                 setStatusMessage('');
-                setErrorMessage('Payment failed. Please try again or use a different payment method.');
-            });
-            rzp.open();
+                try {
+                    const { Checkout } = await import('capacitor-razorpay');
+                    const nativeResult = await Checkout.open(baseOptions as { key: string; amount: string });
+                    const response = typeof nativeResult.response === 'string' ? JSON.parse(nativeResult.response) : nativeResult.response;
+                    setIsProcessing(true);
+                    await verifyAndUpgrade(response as { razorpay_order_id: string; razorpay_payment_id: string; razorpay_signature: string });
+                } catch (nativeError: unknown) {
+                    console.error('Native Razorpay pass error:', nativeError);
+                    const errMsg = nativeError instanceof Error ? nativeError.message : String(nativeError);
+                    if (errMsg.includes('not implemented') || errMsg.includes('not available') || errMsg.includes('plugin_not_installed')) {
+                        console.log('Native Razorpay unavailable, falling back to web SDK...');
+                        openWebCheckout();
+                    } else {
+                        setIsProcessing(false);
+                        setStatusMessage('');
+                        setErrorMessage('Payment failed. Please try again or use a different payment method.');
+                    }
+                }
+            } else {
+                setIsProcessing(false);
+                setStatusMessage('');
+                openWebCheckout();
+            }
         } catch (error: unknown) {
             console.error('Failed to create pass order:', error);
             setIsProcessing(false);

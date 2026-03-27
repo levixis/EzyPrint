@@ -77,18 +77,26 @@ async function sendPushToUser(userId, title, body, data) {
             notification: { title, body },
             data: data || {},
             android: {
+                priority: "high",
                 notification: {
                     channelId: "ezyprint_orders",
                     priority: "high",
                     sound: "default",
+                    defaultVibrateTimings: true,
+                    notificationCount: 1,
                 },
             },
             apns: {
+                headers: {
+                    "apns-priority": "10",
+                },
                 payload: {
                     aps: {
                         alert: { title, body },
                         sound: "default",
                         badge: 1,
+                        "content-available": 1,
+                        "mutable-content": 1,
                     },
                 },
             },
@@ -241,8 +249,8 @@ exports.createOrder = (0, https_1.onCall)({ region: "asia-south1", cors: true },
     if (orderData.userId !== request.auth.uid) {
         throw new https_1.HttpsError("permission-denied", "You can only pay for your own orders.");
     }
-    // Verify order is in PENDING_PAYMENT status
-    if (orderData.status !== "PENDING_PAYMENT") {
+    // Verify order is in a payable status (initial payment or retry)
+    if (orderData.status !== "PENDING_PAYMENT" && orderData.status !== "PAYMENT_FAILED") {
         throw new https_1.HttpsError("failed-precondition", `Order is not awaiting payment. Current status: ${orderData.status}`);
     }
     // Fetch shop pricing from Firestore

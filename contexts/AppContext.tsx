@@ -1,6 +1,3 @@
-
-
-
 import React, { createContext, useState, useContext, useCallback, useMemo, ReactNode, useEffect, useRef } from 'react';
 import { DocumentOrder, OrderFile, NotificationMessage, OrderStatus, User, UserType, ShopProfile, ShopPricing, PayoutMethod, AppView, ShopPayout, PayoutStatus, PrintColor } from '../types';
 import { DEFAULT_SHOP_PRICING, ADMIN_EMAILS } from '../constants';
@@ -30,9 +27,12 @@ import {
   uploadBytesResumable,
   updateProfile,
   onSnapshot,
-  deleteObject,
-  runTransaction
+  runTransaction,
+  enableNetwork,
+  disableNetwork
 } from '../firebase';
+
+import { Capacitor } from '@capacitor/core';
 
 // Helper to safely extract error messages from unknown error types
 const getErrorMessage = (err: unknown): string => {
@@ -87,6 +87,7 @@ interface AppContextType {
 
   currentView: AppView;
   navigateTo: (view: AppView) => void;
+  goBack: () => void;
 
   // Admin payout functions
   payouts: ShopPayout[];
@@ -145,6 +146,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [firestoreNotifications, setFirestoreNotifications] = useState<NotificationMessage[]>([]);
   const [localNotifications, setLocalNotifications] = useState<NotificationMessage[]>([]);
   const [currentView, setCurrentView] = useState<AppView>('landing');
+  const viewHistoryRef = useRef<AppView[]>([]);
 
   // Merged notifications: Firestore (persistent, cross-user) + local (session-only toasts)
   const notifications = useMemo(() => {
@@ -153,8 +155,25 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   }, [localNotifications, firestoreNotifications]);
 
   const navigateTo = useCallback((view: AppView) => {
-    setCurrentView(view);
+    setCurrentView(prev => {
+      // Don't push duplicate consecutive entries
+      if (prev !== view) {
+        viewHistoryRef.current.push(prev);
+        // Keep history bounded
+        if (viewHistoryRef.current.length > 50) viewHistoryRef.current.shift();
+      }
+      return view;
+    });
     window.scrollTo(0, 0);
+  }, []);
+
+  const goBack = useCallback(() => {
+    const history = viewHistoryRef.current;
+    if (history.length > 0) {
+      const previousView = history.pop()!;
+      setCurrentView(previousView);
+      window.scrollTo(0, 0);
+    }
   }, []);
 
   const addNotification = useCallback((notificationData: Omit<NotificationMessage, 'id' | 'timestamp' | 'read'>) => {
@@ -163,6 +182,28 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     // Determine the recipient for Firestore persistence
     // Use shopsRef to avoid depending on shops state (which would cause re-render cycles)
     let recipientUserId = notificationData.targetUserId;
+
+    // Route 'ADMIN' notifications to actual admin user IDs
+    if (recipientUserId === 'ADMIN') {
+      // Find admin users from the current user list or fall back
+      // Admin emails are known at build time — look up their UIDs from Firestore
+      recipientUserId = undefined; // Clear the placeholder
+      // Admin notifications: persist for each known admin by targeting all admin emails
+      // Since we can't reliably resolve UIDs without a query, create a local notification instead
+      // The server-side Cloud Functions handle critical admin notifications via recipientUserId
+      const localNotif: NotificationMessage = {
+        ...notificationData,
+        id: `local_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+        timestamp,
+        read: false,
+      };
+      // Only show if current user IS an admin
+      if (currentUserRef.current?.type === UserType.ADMIN) {
+        setLocalNotifications(prev => [localNotif, ...prev].slice(0, 20));
+      }
+      return;
+    }
+
     if (!recipientUserId && notificationData.targetShopId) {
       const shop = shopsRef.current.find(s => s.id === notificationData.targetShopId);
       recipientUserId = shop?.ownerUserId;
@@ -212,6 +253,13 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       registerPushNotifications(currentUser.id, (title, body) => {
         // Show in-app notification when push arrives while app is in foreground
         addNotificationRef.current({ message: body || title, type: 'info' });
+
+        // Force Firestore to reconnect — the push means server data changed,
+        // but the WebSocket may still be serving cached data
+        if (Capacitor.isNativePlatform()) {
+          console.log('[AppContext] Push received — kicking Firestore to pick up changes');
+          enableNetwork(db).catch(() => {});
+        }
       });
     }
     return () => {
@@ -220,6 +268,97 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       }
     };
   }, [currentUser?.id]);
+
+  // Reconnect Firestore when app resumes from background (native + web)
+  // Android WebView's WebSocket to Firestore goes stale very easily — even brief
+  // background periods cause onSnapshot listeners to silently serve cached data.
+  // On native: always reconnect on resume (no threshold) + periodic heartbeat
+  // On web: reconnect after 5s background (avoid Razorpay popup false triggers)
+  useEffect(() => {
+    let lastBackgroundedAt = 0;
+    let isAppActive = true;
+    let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+    const isNativePlatform = Capacitor.isNativePlatform();
+    // Web needs a threshold to avoid reconnecting during Razorpay popup; native doesn't
+    const MIN_BACKGROUND_MS = isNativePlatform ? 0 : 5000;
+
+    const reconnectFirestore = (reason: string) => {
+      const backgroundDuration = Date.now() - lastBackgroundedAt;
+      if (lastBackgroundedAt > 0 && backgroundDuration < MIN_BACKGROUND_MS) {
+        console.log(`[AppContext] App resumed after ${backgroundDuration}ms — skipping reconnect (${reason})`);
+        return;
+      }
+      console.log(`[AppContext] Reconnecting Firestore — ${reason}`);
+      disableNetwork(db)
+        .then(() => new Promise(resolve => setTimeout(resolve, 200)))
+        .then(() => enableNetwork(db))
+        .then(() => console.log('[AppContext] Firestore reconnected successfully'))
+        .catch(err => {
+          console.warn('[AppContext] Firestore reconnect failed:', err);
+        });
+    };
+
+    // On native, run a periodic heartbeat to keep Firestore listeners alive
+    // This cycles the network connection every 30s while the app is in the foreground
+    const startHeartbeat = () => {
+      if (heartbeatInterval || !isNativePlatform) return;
+      heartbeatInterval = setInterval(() => {
+        if (isAppActive) {
+          console.log('[AppContext] Heartbeat — refreshing Firestore connection');
+          enableNetwork(db).catch(() => {});
+        }
+      }, 30_000); // Every 30 seconds
+    };
+
+    const stopHeartbeat = () => {
+      if (heartbeatInterval) {
+        clearInterval(heartbeatInterval);
+        heartbeatInterval = null;
+      }
+    };
+
+    let nativeCleanup: (() => void) | undefined;
+
+    if (isNativePlatform) {
+      // Start heartbeat immediately on native
+      startHeartbeat();
+
+      import('@capacitor/app').then(({ App }) => {
+        const listener = App.addListener('appStateChange', ({ isActive }) => {
+          isAppActive = isActive;
+          if (!isActive) {
+            lastBackgroundedAt = Date.now();
+            stopHeartbeat();
+          } else {
+            // Always reconnect on native resume — WebView WebSocket is unreliable
+            reconnectFirestore('app resumed from background');
+            startHeartbeat();
+          }
+        });
+        listener.then(handle => {
+          nativeCleanup = () => handle.remove();
+        });
+      }).catch(err => {
+        console.warn('[AppContext] App plugin not available for state change:', err);
+      });
+    } else {
+      // Web-only: use visibilitychange with threshold (safe since no native payment popups)
+      const handleVisibilityChange = () => {
+        if (document.visibilityState === 'hidden') {
+          lastBackgroundedAt = Date.now();
+        } else if (document.visibilityState === 'visible') {
+          reconnectFirestore('tab became visible');
+        }
+      };
+      document.addEventListener('visibilitychange', handleVisibilityChange);
+      nativeCleanup = () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+    }
+
+    return () => {
+      nativeCleanup?.();
+      stopHeartbeat();
+    };
+  }, []);
 
   // Shop data listener — uses addNotificationRef to avoid re-subscribing when addNotification changes
   useEffect(() => {
@@ -629,9 +768,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         return { success: false, message: "Only students can upgrade to Student Pass." };
       }
 
-      const userRef = doc(db, "users", currentUser.id);
-      await updateDoc(userRef, { hasStudentPass: true });
-
+      // Only update local state — the actual Firestore write happens in the server-side
+      // verifyPassPayment Cloud Function after payment verification.
+      // This prevents bypassing payment by calling upgradeToStudentPass directly.
       setCurrentUserInternal(prev => prev ? { ...prev, hasStudentPass: true } : null);
 
       addNotification({
@@ -773,7 +912,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
     // Aggregate values for legacy printOptions
     const totalPages = uploadedFiles.reduce((sum, f) => sum + f.pageCount, 0);
-    const totalCopies = uploadedFiles.reduce((sum, f) => sum + f.copies, 0);
+    // Use max copies per file (not sum) — the sum is misleading in UI display
+    // e.g., 3 files × 2 copies each → show "2" not "6"
+    const maxCopies = Math.max(...uploadedFiles.map(f => f.copies), 1);
     const primaryColor = uploadedFiles[0].color;
     const anyDoubleSided = uploadedFiles.some(f => f.doubleSided);
 
@@ -793,7 +934,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       status: OrderStatus.PENDING_PAYMENT,
       priceDetails: calculatedPriceDetails,
       printOptions: {
-        copies: totalCopies,
+        copies: maxCopies,
         color: primaryColor,
         pages: totalPages,
         doubleSided: anyDoubleSided,
@@ -849,17 +990,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         return { ...currentOrderData, ...updatePayload };
       });
 
-      // --- Auto-cleanup: Delete file from Storage when order is COMPLETED ---
-      if (status === OrderStatus.COMPLETED && updatedOrderInstance?.fileStoragePath && !updatedOrderInstance?.isFileDeleted) {
-        try {
-          const fileRef = storageRef(storage, updatedOrderInstance.fileStoragePath);
-          await deleteObject(fileRef);
-          await updateDoc(orderDocRef, { isFileDeleted: true });
-          console.log(`[AppContext] Auto-deleted file for completed order #${orderId.slice(-6)}`);
-        } catch (deleteError: unknown) {
-          console.warn(`[AppContext] Failed to auto-delete file for order #${orderId.slice(-6)}:`, getErrorMessage(deleteError));
-        }
-      }
+      // NOTE: File cleanup is handled exclusively by the server-side onOrderStatusChange
+      // Cloud Function trigger, which handles both legacy single-file and multi-file orders.
+      // Removed client-side cleanup to avoid race conditions with the server trigger.
 
       // Send notifications
       if (updatedOrderInstance) {
@@ -1191,7 +1324,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     notifications,
     addOrder, updateOrderStatus,
     addNotification, markNotificationAsRead, getNotificationsForCurrentUser,
-    currentView, navigateTo, upgradeToStudentPass, cancelStudentPass,
+    currentView, navigateTo, goBack, upgradeToStudentPass, cancelStudentPass,
     payouts, createPayout, requestPayout, markPayoutPaid, confirmPayout, disputePayout,
     approveShop, rejectShop, deleteShopAndOwner, archiveShop, unarchiveShop, approvedShops,
     deleteOwnShopAccount

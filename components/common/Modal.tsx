@@ -37,15 +37,15 @@ export const Modal: React.FC<ModalProps> = ({ isOpen, onClose, title, children, 
 
   return (
     <div 
-      className={`fixed inset-0 z-[100] overflow-y-auto flex items-center justify-center p-4 transition-opacity duration-300 ease-out
+      className={`fixed inset-0 z-[100] overflow-y-auto flex items-end sm:items-center justify-center p-0 sm:p-4 transition-opacity duration-300 ease-out
                   ${isOpen ? 'opacity-100 bg-brand-bg/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`}
       aria-labelledby="modal-title" 
       role="dialog" 
       aria-modal="true"
     >
       <div 
-        className={`bg-brand-secondary rounded-xl text-left overflow-hidden shadow-modal transform transition-all duration-300 ease-out sm:my-8 sm:align-middle w-full ${sizeClasses[size]}
-                    ${isOpen ? 'opacity-100 scale-100' : 'opacity-0 scale-95'}`}
+        className={`bg-brand-secondary rounded-t-2xl sm:rounded-xl text-left overflow-hidden shadow-modal transform transition-all duration-300 ease-out sm:my-8 sm:align-middle w-full ${sizeClasses[size]}
+                    ${isOpen ? 'opacity-100 translate-y-0 sm:scale-100' : 'opacity-0 translate-y-8 sm:translate-y-0 sm:scale-95'}`}
       >
         <div className="px-4 pt-5 pb-4 sm:p-6 sm:pb-5">
           <div className="sm:flex sm:items-start w-full">

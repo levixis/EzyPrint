@@ -29,7 +29,9 @@ import {
   orderBy,
   limit,          // Added for capping notification queries
   addDoc,         // Added for creating notification documents
-  runTransaction
+  runTransaction,
+  enableNetwork,  // Added for app resume reconnection
+  disableNetwork  // Added for app resume reconnection
 } from 'firebase/firestore';
 import {
   getStorage,
@@ -149,6 +151,8 @@ export {
   uploadBytesResumable, // Exported
   getDownloadURL,      // Exported
   getBlob,             // Exported for CORS-safe blob downloads
-  deleteObject         // Exported for file cleanup
+  deleteObject,        // Exported for file cleanup
+  enableNetwork,       // Exported for app resume reconnection
+  disableNetwork       // Exported for app resume reconnection
 };
 export type { FirebaseUser };

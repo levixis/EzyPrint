@@ -43,6 +43,23 @@ export async function initMobile(): Promise<void> {
     if (getPlatform() === 'ios') {
       Keyboard.setAccessoryBarVisible({ isVisible: true });
     }
+
+    // With resize: 'none', we need to manually ensure the focused input is visible
+    Keyboard.addListener('keyboardWillShow', (info) => {
+      const activeEl = document.activeElement as HTMLElement | null;
+      if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA' || activeEl.tagName === 'SELECT')) {
+        // Add bottom padding to body so content can scroll past the keyboard
+        document.body.style.paddingBottom = `${info.keyboardHeight}px`;
+        // Scroll the active element into view
+        setTimeout(() => {
+          activeEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }, 100);
+      }
+    });
+
+    Keyboard.addListener('keyboardWillHide', () => {
+      document.body.style.paddingBottom = '0px';
+    });
   } catch (e) {
     console.warn('[Mobile] Keyboard plugin not available:', e);
   }

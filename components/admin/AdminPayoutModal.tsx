@@ -40,7 +40,10 @@ const AdminPayoutModal: React.FC<AdminPayoutModalProps> = ({ isOpen, onClose, sh
       .filter(p => p.shopId === shop.id && p.status === PayoutStatus.PENDING)
       .reduce((sum, p) => sum + p.amount, 0);
 
-    const pendingDue = Math.max(0, totalEarned - totalAlreadyPaid - pendingPayoutAmount);
+    // pendingDue = what the shop has earned minus what's actually been paid out
+    // NOTE: We do NOT subtract pendingPayoutAmount here — those are just requests,
+    // not actual payments. The admin should still be able to pay the full due.
+    const pendingDue = Math.max(0, totalEarned - totalAlreadyPaid);
 
     return { totalEarned, totalAlreadyPaid, pendingDue, completedOrderCount, pendingPayoutAmount };
   }, [allOrders, payouts, shop.id]);

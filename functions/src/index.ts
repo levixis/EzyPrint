@@ -49,18 +49,26 @@ async function sendPushToUser(
       notification: { title, body },
       data: data || {},
       android: {
+        priority: "high" as const,
         notification: {
           channelId: "ezyprint_orders",
           priority: "high" as const,
           sound: "default",
+          defaultVibrateTimings: true,
+          notificationCount: 1,
         },
       },
       apns: {
+        headers: {
+          "apns-priority": "10",
+        },
         payload: {
           aps: {
             alert: { title, body },
             sound: "default",
             badge: 1,
+            "content-available": 1,
+            "mutable-content": 1,
           },
         },
       },
@@ -284,8 +292,8 @@ export const createOrder = onCall(
       );
     }
 
-    // Verify order is in PENDING_PAYMENT status
-    if (orderData.status !== "PENDING_PAYMENT") {
+    // Verify order is in a payable status (initial payment or retry)
+    if (orderData.status !== "PENDING_PAYMENT" && orderData.status !== "PAYMENT_FAILED") {
       throw new HttpsError(
         "failed-precondition",
         `Order is not awaiting payment. Current status: ${orderData.status}`
@@ -627,8 +635,12 @@ export const onOrderStatusChange = onDocumentUpdated(
     if (newStatus !== "COMPLETED" && newStatus !== "CANCELLED") return;
 
     // --- AUTO-REFUND: Issue Razorpay refund when a PAID order is CANCELLED ---
-    if (newStatus === "CANCELLED" && afterData.razorpayPaymentId) {
-      console.log(`[onOrderStatusChange] Order #${orderId.slice(-6)} cancelled with payment ${afterData.razorpayPaymentId}. Initiating automatic refund...`);
+    // Only refund if the order was actually paid (had reached PENDING_APPROVAL or beyond)
+    // PAYMENT_FAILED orders may have a razorpayPaymentId from a failed attempt that was never captured
+    const PAID_STATUSES = ["PENDING_APPROVAL", "PRINTING", "READY_FOR_PICKUP", "COMPLETED"];
+    const wasTrulyPaid = afterData.razorpayPaymentId && PAID_STATUSES.includes(oldStatus);
+    if (newStatus === "CANCELLED" && wasTrulyPaid) {
+      console.log(`[onOrderStatusChange] Order #${orderId.slice(-6)} cancelled (was ${oldStatus}) with payment ${afterData.razorpayPaymentId}. Initiating automatic refund...`);
 
       try {
         const refund = await getRazorpay().payments.refund(afterData.razorpayPaymentId, {
@@ -677,7 +689,7 @@ export const onOrderStatusChange = onDocumentUpdated(
           await db.collection("notifications").add({
             message: `⚠️ AUTO-REFUND FAILED for order #${orderId.slice(-6)} (Payment: ${afterData.razorpayPaymentId}). Manual refund required. Error: ${refundError.message}`,
             type: "error",
-            targetUserType: "ADMIN",
+            recipientUserId: afterData.userId, // Notify the student so they can contact support
             read: false,
             timestamp: new Date().toISOString(),
           });

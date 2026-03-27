@@ -1,0 +1,39 @@
+{
+  "project_info": {
+    "project_number": "283831997162",
+    "project_id": "ezyyprint",
+    "storage_bucket": "ezyyprint.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:283831997162:android:d40468acae258f2e1d7d93",
+        "android_client_info": {
+          "package_name": "com.ezyprint.app"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "283831997162-p8afki1sjtfa9srdvr6infpf06gofmk5.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC-gqdXHayKdgeMm8v7k1e1mzVbB1Ny5-Q"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "283831997162-p8afki1sjtfa9srdvr6infpf06gofmk5.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

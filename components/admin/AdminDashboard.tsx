@@ -46,7 +46,8 @@ const AdminDashboard: React.FC = () => {
     const activeOrders = allOrders.filter(o =>
       o.status !== OrderStatus.COMPLETED &&
       o.status !== OrderStatus.CANCELLED &&
-      o.status !== OrderStatus.PAYMENT_FAILED
+      o.status !== OrderStatus.PAYMENT_FAILED &&
+      o.status !== OrderStatus.PENDING_PAYMENT
     ).length;
     const pendingPayouts = payouts.filter(p => p.status === PayoutStatus.PENDING).length;
     const disputedPayouts = payouts.filter(p => p.status === PayoutStatus.DISPUTED).length;

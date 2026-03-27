@@ -258,6 +258,7 @@ const ShopOrderDetailsModal: React.FC<ShopOrderDetailsModalProps> = ({
           placeholder="e.g., Print quality check complete."
           className="mt-2"
           rows={3}
+          disabled={order.status === OrderStatus.COMPLETED || order.status === OrderStatus.CANCELLED}
         />
 
         <Select

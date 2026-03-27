@@ -42,6 +42,24 @@ export async function registerPushNotifications(
     if (permResult.receive === 'granted') {
       console.log('[Push] Permission granted');
 
+      // Create a high-importance notification channel for Android
+      // This ensures notifications show as heads-up popups with sound
+      try {
+        await PushNotifications.createChannel({
+          id: 'ezyprint_orders',
+          name: 'Order Updates',
+          description: 'Notifications for order status changes, payments, and updates',
+          importance: 5, // IMPORTANCE_HIGH — shows as heads-up notification
+          visibility: 1, // PUBLIC
+          sound: 'default',
+          vibration: true,
+          lights: true,
+        });
+        console.log('[Push] Android notification channel created');
+      } catch (channelErr) {
+        console.warn('[Push] Failed to create notification channel:', channelErr);
+      }
+
       // Register with the native push service (FCM on Android, APNs on iOS)
       await PushNotifications.register();
 

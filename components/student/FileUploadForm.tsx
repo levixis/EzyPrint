@@ -6,7 +6,7 @@ import { calculateMultiFileOrderPrice } from '../../utils/pricing';
 import { DocumentOrder, PrintColor } from '../../types';
 import { Select } from '../common/Select';
 import { Button } from '../common/Button';
-import { SUPPORTED_FILE_TYPES } from '../../constants';
+import { SUPPORTED_FILE_TYPES, SUPPORTED_MIME_TYPES } from '../../constants';
 import { Card } from '../common/Card';
 import { PDFDocument } from 'pdf-lib';
 import { Spinner } from '../common/Spinner';
@@ -106,10 +106,12 @@ const FileUploadForm: React.FC<FileUploadFormProps> = ({ userId, isLoadingShops,
     const newFiles = Array.from(files).slice(0, remainingSlots);
     const newEntries: FileEntry[] = [];
 
+    const IMAGE_EXTENSIONS = ['JPG', 'JPEG', 'PNG', 'HEIC', 'HEIF', 'WEBP', 'GIF', 'BMP', 'TIFF', 'SVG'];
+
     for (const file of newFiles) {
       const extension = getFileExtension(file.name);
       if (!SUPPORTED_FILE_TYPES.includes(extension)) {
-        setError(`File "${file.name}" (.${extension.toLowerCase()}) is not supported. Skipped.`);
+        setError(`File "${file.name}" (.${extension.toLowerCase()}) is not supported. Supported: PDF, DOC(X), PPT(X), XLS(X), TXT, JPG, PNG, HEIC, WEBP, GIF.`);
         continue;
       }
 
@@ -119,15 +121,17 @@ const FileUploadForm: React.FC<FileUploadFormProps> = ({ userId, isLoadingShops,
         continue;
       }
 
+      const isImage = IMAGE_EXTENSIONS.includes(extension);
+
       newEntries.push({
         id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
         file,
         fileType: extension,
-        pageCount: 1,
-        color: PrintColor.BLACK_WHITE,
+        pageCount: isImage ? 1 : 1, // Images are always 1 page, PDFs get parsed below
+        color: isImage ? PrintColor.COLOR : PrintColor.BLACK_WHITE, // Default images to color
         copies: 1,
         doubleSided: false,
-        isParsing: extension === 'PDF',
+        isParsing: extension === 'PDF', // Only parse PDFs for page count
       });
     }
 
@@ -246,7 +250,7 @@ const FileUploadForm: React.FC<FileUploadFormProps> = ({ userId, isLoadingShops,
       {/* File selection area */}
       <div>
         <label className="block text-sm font-medium text-brand-lightText mb-1.5">
-          Select Documents ({fileEntries.length}/{MAX_FILES})
+          Select Files — PDFs, Docs, Images ({fileEntries.length}/{MAX_FILES})
         </label>
         <div
           className="mt-1 flex items-center space-x-3 p-4 border-2 border-dashed border-brand-primary/30 bg-brand-primary/5 rounded-lg hover:border-brand-primary hover:bg-brand-primary/10 transition-colors duration-300 cursor-pointer"
@@ -268,7 +272,7 @@ const FileUploadForm: React.FC<FileUploadFormProps> = ({ userId, isLoadingShops,
             ref={fileInputRef}
             onChange={handleFilesSelected}
             className="hidden"
-            accept={SUPPORTED_FILE_TYPES.map(ft => `.${ft.toLowerCase()}`).join(',')}
+            accept={[...SUPPORTED_FILE_TYPES.map(ft => `.${ft.toLowerCase()}`), ...SUPPORTED_MIME_TYPES].join(',')}
             multiple
             disabled={fileEntries.length >= MAX_FILES || isSubmitting}
           />

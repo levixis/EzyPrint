@@ -54,14 +54,20 @@ service cloud.firestore {
       allow delete: if false;
     }
 
-    // Payouts — admin creates, admin and shop owners can read their own
+    // Payouts — admin has full access, shop owners can create requests and manage their own
     match /payouts/{payoutId} {
       // Admin can do anything with payouts
       allow read, write: if request.auth != null && isAdmin();
       
-      // Shop owners can read payouts for their shop and update status (confirm/dispute)
+      // Shop owners can CREATE payout requests for their own shop
+      allow create: if request.auth != null && 
+                    request.resource.data.shopId == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.shopId;
+
+      // Shop owners can read payouts for their shop
       allow read: if request.auth != null && 
                   resource.data.shopId == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.shopId;
+
+      // Shop owners can update status on their own payouts (confirm/dispute)
       allow update: if request.auth != null && 
                     resource.data.shopId == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.shopId;
     }

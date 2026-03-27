@@ -5,8 +5,10 @@ const config: CapacitorConfig = {
   appName: 'EzyPrint',
   webDir: 'dist',
   server: {
+    // Load from live hosted URL — app auto-updates on every hosting deploy
+    url: 'https://ezyyprint.web.app',
     // Allow navigation to external URLs (Razorpay checkout, etc.)
-    allowNavigation: ['*.razorpay.com'],
+    allowNavigation: ['*.razorpay.com', '*.web.app', '*.firebaseapp.com'],
   },
   plugins: {
     SplashScreen: {
@@ -23,8 +25,8 @@ const config: CapacitorConfig = {
       backgroundColor: '#0F172A',
     },
     Keyboard: {
-      resize: 'native' as any,
-      resizeOnFullScreen: true,
+      resize: 'none' as any,
+      resizeOnFullScreen: false,
     },
   },
 };

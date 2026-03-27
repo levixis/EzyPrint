@@ -2,6 +2,7 @@
 
 
 import React, { useEffect, useRef } from 'react';
+import { Capacitor } from '@capacitor/core';
 import { initMobile } from './utils/mobile';
 import { UserType, AppView } from './types';
 import Header from './components/layout/Header';
@@ -34,7 +35,7 @@ const App: React.FC = () => {
 
 // Internal component to use hooks inside Provider if needed, but mostly just structured cleanly.
 const AppContent: React.FC = () => {
-  const { currentUser, logoutUser, isLoadingAuth, pendingFirebaseProfileCreationUser, isLoadingShops, getShopById, currentView, navigateTo } = useAppContext();
+  const { currentUser, logoutUser, isLoadingAuth, pendingFirebaseProfileCreationUser, isLoadingShops, getShopById, currentView, navigateTo, goBack } = useAppContext();
 
   // Track whether we've done the initial redirect after auth resolves
   const hasRedirected = useRef(false);
@@ -44,6 +45,37 @@ const AppContent: React.FC = () => {
 
   // Initialize mobile platform features (status bar, splash screen, etc.)
   useEffect(() => { initMobile(); }, []);
+
+  // Handle Android hardware back button
+  useEffect(() => {
+    if (!Capacitor.isNativePlatform()) return;
+
+    let cleanup: (() => void) | undefined;
+
+    import('@capacitor/app').then(({ App }) => {
+      const listener = App.addListener('backButton', () => {
+        // If we have navigation history, go back one step
+        // The 'landing' and dashboard views are "root" views — exit app from there
+        const rootViews: AppView[] = ['landing', 'login', 'studentDashboard', 'shopDashboard', 'adminDashboard'];
+        if (!rootViews.includes(currentView)) {
+          goBack();
+        } else {
+          // On root views, let the app minimize (default Android behavior)
+          App.minimizeApp();
+        }
+      });
+
+      listener.then(handle => {
+        cleanup = () => handle.remove();
+      });
+    }).catch(err => {
+      console.warn('[App] Back button handler not available:', err);
+    });
+
+    return () => {
+      cleanup?.();
+    };
+  }, [currentView, goBack]);
 
   useEffect(() => {
     // Don't do anything while auth is still loading
@@ -160,16 +192,16 @@ const AppContent: React.FC = () => {
   return (
     <div className="min-h-screen flex flex-col bg-brand-bg text-brand-text dark:bg-brand-dark-bg dark:text-brand-dark-text selection:bg-brand-primary selection:text-brand-secondary transition-colors duration-300">
       <Header currentUser={currentUser} onLogout={handleLogout} navigateTo={navigateTo} />
-      <main className="flex-grow container mx-auto px-4 py-8">
+      <main className="flex-grow container mx-auto px-4 py-8 pb-4">
         {renderContent()}
       </main>
-      <footer className="text-center py-6 text-sm text-gray-600 dark:text-gray-400 border-t border-gray-200 dark:border-zinc-700 transition-colors duration-300">
-        <div className="flex justify-center space-x-4 mb-2">
+      <footer className="text-center py-6 px-4 text-sm text-gray-600 dark:text-gray-400 border-t border-gray-200 dark:border-zinc-700 transition-colors duration-300">
+        <div className="flex flex-wrap justify-center gap-x-3 gap-y-1 mb-2">
           <FooterLink view="privacy">Privacy Policy</FooterLink>
           <span>&bull;</span>
-          <FooterLink view="terms">Terms & Conditions</FooterLink>
+          <FooterLink view="terms">Terms &amp; Conditions</FooterLink>
           <span>&bull;</span>
-          <FooterLink view="refund">Cancellation & Refund</FooterLink>
+          <FooterLink view="refund">Cancellation &amp; Refund</FooterLink>
           <span>&bull;</span>
           <FooterLink view="shipping">Service Delivery</FooterLink>
           <span>&bull;</span>
