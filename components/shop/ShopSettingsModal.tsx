@@ -252,7 +252,7 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
             <label htmlFor="shopOpenToggle" className={`text-sm font-medium ${isShopOpen ? 'text-status-success' : 'text-status-error'}`}>
               {isShopOpen ? 'Shop is OPEN for new orders' : 'Shop is CLOSED for new orders'}
             </label>
-            <div className="relative inline-flex items-center cursor-pointer">
+            <label className="relative inline-flex items-center cursor-pointer">
               <input
                 type="checkbox"
                 id="shopOpenToggle"
@@ -261,7 +261,7 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
                 onChange={() => setIsShopOpen(!isShopOpen)}
               />
               <div className="w-11 h-6 bg-brand-muted peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-brand-primary peer-focus:ring-offset-2 peer-focus:ring-offset-brand-secondary rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-brand-muted after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-brand-primary"></div>
-            </div>
+            </label>
           </div>
           <p className="text-xs text-brand-muted mt-1">Toggle this to control if students can place new orders at your shop.</p>
         </div>

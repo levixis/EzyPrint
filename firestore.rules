@@ -83,8 +83,8 @@ service cloud.firestore {
       // Users can update their own notifications (e.g., mark as read)
       allow update: if request.auth != null && resource.data.recipientUserId == request.auth.uid;
 
-      // Only admin or backend Cloud Functions can delete notifications
-      allow delete: if isAdmin();
+      // Users can delete their own notifications, admin can delete any
+      allow delete: if request.auth != null && (resource.data.recipientUserId == request.auth.uid || isAdmin());
     }
   }
 }

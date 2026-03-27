@@ -1,5 +1,5 @@
 import { onCall, HttpsError } from "firebase-functions/v2/https";
-import { onDocumentUpdated, onDocumentCreated } from "firebase-functions/v2/firestore";
+import { onDocumentUpdated, onDocumentCreated, onDocumentDeleted } from "firebase-functions/v2/firestore";
 import { onSchedule } from "firebase-functions/v2/scheduler";
 import * as admin from "firebase-admin";
 import Razorpay from "razorpay";
@@ -871,6 +871,100 @@ export const onNewOrder = onDocumentCreated(
       );
     } catch (error: any) {
       console.error(`[onNewOrder] Push notification error:`, error.message);
+    }
+  }
+);
+
+/**
+ * cleanupOldNotifications — Scheduled CRON job that runs every 12 hours.
+ * Deletes:
+ *   - READ notifications older than 2 days
+ *   - ALL notifications older than 30 days (regardless of read status)
+ * Uses batched deletes (max 500 per batch) for efficiency.
+ */
+export const cleanupOldNotifications = onSchedule(
+  {
+    schedule: "every 12 hours",
+    region: "asia-south1",
+    timeoutSeconds: 120,
+  },
+  async () => {
+    const now = Date.now();
+    const twoDaysAgo = new Date(now - 2 * 24 * 60 * 60 * 1000).toISOString();
+    const thirtyDaysAgo = new Date(now - 30 * 24 * 60 * 60 * 1000).toISOString();
+
+    console.log(`[cleanupOldNotifications] Running. Read cutoff: ${twoDaysAgo}, Unread cutoff: ${thirtyDaysAgo}`);
+
+    let totalDeleted = 0;
+
+    try {
+      // 1. Delete READ notifications older than 2 days
+      const readQuery = await db
+        .collection("notifications")
+        .where("read", "==", true)
+        .where("timestamp", "<", twoDaysAgo)
+        .limit(500)
+        .get();
+
+      if (!readQuery.empty) {
+        const batch = db.batch();
+        readQuery.docs.forEach((doc) => batch.delete(doc.ref));
+        await batch.commit();
+        totalDeleted += readQuery.size;
+        console.log(`[cleanupOldNotifications] Deleted ${readQuery.size} read notifications (>2 days old)`);
+      }
+
+      // 2. Delete ALL notifications older than 30 days (safety cleanup)
+      const oldQuery = await db
+        .collection("notifications")
+        .where("timestamp", "<", thirtyDaysAgo)
+        .limit(500)
+        .get();
+
+      if (!oldQuery.empty) {
+        const batch = db.batch();
+        oldQuery.docs.forEach((doc) => batch.delete(doc.ref));
+        await batch.commit();
+        totalDeleted += oldQuery.size;
+        console.log(`[cleanupOldNotifications] Deleted ${oldQuery.size} old notifications (>30 days)`);
+      }
+
+      console.log(`[cleanupOldNotifications] Cleanup complete. Total deleted: ${totalDeleted}`);
+    } catch (error: any) {
+      console.error("[cleanupOldNotifications] Error:", error.message);
+    }
+  }
+);
+
+/**
+ * onUserDeleted — Firestore trigger that fires when a user document is deleted.
+ * Cleans up all notifications for the deleted user.
+ * This handles both admin deletion and self-deletion automatically.
+ */
+export const onUserDeleted = onDocumentDeleted(
+  { document: "users/{userId}", region: "asia-south1" },
+  async (event) => {
+    const userId = event.params.userId;
+    console.log(`[onUserDeleted] User ${userId.slice(-6)} deleted. Cleaning up notifications...`);
+
+    try {
+      // Delete all notifications for this user
+      const notifsQuery = await db
+        .collection("notifications")
+        .where("recipientUserId", "==", userId)
+        .get();
+
+      if (notifsQuery.empty) {
+        console.log(`[onUserDeleted] No notifications to clean up for user ${userId.slice(-6)}`);
+        return;
+      }
+
+      const batch = db.batch();
+      notifsQuery.docs.forEach((doc) => batch.delete(doc.ref));
+      await batch.commit();
+      console.log(`[onUserDeleted] Deleted ${notifsQuery.size} notification(s) for user ${userId.slice(-6)}`);
+    } catch (error: any) {
+      console.error(`[onUserDeleted] Error cleaning up notifications for ${userId.slice(-6)}:`, error.message);
     }
   }
 );

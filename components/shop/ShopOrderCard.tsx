@@ -77,6 +77,15 @@ const ShopOrderCard: React.FC<ShopOrderCardProps> = ({ order, onSelectOrder }) =
           <p><strong>Order Value:</strong> <span className="font-semibold text-gray-900 dark:text-white">₹{priceDetails.totalPrice.toFixed(2)}</span></p>
           <p className="text-gray-500 dark:text-gray-400 italic">(Page Cost: ₹{priceDetails.pageCost.toFixed(2)}, Base Fee: ₹{priceDetails.baseFee.toFixed(2)})</p>
         </div>
+        {status === OrderStatus.READY_FOR_PICKUP && order.pickupCode && (
+          <div className="mt-3 flex items-center gap-2 px-3 py-2 rounded-lg bg-emerald-50 dark:bg-emerald-900/30 border border-emerald-200 dark:border-emerald-700">
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-5 h-5 text-emerald-600 dark:text-emerald-400 flex-shrink-0">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 5.25a3 3 0 0 1 3 3m3 0a6 6 0 0 1-7.029 5.912c-.563-.097-1.159.026-1.563.43L10.5 17.25H8.25v2.25H6v2.25H2.25v-2.818c0-.597.237-1.17.659-1.591l6.499-6.499c.404-.404.527-1 .43-1.563A6 6 0 1 1 21.75 8.25Z" />
+            </svg>
+            <span className="text-xs font-medium text-emerald-700 dark:text-emerald-300">Pickup Code:</span>
+            <span className="text-sm font-bold tracking-wider text-white bg-emerald-600 dark:bg-emerald-500 px-2.5 py-0.5 rounded-md">{order.pickupCode}</span>
+          </div>
+        )}
       </div>
       <div className="p-4 border-t border-gray-200 dark:border-zinc-700 bg-gray-50 dark:bg-zinc-800">
         <Button

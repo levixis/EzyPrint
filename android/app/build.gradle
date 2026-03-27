@@ -1,5 +1,12 @@
 apply plugin: 'com.android.application'
 
+// Industry Grade Signing Configuration
+def signingPropsFile = rootProject.file("release-signing.properties")
+def signingProps = new Properties()
+if (signingPropsFile.exists()) {
+    signingProps.load(new FileInputStream(signingPropsFile))
+}
+
 android {
     namespace = "com.ezyprint.app"
     compileSdk = rootProject.ext.compileSdkVersion
@@ -16,10 +23,24 @@ android {
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
+
+    signingConfigs {
+        release {
+            if (signingProps.containsKey('STORE_FILE')) {
+                storeFile file("../" + signingProps['STORE_FILE'])
+                storePassword signingProps['STORE_PASSWORD']
+                keyAlias signingProps['KEY_ALIAS']
+                keyPassword signingProps['KEY_PASSWORD']
+            }
+        }
+    }
+
     buildTypes {
         release {
-            minifyEnabled false
-            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            signingConfig signingConfigs.release
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
 }

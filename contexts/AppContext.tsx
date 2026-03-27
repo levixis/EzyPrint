@@ -7,6 +7,8 @@ import {
   storage,
   GoogleAuthProvider,
   signInWithPopup,
+  signInWithCredential,
+  getRedirectResult,
   signOut,
   onAuthStateChanged,
   createUserWithEmailAndPassword,
@@ -28,8 +30,7 @@ import {
   updateProfile,
   onSnapshot,
   runTransaction,
-  enableNetwork,
-  disableNetwork
+  enableNetwork
 } from '../firebase';
 
 import { Capacitor } from '@capacitor/core';
@@ -137,7 +138,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [pendingFirebaseProfileCreationUser, setPendingFirebaseProfileCreationUser] = useState<FirebaseUser | null>(null);
 
   // Stable refs to break the dependency cycle: shops → addNotification → shops useEffect
-  const addNotificationRef = useRef<(notification: Omit<NotificationMessage, 'id' | 'timestamp' | 'read'>) => void>(() => {});
+  const addNotificationRef = useRef<(notification: Omit<NotificationMessage, 'id' | 'timestamp' | 'read'>) => void>(() => { });
   const shopsRef = useRef<ShopProfile[]>([]);
   const currentUserRef = useRef<User | null>(null);
 
@@ -262,7 +263,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         // but the WebSocket may still be serving cached data
         if (Capacitor.isNativePlatform()) {
           console.log('[AppContext] Push received — kicking Firestore to pick up changes');
-          enableNetwork(db).catch(() => {});
+          enableNetwork(db).catch(() => { });
         }
       });
     }
@@ -292,13 +293,17 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         console.log(`[AppContext] App resumed after ${backgroundDuration}ms — skipping reconnect (${reason})`);
         return;
       }
-      console.log(`[AppContext] Reconnecting Firestore — ${reason}`);
-      disableNetwork(db)
-        .then(() => new Promise(resolve => setTimeout(resolve, 200)))
-        .then(() => enableNetwork(db))
-        .then(() => console.log('[AppContext] Firestore reconnected successfully'))
+      // Only call enableNetwork — do NOT call disableNetwork first.
+      // The disableNetwork→enableNetwork cycle corrupts Firestore's internal state
+      // when onSnapshot listeners are active, causing:
+      //   INTERNAL ASSERTION FAILED: Unexpected state {"Fe":-1}
+      // enableNetwork alone is safe: it's a no-op when connected, and gently
+      // reconnects stale WebSockets without disrupting active listeners.
+      console.log(`[AppContext] Refreshing Firestore connection — ${reason}`);
+      enableNetwork(db)
+        .then(() => console.log('[AppContext] Firestore connection refreshed'))
         .catch(err => {
-          console.warn('[AppContext] Firestore reconnect failed:', err);
+          console.warn('[AppContext] Firestore enableNetwork failed:', err);
         });
     };
 
@@ -309,7 +314,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       heartbeatInterval = setInterval(() => {
         if (isAppActive) {
           console.log('[AppContext] Heartbeat — refreshing Firestore connection');
-          enableNetwork(db).catch(() => {});
+          enableNetwork(db).catch(() => { });
         }
       }, 30_000); // Every 30 seconds
     };
@@ -364,26 +369,80 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     };
   }, []);
 
-  // Shop data listener — uses addNotificationRef to avoid re-subscribing when addNotification changes
+  // Shop data listener — self-healing: retries on error instead of wiping data.
+  // Firebase auto-closes onSnapshot listeners on error, so we must re-subscribe.
   useEffect(() => {
     setIsLoadingShops(true);
-    const shopsCollectionRef = collection(db, "shops");
-    const unsubscribeShops = onSnapshot(shopsCollectionRef, (querySnapshot) => {
-      const fetchedShops: ShopProfile[] = [];
-      querySnapshot.forEach((doc) => {
-        fetchedShops.push({ id: doc.id, ...doc.data() } as ShopProfile);
-      });
-      setShops(fetchedShops);
-      setIsLoadingShops(false);
-    }, (_error) => {
-      addNotificationRef.current({ message: "Error updating shop list from Firestore. Please try refreshing.", type: 'error' });
-      setShops([]);
-      setIsLoadingShops(false);
-    });
-    return () => {
-      unsubscribeShops();
+    let hasReceivedServerData = false;
+    let unsubscribeShops: (() => void) | null = null;
+    let retryTimeout: ReturnType<typeof setTimeout> | null = null;
+    let retryCount = 0;
+    const MAX_RETRIES = 3;
+    let isCleaned = false;
+
+    const subscribe = () => {
+      if (isCleaned) return;
+      const shopsCollectionRef = collection(db, "shops");
+      unsubscribeShops = onSnapshot(
+        shopsCollectionRef,
+        { includeMetadataChanges: true },
+        (querySnapshot) => {
+          const isFromCache = querySnapshot.metadata.fromCache;
+          const fetchedShops: ShopProfile[] = [];
+          querySnapshot.forEach((docSnap) => {
+            fetchedShops.push({ id: docSnap.id, ...docSnap.data() } as ShopProfile);
+          });
+
+          // Always update shop data (even cached data is useful to display)
+          setShops(fetchedShops);
+          // Reset retry count on success — connection is healthy
+          retryCount = 0;
+
+          if (!isFromCache) {
+            hasReceivedServerData = true;
+            setIsLoadingShops(false);
+          } else if (fetchedShops.length > 0) {
+            setIsLoadingShops(false);
+          } else if (!hasReceivedServerData) {
+            setTimeout(() => {
+              setIsLoadingShops(false);
+            }, 5000);
+          }
+        },
+        (_error) => {
+          console.error('[AppContext] Shops listener error:', _error);
+          // DON'T wipe shops — keep existing data so dashboards don't break.
+          // The listener is now dead (Firebase auto-closed it). Re-subscribe after delay.
+          setIsLoadingShops(false);
+
+          if (retryCount < MAX_RETRIES && !isCleaned) {
+            retryCount++;
+            const delay = Math.min(retryCount * 3000, 10000); // 3s, 6s, 9s
+            console.log(`[AppContext] Shops listener will retry in ${delay}ms (attempt ${retryCount}/${MAX_RETRIES})`);
+            retryTimeout = setTimeout(() => {
+              if (isCleaned) return;
+              // Kick Firestore connection before re-subscribing
+              enableNetwork(db).catch(() => {});
+              subscribe();
+            }, delay);
+          } else {
+            addNotificationRef.current({
+              message: "Unable to load shop data. Please check your connection and refresh.",
+              type: 'error',
+            });
+          }
+        }
+      );
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+
+    subscribe();
+
+    return () => {
+      isCleaned = true;
+      unsubscribeShops?.();
+      if (retryTimeout) clearTimeout(retryTimeout);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
 
@@ -407,9 +466,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         setAllOrders(fetchedOrders);
         setOrders(fetchedOrders); // Also set orders for compatibility
       }, (_error) => {
-        addNotificationRef.current({ message: "Error fetching all orders.", type: 'error' });
-        setAllOrders([]);
-        setOrders([]);
+        // Don't wipe orders or show error — this fires during sign-out when
+        // user's permissions are revoked. Sign-out cleanup handles state.
+        console.warn("[AppContext] All-orders listener error (may be expected during sign-out):", _error.message || _error);
       });
       return () => unsubscribeAllOrders();
     }
@@ -431,14 +490,15 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       });
       setOrders(fetchedOrders);
     }, (_error) => {
-      addNotificationRef.current({ message: "Error fetching your orders. Please try again.", type: 'error' });
-      setOrders([]);
+      // Don't wipe orders or show error — this fires during sign-out when
+      // user's permissions are revoked. Sign-out cleanup handles state.
+      console.warn("[AppContext] Orders listener error (may be expected during sign-out):", _error.message || _error);
     });
 
     return () => {
       unsubscribeOrders();
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentUser]);
 
 
@@ -466,8 +526,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       });
       setPayouts(fetchedPayouts);
     }, (error) => {
-      console.error("Error fetching payouts:", error);
-      setPayouts([]);
+      // Don't wipe payouts on errors — this fires when user's account is deleted
+      // mid-session (permission denied). The sign-out flow will clear state.
+      console.warn("[AppContext] Payouts listener error (may be expected during sign-out):", error.message || error);
     });
 
     return () => unsubscribePayouts();
@@ -500,6 +561,48 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
     return () => unsubscribeNotifs();
   }, [currentUser]);
+
+  // Real-time listener on the current user's Firestore document.
+  // Detects admin deletion/rejection: when the doc is deleted, sign the user out immediately.
+  // onAuthStateChanged does NOT fire when only the Firestore doc is removed — the Firebase Auth
+  // session is still valid. This listener fills that gap.
+  useEffect(() => {
+    if (!currentUser?.id) return;
+
+    const userDocRef = doc(db, "users", currentUser.id);
+    let isFirstSnapshot = true;
+
+    const unsubscribeUserDoc = onSnapshot(userDocRef, (docSnap) => {
+      // Skip the first snapshot — we already have the user data from onAuthStateChanged
+      if (isFirstSnapshot) {
+        isFirstSnapshot = false;
+        return;
+      }
+
+      if (!docSnap.exists()) {
+        // Document was deleted (admin action) — sign out immediately
+        console.log('[AppContext] User document deleted (admin action). Signing out.');
+        addNotificationRef.current({
+          message: 'Your account has been removed by the administrator.',
+          type: 'warning',
+        });
+        setCurrentUserInternal(null);
+        setPendingFirebaseProfileCreationUser(null);
+        signOut(auth).catch((err) => {
+          console.warn('[AppContext] signOut after admin deletion failed:', err);
+        });
+      } else {
+        // Document was updated — sync the latest data (e.g., role changes, pass status)
+        const updatedData = docSnap.data() as User;
+        setCurrentUserInternal(updatedData);
+      }
+    }, (error) => {
+      console.warn('[AppContext] User document listener error:', error);
+      // Don't sign out on listener errors — could be a transient network issue
+    });
+
+    return () => unsubscribeUserDoc();
+  }, [currentUser?.id]);
 
   // Student Pass holders listener — admin only, for subscription revenue tracking
   useEffect(() => {
@@ -536,74 +639,123 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   useEffect(() => {
     setIsLoadingAuth(true);
     const notifyError = (msg: string) => addNotificationRef.current({ message: msg, type: 'error' });
+
+    // Handle redirect result (for Android WebView where signInWithRedirect is used)
+    // This must be called before onAuthStateChanged to catch the redirect return
+    getRedirectResult(auth).then((result) => {
+      if (result) {
+        console.log('[AppContext] Google redirect sign-in completed successfully');
+        // onAuthStateChanged will handle the rest
+      }
+    }).catch((error) => {
+      console.warn('[AppContext] getRedirectResult error:', error);
+      // Don't show error for "no redirect result" — that's normal on non-redirect flows
+      const firebaseError = error as { code?: string };
+      if (firebaseError.code && firebaseError.code !== 'auth/popup-closed-by-user') {
+        notifyError('Google sign-in failed. Please try again.');
+      }
+      setIsLoadingAuth(false);
+    });
+
     const unsubscribe = onAuthStateChanged(auth, async (authUser) => {
       if (authUser) {
+        // Helper: fetch user doc with retry for offline/network errors
+        const fetchUserDoc = async (uid: string, retries = 2): Promise<import('firebase/firestore').DocumentSnapshot> => {
+          const userDocRef = doc(db, "users", uid);
+          for (let attempt = 0; attempt <= retries; attempt++) {
+            try {
+              return await getDoc(userDocRef);
+            } catch (fetchErr) {
+              if (attempt < retries) {
+                console.warn(`[AppContext] Profile fetch attempt ${attempt + 1} failed, retrying...`, fetchErr);
+                await enableNetwork(db).catch(() => { });
+                await new Promise(r => setTimeout(r, 1500));
+              } else {
+                throw fetchErr;
+              }
+            }
+          }
+          throw new Error('Exhausted retries');
+        };
+
         try {
           // Check if this user's email is in the admin list
           const isAdmin = authUser.email && ADMIN_EMAILS.includes(authUser.email.toLowerCase());
 
           if (isAdmin) {
-            // Check if admin profile exists in Firestore
-            const userDocRef = doc(db, "users", authUser.uid);
-            const userDocSnap = await getDoc(userDocRef);
+            const userDocSnap = await fetchUserDoc(authUser.uid);
 
             if (userDocSnap.exists()) {
               const existingData = userDocSnap.data() as User;
               if (existingData.type !== UserType.ADMIN) {
-                // Overwrite existing profile as Admin
-                // If they had a shopId, we leave the shop data in Firestore (it stays accessible)
                 const adminProfile: User = {
                   id: authUser.uid,
                   name: authUser.displayName || existingData.name || 'Admin',
                   type: UserType.ADMIN,
                   email: authUser.email || existingData.email,
                 };
-                await setDoc(userDocRef, adminProfile);
+                await setDoc(doc(db, "users", authUser.uid), adminProfile);
                 setCurrentUserInternal(adminProfile);
               } else {
                 setCurrentUserInternal(existingData);
               }
             } else {
-              // Create admin profile
               const adminProfile: User = {
                 id: authUser.uid,
                 name: authUser.displayName || 'Admin',
                 type: UserType.ADMIN,
                 email: authUser.email || undefined,
               };
-              await setDoc(userDocRef, adminProfile);
+              await setDoc(doc(db, "users", authUser.uid), adminProfile);
               setCurrentUserInternal(adminProfile);
             }
             setPendingFirebaseProfileCreationUser(null);
           } else {
-            // Non-admin user: existing logic
-            const userDocRef = doc(db, "users", authUser.uid);
-            const userDocSnap = await getDoc(userDocRef);
+            // Non-admin user
+            const userDocSnap = await fetchUserDoc(authUser.uid);
 
             if (userDocSnap.exists()) {
               const userData = userDocSnap.data() as User;
               setCurrentUserInternal(userData);
               setPendingFirebaseProfileCreationUser(null);
             } else {
-              setCurrentUserInternal(null);
-              setPendingFirebaseProfileCreationUser(authUser);
+              // Profile doesn't exist in Firestore.
+              // If the user was previously logged in (currentUserRef has data),
+              // this means admin deleted their account → sign them out.
+              if (currentUserRef.current) {
+                console.log('[AppContext] Profile was deleted (admin action). Signing out user.');
+                addNotificationRef.current({ message: 'Your account has been removed by the administrator.', type: 'warning' });
+                setCurrentUserInternal(null);
+                setPendingFirebaseProfileCreationUser(null);
+                await signOut(auth);
+              } else {
+                // Genuinely new user — show profile creation form
+                setCurrentUserInternal(null);
+                setPendingFirebaseProfileCreationUser(authUser);
+              }
             }
           }
         } catch (error) {
-          notifyError("Error loading your profile.");
-          setCurrentUserInternal(null);
-          setPendingFirebaseProfileCreationUser(null);
+          console.error('[AppContext] Failed to load profile after retries:', error);
+          // DON'T clear currentUser on network errors — the user may have signed in
+          // successfully via signInWithGoogle which already set the user state.
+          // Only show error if we don't already have a valid user.
+          if (!currentUserRef.current) {
+            notifyError("Error loading your profile. Please check your connection and try again.");
+          }
+          // Don't clear state — leave whatever currentUser/pending state exists
         } finally {
           setIsLoadingAuth(false);
         }
       } else {
+        // User signed out (or admin deleted their Firebase Auth account)
         setCurrentUserInternal(null);
         setPendingFirebaseProfileCreationUser(null);
         setIsLoadingAuth(false);
       }
     });
     return () => unsubscribe();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
 
@@ -635,14 +787,107 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     provider.setCustomParameters({
       prompt: 'select_account'
     });
+
+    const isNative = Capacitor.isNativePlatform();
+
     try {
-      await signInWithPopup(auth, provider);
+      if (isNative) {
+        // Native Android/iOS: use native Google Sign-In via Credential Manager.
+        // Google blocks signInWithPopup/Redirect in WebViews with "disallowed_useragent".
+        console.log('[AppContext] Attempting native Google Sign-In...');
+        const success = await attemptNativeGoogleSignIn();
+        if (!success) {
+          throw new Error('Native Google Sign-In returned no result. Please ensure Google Play Services is up to date.');
+        }
+        console.log('[AppContext] Native Google Sign-In + Firebase credential completed');
+      } else {
+        // Web browser: use signInWithPopup
+        console.log('[AppContext] Using signInWithPopup for web...');
+        try {
+          await signInWithPopup(auth, provider);
+          console.log('[AppContext] signInWithPopup resolved normally');
+        } catch (popupErr: unknown) {
+          // COOP (Cross-Origin-Opener-Policy) can cause signInWithPopup to throw
+          // even when the auth actually succeeded via onAuthStateChanged.
+          // Check if Firebase already has a valid user before treating it as failure.
+          if (auth.currentUser) {
+            console.log('[AppContext] signInWithPopup threw but auth.currentUser exists — sign-in succeeded despite COOP');
+          } else {
+            throw popupErr; // Re-throw — it's a real failure
+          }
+        }
+      }
+
+      // Auth succeeded. DON'T load the profile here — let onAuthStateChanged
+      // be the single source of truth. Loading the profile both here AND in
+      // onAuthStateChanged creates a race condition where two getDoc calls run
+      // simultaneously. If Firestore's WebSocket is recovering from the popup
+      // stealing focus, these parallel reads can trigger internal assertion errors.
+      // onAuthStateChanged fires automatically after signInWithPopup/signInWithCredential
+      // completes, and its handler already has retry logic.
+      if (auth.currentUser) {
+        console.log('[AppContext] Auth succeeded for:', auth.currentUser.email, '— onAuthStateChanged will handle profile loading');
+        // Gently nudge Firestore to reconnect its WebSocket (the popup may have
+        // caused it to go stale). enableNetwork alone is safe — no disableNetwork.
+        enableNetwork(db).catch(() => { });
+      }
     } catch (err: unknown) {
-      handleAuthError(err);
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      console.error('[AppContext] Google Sign-In error:', errorMessage);
+
+      // Don't show error if user just cancelled the sign-in
+      const lower = errorMessage.toLowerCase();
+      const isCancellation = lower.includes('user canceled') ||
+        lower.includes('user cancelled') ||
+        lower.includes('sign_in_cancelled') ||
+        lower.includes('sign in action cancelled') ||
+        lower.includes('canceled by user') ||
+        lower.includes('popup-closed-by-user') ||
+        lower.includes('cancelled-popup-request');
+
+      if (!isCancellation) {
+        addNotification({ message: `Google Sign-In failed: ${errorMessage}`, type: 'error' });
+      }
       setCurrentUserInternal(null);
       setPendingFirebaseProfileCreationUser(null);
+    } finally {
       setIsLoadingAuth(false);
     }
+  };
+
+  // Helper: Attempt native Google Sign-In using Capacitor plugin
+  // Returns true if successful, throws on error, returns false if plugin unavailable
+  const attemptNativeGoogleSignIn = async (): Promise<boolean> => {
+    const { SocialLogin } = await import('@capgo/capacitor-social-login');
+
+    await SocialLogin.initialize({
+      google: {
+        webClientId: '283831997162-p8afki1sjtfa9srdvr6infpf06gofmk5.apps.googleusercontent.com',
+      },
+    });
+
+    const result = await SocialLogin.login({
+      provider: 'google',
+      options: {
+        scopes: ['email', 'profile'],
+      },
+    });
+
+    const loginResponse = result?.result;
+    if (!loginResponse || loginResponse.responseType !== 'online') {
+      console.warn('[AppContext] Native sign-in returned non-online response:', loginResponse);
+      return false;
+    }
+
+    const idToken = loginResponse.idToken;
+    if (!idToken) {
+      console.warn('[AppContext] Native sign-in returned no idToken');
+      return false;
+    }
+
+    const credential = GoogleAuthProvider.credential(idToken);
+    await signInWithCredential(auth, credential);
+    return true;
   };
 
   const signUpWithEmailPassword = async (email: string, password: string, displayName: string): Promise<{ success: boolean; message?: string }> => {
@@ -1366,7 +1611,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     approveShop, rejectShop, deleteShopAndOwner, archiveShop, unarchiveShop, approvedShops,
     deleteOwnShopAccount,
     studentPassHolders
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }), [
     currentUser, isLoadingAuth, pendingFirebaseProfileCreationUser,
     shops, isLoadingShops, orders, allOrders, notifications, currentView, payouts, approvedShops, studentPassHolders

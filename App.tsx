@@ -1,7 +1,5 @@
 
-
-
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Capacitor } from '@capacitor/core';
 import { initMobile } from './utils/mobile';
 import { UserType, AppView } from './types';
@@ -11,6 +9,7 @@ import ShopDashboard from './components/shop/ShopDashboard';
 import AdminDashboard from './components/admin/AdminDashboard';
 import LoginPage from './components/auth/LoginPage';
 import { useAppContext } from './contexts/AppContext';
+import { enableNetwork, db } from './firebase';
 import { Spinner } from './components/common/Spinner';
 import { ThemeProvider } from './contexts/ThemeContext';
 
@@ -24,6 +23,59 @@ import StudentPassPage from './components/student/StudentPassPage';
 import LandingPage from './components/LandingPage';
 
 
+// Fallback component for shop dashboard loading — prevents infinite spinner for new shopkeepers
+// whose shop data hasn't been picked up by onSnapshot yet.
+const ShopLoadingFallback: React.FC = () => {
+  const [timedOut, setTimedOut] = useState(false);
+  const [retryCount, setRetryCount] = useState(0);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setTimedOut(true), 8_000);
+    return () => clearTimeout(timer);
+  }, []);
+
+  const handleRetry = () => {
+    if (retryCount >= 1) {
+      // Second retry — reload page. The onSnapshot listener may be dead,
+      // and a full reload re-initializes Firebase cleanly (guaranteed fix).
+      window.location.reload();
+      return;
+    }
+    // First retry — kick Firestore to reconnect, then wait for the
+    // self-healing shops listener to pick up data. If shops state updates,
+    // the parent component will auto-switch from Fallback to ShopDashboard.
+    setRetryCount(1);
+    setTimedOut(false);
+    enableNetwork(db).catch(() => {});
+    setTimeout(() => setTimedOut(true), 5000);
+  };
+
+  if (!timedOut) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-[70vh]">
+        <Spinner size="lg" />
+        <p className="mt-4 text-brand-lightText">Loading shop data...</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col items-center justify-center min-h-[70vh] text-center px-6">
+      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-16 h-16 text-amber-400 mb-4">
+        <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" />
+      </svg>
+      <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">Shop data is taking longer than expected</h3>
+      <p className="text-sm text-gray-600 dark:text-gray-400 mb-1">This can happen when your shop was just created or your network is slow.</p>
+      <p className="text-sm text-gray-600 dark:text-gray-400 mb-6">If you just registered, your shop may be pending admin approval.</p>
+      <button
+        onClick={handleRetry}
+        className="px-6 py-2.5 rounded-lg bg-brand-primary text-white font-medium hover:bg-brand-primaryDark transition-colors"
+      >
+        {retryCount >= 1 ? 'Reload Page' : 'Try Again'}
+      </button>
+    </div>
+  );
+};
 
 const App: React.FC = () => {
   return (
@@ -102,7 +154,10 @@ const AppContent: React.FC = () => {
       } else if (currentUser.type === UserType.STUDENT && !isLoadingShops) {
         navigateTo('studentDashboard');
         hasRedirected.current = true;
-      } else if (currentUser.type === UserType.SHOP_OWNER && currentUser.shopId && !isLoadingShops && getShopById(currentUser.shopId)) {
+      } else if (currentUser.type === UserType.SHOP_OWNER && currentUser.shopId) {
+        // Don't wait for shop data to load — the dashboard handles its own loading state.
+        // Waiting for getShopById() caused new shopkeepers to get stuck on the login page
+        // because the onSnapshot hadn't picked up their newly created shop yet.
         navigateTo('shopDashboard');
         hasRedirected.current = true;
       }
@@ -152,13 +207,11 @@ const AppContent: React.FC = () => {
         return <LoginPage />;
       case 'shopDashboard':
         if (currentUser?.type === UserType.SHOP_OWNER && currentUser.shopId) {
-          if (isLoadingShops || !getShopById(currentUser.shopId)) {
-            return (
-              <div className="flex flex-col items-center justify-center min-h-[70vh]">
-                <Spinner size="lg" />
-                <p className="mt-4 text-brand-lightText">Loading shop data...</p>
-              </div>
-            );
+          const shop = getShopById(currentUser.shopId);
+          if (isLoadingShops || !shop) {
+            // Use the fallback component instead of a plain spinner
+            // It handles timeouts and retry for new shopkeepers
+            return <ShopLoadingFallback />;
           }
           return <ShopDashboard shopId={currentUser.shopId} />;
         }
@@ -214,3 +267,4 @@ const AppContent: React.FC = () => {
 };
 
 export default App;
+

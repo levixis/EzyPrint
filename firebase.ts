@@ -5,6 +5,8 @@ import {
   getAuth,
   GoogleAuthProvider,
   signInWithPopup,
+  signInWithCredential,
+  getRedirectResult,
   signOut,
   onAuthStateChanged,
   createUserWithEmailAndPassword,
@@ -30,8 +32,7 @@ import {
   limit,          // Added for capping notification queries
   addDoc,         // Added for creating notification documents
   runTransaction,
-  enableNetwork,  // Added for app resume reconnection
-  disableNetwork  // Added for app resume reconnection
+  enableNetwork  // Added for app resume reconnection
 } from 'firebase/firestore';
 import {
   getStorage,
@@ -47,7 +48,9 @@ import {
 // Falls back to hardcoded values if env vars are not set
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY || "AIzaSyBLmBxkJaImXrB-eOHpaieDTVhcLjOsod0",
-  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || "ezyyprint.firebaseapp.com",
+  // Use the web.app domain (same as hosting) to prevent cross-origin storage
+  // partitioning issues with signInWithRedirect in Android WebViews
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || "ezyyprint.web.app",
   projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID || "ezyyprint",
   storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET || "ezyyprint.firebasestorage.app",
   messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || "283831997162",
@@ -114,7 +117,7 @@ if (connectToEmulators) {
   } catch (e) {
   }
 } else {
-  console.warn(`[FirebaseConnectionDEBUG] ==> PRODUCTION environment DETECTED (viteDevMode: ${viteDevMode}, actualHostname: "${actualHostname}", isLocalHostname: ${isLocalHostname}). Connecting to LIVE Firebase services.`);
+  console.log(`[Firebase] Production mode (host: "${actualHostname}"). Connected to LIVE Firebase services.`);
   if (actualHostname === "127.0.0.1" || actualHostname === "localhost") {
     // debugger; // Uncomment this line if you want the script to pause here for inspection
   }
@@ -128,6 +131,8 @@ export {
   storage,
   GoogleAuthProvider,
   signInWithPopup,
+  signInWithCredential,
+  getRedirectResult,
   signOut,
   onAuthStateChanged,
   createUserWithEmailAndPassword,
@@ -152,7 +157,6 @@ export {
   getDownloadURL,      // Exported
   getBlob,             // Exported for CORS-safe blob downloads
   deleteObject,        // Exported for file cleanup
-  enableNetwork,       // Exported for app resume reconnection
-  disableNetwork       // Exported for app resume reconnection
+  enableNetwork        // Exported for app resume reconnection
 };
 export type { FirebaseUser };

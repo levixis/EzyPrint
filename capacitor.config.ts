@@ -7,8 +7,15 @@ const config: CapacitorConfig = {
   server: {
     // Load from live hosted URL — app auto-updates on every hosting deploy
     url: 'https://ezyyprint.web.app',
-    // Allow navigation to external URLs (Razorpay checkout, etc.)
-    allowNavigation: ['*.razorpay.com', '*.web.app', '*.firebaseapp.com'],
+    // Allow navigation to external URLs (Google auth, Razorpay checkout, etc.)
+    allowNavigation: [
+      '*.razorpay.com',
+      '*.web.app',
+      '*.firebaseapp.com',
+      '*.google.com',
+      '*.googleapis.com',
+      'accounts.google.com',
+    ],
   },
   plugins: {
     SplashScreen: {
@@ -27,6 +34,11 @@ const config: CapacitorConfig = {
     Keyboard: {
       resize: 'none' as any,
       resizeOnFullScreen: false,
+    },
+    SocialLogin: {
+      google: {
+        webClientId: '283831997162-p8afki1sjtfa9srdvr6infpf06gofmk5.apps.googleusercontent.com',
+      },
     },
   },
 };

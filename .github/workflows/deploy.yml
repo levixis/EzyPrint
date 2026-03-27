@@ -1,0 +1,50 @@
+name: Deploy EzyPrint
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      # ── Web App ──
+      - name: Install web dependencies
+        run: npm ci
+
+      - name: Build web app
+        run: npm run build
+
+      # ── Cloud Functions ──
+      - name: Install functions dependencies
+        run: cd functions && npm ci
+
+      # Write the Razorpay env vars for Cloud Functions
+      - name: Create functions .env
+        run: |
+          echo "RAZORPAY_KEY_ID=${{ secrets.RAZORPAY_KEY_ID }}" > functions/.env
+          echo "RAZORPAY_KEY_SECRET=${{ secrets.RAZORPAY_KEY_SECRET }}" >> functions/.env
+
+      - name: Build functions
+        run: cd functions && npm run build
+
+      # ── Deploy Everything ──
+      # Write the service account key to a temp file for authentication
+      - name: Authenticate with Firebase
+        run: |
+          echo '${{ secrets.FIREBASE_SERVICE_ACCOUNT_EZYYPRINT }}' > /tmp/firebase-sa.json
+          export GOOGLE_APPLICATION_CREDENTIALS=/tmp/firebase-sa.json
+          npx firebase-tools deploy --only hosting,functions,firestore:rules --project ezyyprint --force
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: /tmp/firebase-sa.json

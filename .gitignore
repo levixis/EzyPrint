@@ -29,3 +29,26 @@ android/.gradle/
 android/build/
 ios/App/Pods/
 ios/DerivedData/
+
+# ── SECURITY: Never commit secrets ──
+# Environment variables (Razorpay keys, API secrets, etc.)
+.env
+.env.*
+!.env.example
+functions/.env
+functions/.env.*
+
+# Firebase admin SDK / service account keys
+*-adminsdk-*.json
+*-firebase-adminsdk-*.json
+firebase-service-account*.json
+
+# Android signing keys
+*.jks
+*.keystore
+android/release-signing.properties
+android/key.properties
+
+# Firebase CI tokens
+.firebaserc-ci
+functions/lib/

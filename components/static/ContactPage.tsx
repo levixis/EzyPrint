@@ -8,8 +8,7 @@ const ContactPage: React.FC = () => {
         window.scrollTo(0, 0);
     }, []);
 
-    const supportEmail = "harshop174@gmail.com";
-    const supportPhone = "+91 7001856694";
+    const supportEmail = "devnexus47@gmail.com";
 
     return (
         <div className="max-w-3xl mx-auto pt-24 pb-8 px-4">
@@ -27,12 +26,6 @@ const ContactPage: React.FC = () => {
                                     <path d="M18 8.118l-8 4-8-4V14a2 2 0 002 2h12a2 2 0 002-2V8.118z" />
                                 </svg>
                                 <span>Email: <a href={`mailto:${supportEmail}`} className="text-brand-primary hover:underline">{supportEmail}</a></span>
-                            </li>
-                            <li className="flex items-center">
-                                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 mr-2 text-brand-primary" viewBox="0 0 20 20" fill="currentColor">
-                                    <path d="M2 3a1 1 0 011-1h2.153a1 1 0 01.986.836l.74 4.435a1 1 0 01-.54 1.06l-1.548.773a11.037 11.037 0 006.105 6.105l.774-1.548a1 1 0 011.059-.54l4.435.74a1 1 0 01.836.986V17a1 1 0 01-1 1h-2C7.82 18 2 12.18 2 5V3z" />
-                                </svg>
-                                <span>Phone: <a href={`tel:${supportPhone}`} className="text-brand-primary hover:underline">{supportPhone}</a> (Mon-Sun, 5 PM - 8 PM IST)</span>
                             </li>
                         </ul>
                     </div>
