@@ -13,10 +13,19 @@ const ShopOrderList: React.FC<ShopOrderListProps> = ({ orders, onSelectOrder }) 
   const [historyLimit, setHistoryLimit] = useState(HISTORY_PAGE_SIZE);
 
   const processingOrders = orders.filter(o => [OrderStatus.PENDING_APPROVAL, OrderStatus.PRINTING].includes(o.status))
-    .sort((a, b) => new Date(a.uploadedAt).getTime() - new Date(b.uploadedAt).getTime());
+    .sort((a, b) => {
+      // Premium orders first, then by upload time (FIFO)
+      if (a.isPremiumOrder && !b.isPremiumOrder) return -1;
+      if (!a.isPremiumOrder && b.isPremiumOrder) return 1;
+      return new Date(a.uploadedAt).getTime() - new Date(b.uploadedAt).getTime();
+    });
 
   const readyForPickupOrders = orders.filter(o => o.status === OrderStatus.READY_FOR_PICKUP)
-    .sort((a, b) => new Date(a.uploadedAt).getTime() - new Date(b.uploadedAt).getTime());
+    .sort((a, b) => {
+      if (a.isPremiumOrder && !b.isPremiumOrder) return -1;
+      if (!a.isPremiumOrder && b.isPremiumOrder) return 1;
+      return new Date(a.uploadedAt).getTime() - new Date(b.uploadedAt).getTime();
+    });
 
   const historicalOrders = orders.filter(o => [OrderStatus.COMPLETED, OrderStatus.CANCELLED].includes(o.status))
     .sort((a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());

@@ -112,6 +112,7 @@ export interface DocumentOrder {
   shopNotes?: string;
   pickupCode?: string;
   paymentAttemptedAt?: string;
+  isPremiumOrder?: boolean; // True if user had Student Pass at order creation
 }
 
 export interface NotificationMessage {

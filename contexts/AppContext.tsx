@@ -939,6 +939,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         pages: totalPages,
         doubleSided: anyDoubleSided,
       },
+      isPremiumOrder: hasStudentPass,
     };
 
     try {

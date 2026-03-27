@@ -36,19 +36,29 @@ const FileIconShop: React.FC<{ fileType: string }> = ({ fileType }) => {
 };
 
 const ShopOrderCard: React.FC<ShopOrderCardProps> = ({ order, onSelectOrder }) => {
-  const { id, userId, status, uploadedAt, printOptions, priceDetails } = order;
+  const { id, userId, status, uploadedAt, printOptions, priceDetails, isPremiumOrder } = order;
   const files = getOrderFiles(order);
   const displayName = getOrderDisplayName(order);
   const formattedStatus = status.replace(/_/g, ' ');
   const statusStyle = getStatusShopStyles(status);
 
   return (
-    <Card className={`flex flex-col justify-between h-full hover:shadow-2xl hover:ring-2 hover:ring-brand-primary transition-all duration-200 border-l-4 ${statusStyle.border}`} noPadding>
+    <Card className={`flex flex-col justify-between h-full hover:shadow-2xl hover:ring-2 hover:ring-brand-primary transition-all duration-200 border-l-4 ${isPremiumOrder ? 'border-amber-400 ring-1 ring-amber-300/30' : statusStyle.border}`} noPadding>
       <div className="p-5">
         <div className="flex items-start mb-3">
           <FileIconShop fileType={files[0]?.fileType || 'PDF'} />
-          <div>
-            <h4 className="text-md font-semibold text-gray-900 dark:text-white break-all leading-tight mb-0.5">{displayName}</h4>
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <h4 className="text-md font-semibold text-gray-900 dark:text-white break-all leading-tight mb-0.5">{displayName}</h4>
+              {isPremiumOrder && (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-gradient-to-r from-amber-400 to-yellow-500 text-amber-900 shadow-sm flex-shrink-0">
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-3 h-3">
+                    <path fillRule="evenodd" d="M10.868 2.884c-.321-.772-1.415-.772-1.736 0l-1.83 4.401-4.753.381c-.833.067-1.171 1.107-.536 1.651l3.62 3.102-1.106 4.637c-.194.813.691 1.456 1.405 1.02L10 15.591l4.069 2.485c.713.436 1.598-.207 1.404-1.02l-1.106-4.637 3.62-3.102c.635-.544.297-1.584-.536-1.65l-4.752-.382-1.831-4.401Z" clipRule="evenodd" />
+                  </svg>
+                  Priority
+                </span>
+              )}
+            </div>
             <p className="text-xs text-gray-600 dark:text-gray-400">Order #{id.slice(-6)} (User: {userId.slice(-6)})</p>
           </div>
         </div>

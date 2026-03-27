@@ -16,7 +16,7 @@ const StudentDashboard: React.FC<StudentDashboardProps> = ({ userId, onNavigateT
 
   return (
     <div className="space-y-8 pt-28">
-      <h2 className="text-3xl font-bold text-brand-text mb-6">Welcome, {currentUser?.name || 'Student'}!</h2>
+      <h2 className="text-3xl font-bold text-brand-text dark:text-brand-dark-text mb-6">Welcome, {currentUser?.name || 'Student'}!</h2>
       <Card title="Upload New Document" className="bg-brand-secondary/80 backdrop-blur-sm">
         <FileUploadForm userId={userId} isLoadingShops={isLoadingShops} onNavigateToPass={onNavigateToPass} />
       </Card>
