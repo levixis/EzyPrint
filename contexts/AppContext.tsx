@@ -89,6 +89,9 @@ interface AppContextType {
   navigateTo: (view: AppView) => void;
   goBack: () => void;
 
+  // Admin subscription data
+  studentPassHolders: { id: string; name?: string; email?: string; studentPassActivatedAt?: string; studentPassPaymentId?: string }[];
+
   // Admin payout functions
   payouts: ShopPayout[];
   createPayout: (shopId: string, shopName: string, amount: number, adminNote?: string) => Promise<{ success: boolean; message?: string }>;
@@ -143,6 +146,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [orders, setOrders] = useState<DocumentOrder[]>([]);
   const [allOrders, setAllOrders] = useState<DocumentOrder[]>([]); // Admin: all orders
   const [payouts, setPayouts] = useState<ShopPayout[]>([]);
+  const [studentPassHolders, setStudentPassHolders] = useState<{ id: string; name?: string; email?: string; studentPassActivatedAt?: string; studentPassPaymentId?: string }[]>([]);
   const [firestoreNotifications, setFirestoreNotifications] = useState<NotificationMessage[]>([]);
   const [localNotifications, setLocalNotifications] = useState<NotificationMessage[]>([]);
   const [currentView, setCurrentView] = useState<AppView>('landing');
@@ -495,6 +499,38 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     });
 
     return () => unsubscribeNotifs();
+  }, [currentUser]);
+
+  // Student Pass holders listener — admin only, for subscription revenue tracking
+  useEffect(() => {
+    if (!currentUser || currentUser.type !== UserType.ADMIN) {
+      setStudentPassHolders([]);
+      return;
+    }
+
+    const passQuery = query(
+      collection(db, 'users'),
+      where('hasStudentPass', '==', true)
+    );
+
+    const unsubscribePass = onSnapshot(passQuery, (querySnapshot) => {
+      const holders: typeof studentPassHolders = [];
+      querySnapshot.forEach((docSnap) => {
+        const data = docSnap.data();
+        holders.push({
+          id: docSnap.id,
+          name: data.name,
+          email: data.email,
+          studentPassActivatedAt: data.studentPassActivatedAt,
+          studentPassPaymentId: data.studentPassPaymentId,
+        });
+      });
+      setStudentPassHolders(holders);
+    }, (error) => {
+      console.error('[AppContext] Error listening to student pass holders:', error);
+    });
+
+    return () => unsubscribePass();
   }, [currentUser]);
 
   useEffect(() => {
@@ -1328,11 +1364,12 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     currentView, navigateTo, goBack, upgradeToStudentPass, cancelStudentPass,
     payouts, createPayout, requestPayout, markPayoutPaid, confirmPayout, disputePayout,
     approveShop, rejectShop, deleteShopAndOwner, archiveShop, unarchiveShop, approvedShops,
-    deleteOwnShopAccount
+    deleteOwnShopAccount,
+    studentPassHolders
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }), [
     currentUser, isLoadingAuth, pendingFirebaseProfileCreationUser,
-    shops, isLoadingShops, orders, allOrders, notifications, currentView, payouts, approvedShops
+    shops, isLoadingShops, orders, allOrders, notifications, currentView, payouts, approvedShops, studentPassHolders
   ]);
 
   return (

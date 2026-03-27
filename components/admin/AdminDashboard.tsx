@@ -10,7 +10,7 @@ import gsap from 'gsap';
 type AdminTab = 'overview' | 'shops' | 'payouts' | 'orders';
 
 const AdminDashboard: React.FC = () => {
-  const { shops, allOrders, payouts } = useAppContext();
+  const { shops, allOrders, payouts, studentPassHolders } = useAppContext();
   const [activeTab, setActiveTab] = useState<AdminTab>('overview');
   const [selectedShopForPayout, setSelectedShopForPayout] = useState<ShopProfile | null>(null);
   const [ordersSearch, setOrdersSearch] = useState('');
@@ -57,8 +57,12 @@ const AdminDashboard: React.FC = () => {
 
     const pendingApprovals = shops.filter(s => !s.isApproved).length;
 
-    return { totalOrders, totalRevenue, shopEarnings, platformFees, activeOrders, pendingPayouts, disputedPayouts, totalPaidOut, activeShops: shops.filter(s => s.isOpen).length, pendingApprovals };
-  }, [allOrders, payouts, shops]);
+    // Subscription revenue
+    const totalPassHolders = studentPassHolders.length;
+    const subscriptionRevenue = totalPassHolders * 49; // ₹49 per pass
+
+    return { totalOrders, totalRevenue, shopEarnings, platformFees, activeOrders, pendingPayouts, disputedPayouts, totalPaidOut, activeShops: shops.filter(s => s.isOpen).length, pendingApprovals, totalPassHolders, subscriptionRevenue };
+  }, [allOrders, payouts, shops, studentPassHolders]);
 
   // Filtered orders for search
   const filteredOrders = useMemo(() => {
@@ -174,6 +178,11 @@ const AdminDashboard: React.FC = () => {
               <p className="text-3xl font-bold text-purple-700 dark:text-purple-300 mt-1">{stats.activeShops}</p>
               <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">of {shops.length} total</p>
             </div>
+            <div className="admin-card bg-gradient-to-br from-rose-50 to-pink-50 dark:from-rose-900/20 dark:to-pink-900/20 rounded-xl p-5 border border-rose-200/50 dark:border-rose-800/30">
+              <p className="text-xs font-semibold text-rose-600/70 dark:text-rose-400/70 uppercase tracking-wider">Student Pass Revenue</p>
+              <p className="text-3xl font-bold text-rose-700 dark:text-rose-300 mt-1">₹{stats.subscriptionRevenue}</p>
+              <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">{stats.totalPassHolders} subscribers × ₹49</p>
+            </div>
             {stats.pendingApprovals > 0 && (
               <div className="admin-card bg-gradient-to-br from-orange-50 to-amber-50 dark:from-orange-900/20 dark:to-amber-900/20 rounded-xl p-5 border border-orange-200/50 dark:border-orange-800/30 col-span-2 md:col-span-4">
                 <div className="flex items-center justify-between">
@@ -237,6 +246,48 @@ const AdminDashboard: React.FC = () => {
               </div>
             </Card>
           </div>
+
+          {/* Student Pass Subscribers */}
+          {studentPassHolders.length > 0 && (
+            <Card className="admin-card bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-700" noPadding>
+              <div className="p-5 border-b border-gray-200 dark:border-zinc-700">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <div className="w-8 h-8 rounded-lg bg-rose-100 dark:bg-rose-900/30 flex items-center justify-center">
+                      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4 text-rose-600 dark:text-rose-400">
+                        <path fillRule="evenodd" d="M10.868 2.884c-.321-.772-1.415-.772-1.736 0l-1.83 4.401-4.753.381c-.833.067-1.171 1.107-.536 1.651l3.62 3.102-1.106 4.637c-.194.813.691 1.456 1.405 1.02L10 15.591l4.069 2.485c.713.436 1.598-.207 1.404-1.02l-1.106-4.637 3.62-3.102c.635-.544.297-1.584-.536-1.65l-4.752-.382-1.831-4.401Z" clipRule="evenodd" />
+                      </svg>
+                    </div>
+                    <h4 className="font-semibold text-gray-900 dark:text-white">Student Pass Subscribers</h4>
+                  </div>
+                  <span className="text-sm font-bold text-rose-600 dark:text-rose-400">₹{stats.subscriptionRevenue} total</span>
+                </div>
+              </div>
+              <div className="divide-y divide-gray-100 dark:divide-zinc-800 max-h-64 overflow-y-auto">
+                {[...studentPassHolders]
+                  .sort((a, b) => new Date(b.studentPassActivatedAt || 0).getTime() - new Date(a.studentPassActivatedAt || 0).getTime())
+                  .map((holder) => (
+                  <div key={holder.id} className="px-5 py-3 flex items-center justify-between">
+                    <div>
+                      <p className="text-sm font-medium text-gray-900 dark:text-white">{holder.name || 'Unknown'}</p>
+                      <p className="text-xs text-gray-500 dark:text-gray-400">{holder.email || holder.id.slice(-8)}</p>
+                    </div>
+                    <div className="text-right">
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-gradient-to-r from-amber-400 to-yellow-500 text-amber-900">
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-3 h-3">
+                          <path fillRule="evenodd" d="M10.868 2.884c-.321-.772-1.415-.772-1.736 0l-1.83 4.401-4.753.381c-.833.067-1.171 1.107-.536 1.651l3.62 3.102-1.106 4.637c-.194.813.691 1.456 1.405 1.02L10 15.591l4.069 2.485c.713.436 1.598-.207 1.404-1.02l-1.106-4.637 3.62-3.102c.635-.544.297-1.584-.536-1.65l-4.752-.382-1.831-4.401Z" clipRule="evenodd" />
+                        </svg>
+                        ₹49
+                      </span>
+                      {holder.studentPassActivatedAt && (
+                        <p className="text-[10px] text-gray-400 mt-0.5">{new Date(holder.studentPassActivatedAt).toLocaleDateString()}</p>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </Card>
+          )}
         </div>
       )}
 
