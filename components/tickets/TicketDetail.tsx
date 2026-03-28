@@ -117,7 +117,7 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
 
   return (
     <Modal isOpen={isOpen} onClose={onClose} title="" size="full" hideCloseButton>
-      <div className="flex flex-col lg:h-[65vh] -mt-2">
+      <div className="flex flex-col lg:h-[65vh]">
         {/* Header Bar */}
         <div className="flex items-center justify-between gap-3 pb-4 border-b border-gray-200 dark:border-zinc-700">
           <div className="flex items-center gap-3 min-w-0 flex-1">
@@ -127,7 +127,7 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
               </svg>
             </div>
             <div className="min-w-0 flex-1">
-              <h3 className="text-lg font-bold text-gray-900 dark:text-white truncate leading-tight">
+              <h3 className="text-lg sm:text-xl font-bold text-gray-900 dark:text-white line-clamp-2 leading-snug">
                 {liveTicket.subject}
               </h3>
               <div className="flex items-center gap-2 mt-0.5 flex-wrap">
@@ -153,7 +153,7 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
         {/* Two-Column Layout */}
         <div className="flex flex-col lg:flex-row gap-5 mt-4 flex-1 lg:min-h-0">
           {/* Left Column: Ticket Info + Attachments */}
-          <div className="lg:w-[340px] flex-shrink-0 space-y-4 lg:overflow-y-auto pr-1 lg:pb-4">
+          <div className="w-full lg:w-[340px] flex-shrink-0 space-y-4 lg:overflow-y-auto pr-1 lg:pb-4">
             {/* Raised By Info */}
             <div className="bg-gray-50 dark:bg-zinc-800/50 rounded-xl p-4 border border-gray-200 dark:border-zinc-700 space-y-2.5">
               <h5 className="text-xs font-bold text-gray-500 dark:text-gray-400 uppercase tracking-wider">Ticket Info</h5>
@@ -301,7 +301,7 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
             </div>
 
             {/* Messages Thread — takes remaining space */}
-            <div className="flex-1 overflow-y-auto py-4 space-y-3 min-h-[250px] lg:min-h-0 lg:max-h-full">
+            <div className="flex-1 lg:overflow-y-auto py-4 space-y-3 min-h-[200px] lg:min-h-0 lg:max-h-full">
               {liveTicket.messages.length === 0 && (
                 <div className="flex flex-col items-center justify-center py-12 text-center">
                   <div className="w-14 h-14 rounded-full bg-gray-100 dark:bg-zinc-800 flex items-center justify-center mb-3">
