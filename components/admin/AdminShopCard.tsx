@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ShopProfile, DocumentOrder, OrderStatus, ShopPayout, PayoutStatus } from '../../types';
+import { ShopProfile, DocumentOrder, OrderStatus, ShopPayout, PayoutStatus, BankDetails } from '../../types';
 import { Card } from '../common/Card';
 import { Button } from '../common/Button';
 import { useAppContext } from '../../contexts/AppContext';
@@ -12,8 +12,11 @@ interface AdminShopCardProps {
 }
 
 const AdminShopCard: React.FC<AdminShopCardProps> = ({ shop, orders, payouts, onCreatePayout }) => {
-  const { approveShop, rejectShop, deleteShopAndOwner, archiveShop, unarchiveShop } = useAppContext();
+  const { approveShop, rejectShop, deleteShopAndOwner, archiveShop, unarchiveShop, getBankDetails, verifyBankDetails, logBankAccess } = useAppContext();
   const [isProcessing, setIsProcessing] = useState(false);
+  const [bankDetails, setBankDetails] = useState<BankDetails | null>(null);
+  const [isBankLoading, setIsBankLoading] = useState(false);
+  const [isBankVerifying, setIsBankVerifying] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
 
   const shopOrders = orders.filter(o => o.shopId === shop.id);
@@ -133,6 +136,66 @@ const AdminShopCard: React.FC<AdminShopCardProps> = ({ shop, orders, payouts, on
         <div className="flex gap-2 text-xs text-gray-500 dark:text-gray-400 mb-4">
           <span className="bg-gray-100 dark:bg-zinc-800 px-2 py-1 rounded">B&W: ₹{shop.customPricing.bwPerPage}/pg</span>
           <span className="bg-gray-100 dark:bg-zinc-800 px-2 py-1 rounded">Color: ₹{shop.customPricing.colorPerPage}/pg</span>
+        </div>
+
+        {/* Contact Info */}
+        {(shop.contactPhone || shop.contactEmail || shop.whatsappNumber) && (
+          <div className="bg-gray-50 dark:bg-zinc-800/50 rounded-lg p-3 mb-4 text-xs space-y-1">
+            <p className="font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-1.5">Contact Info</p>
+            {shop.contactPhone && <p className="text-gray-700 dark:text-gray-300">📞 {shop.contactPhone}{shop.contactPhoneAlt ? ` / ${shop.contactPhoneAlt}` : ''}</p>}
+            {shop.contactEmail && <p className="text-gray-700 dark:text-gray-300">✉️ {shop.contactEmail}</p>}
+            {shop.whatsappNumber && <p className="text-gray-700 dark:text-gray-300">💬 WhatsApp: {shop.whatsappNumber}</p>}
+          </div>
+        )}
+
+        {/* Bank Details (Admin View) */}
+        <div className="bg-indigo-50/50 dark:bg-indigo-900/10 rounded-lg p-3 mb-4 text-xs space-y-2">
+          <div className="flex items-center justify-between">
+            <p className="font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">Bank Details</p>
+            {!bankDetails && (
+              <button
+                onClick={async () => {
+                  setIsBankLoading(true);
+                  const details = await getBankDetails(shop.id);
+                  setBankDetails(details);
+                  await logBankAccess(shop.id, 'VIEW');
+                  setIsBankLoading(false);
+                }}
+                disabled={isBankLoading}
+                className="text-xs text-brand-primary hover:underline"
+              >
+                {isBankLoading ? 'Loading...' : 'Load'}
+              </button>
+            )}
+          </div>
+          {bankDetails ? (
+            <div className="space-y-1">
+              <p className="text-gray-700 dark:text-gray-300"><strong>Name:</strong> {bankDetails.accountHolderName}</p>
+              <p className="text-gray-700 dark:text-gray-300"><strong>A/C:</strong> {bankDetails.accountNumber}</p>
+              <p className="text-gray-700 dark:text-gray-300"><strong>IFSC:</strong> {bankDetails.ifscCode}</p>
+              <p className="text-gray-700 dark:text-gray-300"><strong>Bank:</strong> {bankDetails.bankName} ({bankDetails.accountType})</p>
+              {bankDetails.isVerified ? (
+                <p className="text-emerald-600 dark:text-emerald-400 font-semibold">✓ Verified</p>
+              ) : (
+                <Button
+                  variant="primary"
+                  size="sm"
+                  onClick={async () => {
+                    setIsBankVerifying(true);
+                    const res = await verifyBankDetails(shop.id);
+                    if (res.success) setBankDetails({ ...bankDetails, isVerified: true, verifiedAt: new Date().toISOString() });
+                    setIsBankVerifying(false);
+                  }}
+                  disabled={isBankVerifying}
+                  className="!text-[10px] mt-1"
+                >
+                  {isBankVerifying ? 'Verifying...' : '✓ Verify Bank Details'}
+                </Button>
+              )}
+            </div>
+          ) : (
+            <p className="text-gray-400 dark:text-gray-500">Click "Load" to view bank details.</p>
+          )}
         </div>
       </div>
 

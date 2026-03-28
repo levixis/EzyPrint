@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Capacitor } from '@capacitor/core';
 import { Button } from '../common/Button';
-import { useAppContext } from '../../contexts/AppContext';
+import { useAppContext, isStudentPassActive, getStudentPassDaysRemaining, getStudentPassExpiryDate } from '../../contexts/AppContext';
 import { getFunctions, httpsCallable } from 'firebase/functions';
 import { app } from '../../firebase';
 
@@ -37,6 +37,12 @@ const StudentPassPage: React.FC = () => {
     const [showCancelConfirm, setShowCancelConfirm] = useState(false);
     const [statusMessage, setStatusMessage] = useState('');
     const [errorMessage, setErrorMessage] = useState('');
+
+    // Expiry state
+    const passActive = isStudentPassActive(currentUser?.hasStudentPass, currentUser?.studentPassActivatedAt);
+    const daysRemaining = getStudentPassDaysRemaining(currentUser?.studentPassActivatedAt);
+    const expiryDate = getStudentPassExpiryDate(currentUser?.studentPassActivatedAt);
+    const hasExpiredPass = currentUser?.studentPassActivatedAt && !passActive && currentUser?.hasStudentPass;
 
     const handleUpgrade = async () => {
         if (!currentUser) {
@@ -173,8 +179,8 @@ const StudentPassPage: React.FC = () => {
         { text: 'More exciting benefits coming soon!', highlight: false, isUpcoming: true },
     ];
 
-    // Premium member view - Manage Subscription
-    if (currentUser?.hasStudentPass) {
+    // Premium member view - Manage Subscription (only if pass is still within 30 days)
+    if (passActive) {
         return (
             <div className="min-h-[80vh] flex flex-col items-center justify-center py-12 px-4 pt-32">
                 {/* Background decorations */}
@@ -205,7 +211,12 @@ const StudentPassPage: React.FC = () => {
                                 </svg>
                                 <span className="text-2xl font-black text-black">Premium Member</span>
                             </div>
-                            <p className="text-yellow-900/70 text-sm mt-2">Your subscription is currently active</p>
+                            <p className="text-yellow-900/70 text-sm mt-2">
+                                {passActive
+                                    ? `${daysRemaining} day${daysRemaining !== 1 ? 's' : ''} remaining • Expires ${expiryDate?.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })}`
+                                    : 'Your pass has expired'
+                                }
+                            </p>
                         </div>
 
                         {/* Benefits Section */}
@@ -311,7 +322,7 @@ const StudentPassPage: React.FC = () => {
                                 <span className="text-5xl sm:text-6xl font-black text-black">₹49</span>
                                 <span className="text-xl text-black/70 font-medium mb-2">/month</span>
                             </div>
-                            <p className="text-yellow-900/70 text-sm mt-2">Cancel anytime • No hidden fees</p>
+                            <p className="text-yellow-900/70 text-sm mt-2">30-day pass • No auto-renewal • No hidden fees</p>
                         </div>
                     </div>
 
@@ -356,6 +367,11 @@ const StudentPassPage: React.FC = () => {
                                 {errorMessage}
                             </div>
                         )}
+                        {hasExpiredPass && (
+                            <div className="mb-4 p-3 rounded-xl bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800/50 text-sm text-yellow-700 dark:text-yellow-300 text-center">
+                                Your previous pass expired. Renew for another 30 days of benefits!
+                            </div>
+                        )}
                         <Button
                             type="button"
                             variant="primary"
@@ -365,10 +381,10 @@ const StudentPassPage: React.FC = () => {
                             onClick={handleUpgrade}
                             disabled={isProcessing}
                         >
-                            {isProcessing ? (statusMessage || 'Processing...') : 'Get Student Pass Now'}
+                            {isProcessing ? (statusMessage || 'Processing...') : (hasExpiredPass ? 'Renew Student Pass — ₹49' : 'Get Student Pass Now')}
                         </Button>
                         <p className="text-[11px] text-brand-lightText dark:text-gray-500 mt-4 text-center">
-                            By clicking "Get Student Pass Now", you agree to our terms and conditions.
+                            Your pass is valid for 30 days from purchase. By purchasing, you agree to our terms and conditions.
                         </p>
                     </div>
                 </div>

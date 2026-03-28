@@ -3,7 +3,7 @@ import { Modal } from '../common/Modal';
 import { Button } from '../common/Button';
 import { Input } from '../common/Input';
 import { Select } from '../common/Select';
-import { ShopProfile, ShopPricing, PayoutMethod, PayoutMethodType } from '../../types';
+import { ShopProfile, ShopPricing, PayoutMethod, PayoutMethodType, BankDetails } from '../../types';
 import { useAppContext } from '../../contexts/AppContext';
 import { calculateBaseFee } from '../../utils/pricing';
 import { Card } from '../common/Card';
@@ -12,7 +12,7 @@ interface ShopSettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
   shop: ShopProfile;
-  onSaveSettings: (shopId: string, newSettings: { pricing: ShopPricing; isOpen: boolean; payoutMethods?: PayoutMethod[] }) => void;
+  onSaveSettings: (shopId: string, newSettings: { pricing: ShopPricing; isOpen: boolean; payoutMethods?: PayoutMethod[]; contactPhone?: string; contactPhoneAlt?: string; contactEmail?: string; whatsappNumber?: string }) => void;
 }
 
 const generatePayoutMethodId = () => `pm_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
@@ -30,7 +30,7 @@ const EMPTY_PAYOUT_METHOD_FORM: Partial<PayoutMethod> & { type: PayoutMethodType
 };
 
 const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, shop, onSaveSettings }) => {
-  const { deleteOwnShopAccount } = useAppContext();
+  const { deleteOwnShopAccount, getBankDetails, saveBankDetails, logBankAccess } = useAppContext();
   const [bwPriceInput, setBwPriceInput] = useState(String(shop.customPricing.bwPerPage));
   const [colorPriceInput, setColorPriceInput] = useState(String(shop.customPricing.colorPerPage));
   const [isShopOpen, setIsShopOpen] = useState(shop.isOpen);
@@ -42,6 +42,20 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
   const [formError, setFormError] = useState('');
   const [showDeleteAccountConfirm, setShowDeleteAccountConfirm] = useState(false);
   const [isDeletingAccount, setIsDeletingAccount] = useState(false);
+
+  // Contact info state
+  const [contactPhone, setContactPhone] = useState(shop.contactPhone || '');
+  const [contactPhoneAlt, setContactPhoneAlt] = useState(shop.contactPhoneAlt || '');
+  const [contactEmail, setContactEmail] = useState(shop.contactEmail || '');
+  const [whatsappNumber, setWhatsappNumber] = useState(shop.whatsappNumber || '');
+
+  // Bank details state
+  const [bankDetails, setBankDetails] = useState<BankDetails | null>(null);
+  const [isBankLoading, setIsBankLoading] = useState(false);
+  const [isBankEditing, setIsBankEditing] = useState(false);
+  const [bankForm, setBankForm] = useState({ accountHolderName: '', accountNumber: '', ifscCode: '', bankName: '', accountType: 'SAVINGS' as 'SAVINGS' | 'CURRENT' });
+  const [isBankSaving, setIsBankSaving] = useState(false);
+  const [showBankDetails, setShowBankDetails] = useState(false);
 
   const prevIsOpen = useRef(isOpen);
   const prevShopId = useRef(shop.id);
@@ -57,6 +71,14 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
             setEditingPayoutMethod(null);
             setError('');
             setFormError('');
+            setContactPhone(shop.contactPhone || '');
+            setContactPhoneAlt(shop.contactPhoneAlt || '');
+            setContactEmail(shop.contactEmail || '');
+            setWhatsappNumber(shop.whatsappNumber || '');
+            // Reset bank details state
+            setBankDetails(null);
+            setIsBankEditing(false);
+            setShowBankDetails(false);
         }
     }
     prevIsOpen.current = isOpen;
@@ -108,7 +130,11 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
     onSaveSettings(shop.id, {
         pricing: { bwPerPage: finalBw, colorPerPage: finalColor },
         isOpen: isShopOpen,
-        payoutMethods: cleanedPayoutMethods
+        payoutMethods: cleanedPayoutMethods,
+        contactPhone: contactPhone.trim() || undefined,
+        contactPhoneAlt: contactPhoneAlt.trim() || undefined,
+        contactEmail: contactEmail.trim() || undefined,
+        whatsappNumber: whatsappNumber.trim() || undefined,
     });
     onClose();
   };
@@ -264,6 +290,208 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
             </label>
           </div>
           <p className="text-xs text-brand-muted mt-1">Toggle this to control if students can place new orders at your shop.</p>
+        </div>
+
+        {/* Store Contact Info */}
+        <div>
+          <h4 className="text-lg font-semibold text-brand-primary mb-2">Store Contact Info</h4>
+          <p className="text-sm text-gray-600 dark:text-gray-400 mb-3">Add your store's contact details so the admin can reach you.</p>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <Input
+              label="Primary Phone"
+              id="contactPhone"
+              type="tel"
+              value={contactPhone}
+              onChange={(e) => setContactPhone(e.target.value)}
+              placeholder="e.g. 9876543210"
+            />
+            <Input
+              label="Alternate Phone"
+              id="contactPhoneAlt"
+              type="tel"
+              value={contactPhoneAlt}
+              onChange={(e) => setContactPhoneAlt(e.target.value)}
+              placeholder="Optional"
+            />
+            <Input
+              label="Store Email"
+              id="contactEmail"
+              type="email"
+              value={contactEmail}
+              onChange={(e) => setContactEmail(e.target.value)}
+              placeholder="e.g. shop@example.com"
+            />
+            <Input
+              label="WhatsApp Number"
+              id="whatsappNumber"
+              type="tel"
+              value={whatsappNumber}
+              onChange={(e) => setWhatsappNumber(e.target.value)}
+              placeholder="Optional"
+            />
+          </div>
+        </div>
+
+        {/* Bank Account Details */}
+        <div>
+          <h4 className="text-lg font-semibold text-brand-primary mb-2">Bank Account Details</h4>
+          <p className="text-sm text-gray-600 dark:text-gray-400 mb-3">Your bank details are stored securely in a private sub-collection. Only you and the admin can access them.</p>
+
+          {bankDetails === null && !isBankLoading && !isBankEditing && (
+            <div className="flex gap-2">
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={async () => {
+                  setIsBankLoading(true);
+                  const details = await getBankDetails(shop.id);
+                  setBankDetails(details);
+                  await logBankAccess(shop.id, 'VIEW');
+                  setIsBankLoading(false);
+                  if (details) setShowBankDetails(true);
+                  else setIsBankEditing(true);
+                }}
+              >
+                {isBankLoading ? 'Loading...' : 'Load Bank Details'}
+              </Button>
+            </div>
+          )}
+
+          {isBankLoading && <p className="text-sm text-brand-lightText py-3">Loading bank details...</p>}
+
+          {/* Display existing bank details (masked) */}
+          {bankDetails && !isBankEditing && (
+            <div className="bg-gray-50 dark:bg-zinc-800/50 rounded-xl p-4 border border-gray-200 dark:border-zinc-700 space-y-2">
+              <div className="flex items-center justify-between">
+                <p className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">Stored Bank Details</p>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setShowBankDetails(!showBankDetails)}
+                    className="text-xs text-brand-primary hover:underline"
+                  >
+                    {showBankDetails ? 'Hide' : 'Show'}
+                  </button>
+                  <button
+                    onClick={() => {
+                      setIsBankEditing(true);
+                      setBankForm({
+                        accountHolderName: bankDetails.accountHolderName || '',
+                        accountNumber: bankDetails.accountNumber || '',
+                        ifscCode: bankDetails.ifscCode || '',
+                        bankName: bankDetails.bankName || '',
+                        accountType: bankDetails.accountType || 'SAVINGS',
+                      });
+                    }}
+                    className="text-xs text-brand-primary hover:underline"
+                  >
+                    Edit
+                  </button>
+                </div>
+              </div>
+              {showBankDetails ? (
+                <div className="text-sm text-gray-700 dark:text-gray-300 space-y-1">
+                  <p><strong>Name:</strong> {bankDetails.accountHolderName}</p>
+                  <p><strong>Account:</strong> {bankDetails.accountNumber}</p>
+                  <p><strong>IFSC:</strong> {bankDetails.ifscCode}</p>
+                  <p><strong>Bank:</strong> {bankDetails.bankName}</p>
+                  {bankDetails.isVerified && <p className="text-xs text-emerald-600 dark:text-emerald-400 font-semibold">✓ Verified by Admin</p>}
+                </div>
+              ) : (
+                <div className="text-sm text-gray-700 dark:text-gray-300 space-y-1">
+                  <p><strong>Name:</strong> {bankDetails.accountHolderName}</p>
+                  <p><strong>Account:</strong> {'••••' + (bankDetails.accountNumber || '').slice(-4)}</p>
+                  <p><strong>IFSC:</strong> {(bankDetails.ifscCode || '').slice(0, 4) + '••••••'}</p>
+                  <p><strong>Bank:</strong> {bankDetails.bankName}</p>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Edit form */}
+          {isBankEditing && (
+            <div className="bg-blue-50 dark:bg-blue-900/20 rounded-xl p-4 border border-blue-200 dark:border-blue-800/50 space-y-3">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <Input
+                  label="Account Holder Name"
+                  id="bankHolder"
+                  type="text"
+                  value={bankForm.accountHolderName}
+                  onChange={(e) => setBankForm(f => ({ ...f, accountHolderName: e.target.value }))}
+                  placeholder="As per bank records"
+                />
+                <Input
+                  label="Account Number"
+                  id="bankAccount"
+                  type="text"
+                  value={bankForm.accountNumber}
+                  onChange={(e) => setBankForm(f => ({ ...f, accountNumber: e.target.value }))}
+                  placeholder="e.g. 1234567890"
+                />
+                <Input
+                  label="IFSC Code"
+                  id="bankIfsc"
+                  type="text"
+                  value={bankForm.ifscCode}
+                  onChange={(e) => setBankForm(f => ({ ...f, ifscCode: e.target.value.toUpperCase() }))}
+                  placeholder="e.g. SBIN0001234"
+                />
+                <Input
+                  label="Bank Name"
+                  id="bankName"
+                  type="text"
+                  value={bankForm.bankName}
+                  onChange={(e) => setBankForm(f => ({ ...f, bankName: e.target.value }))}
+                  placeholder="e.g. State Bank of India"
+                />
+              </div>
+              <Select
+                label="Account Type"
+                name="bankAccountType"
+                value={bankForm.accountType}
+                onChange={(e) => setBankForm(f => ({ ...f, accountType: e.target.value as 'SAVINGS' | 'CURRENT' }))}
+                options={[
+                  { value: 'SAVINGS', label: 'Savings' },
+                  { value: 'CURRENT', label: 'Current' },
+                ]}
+              />
+              <div className="flex gap-2">
+                <Button
+                  variant="primary"
+                  size="sm"
+                  disabled={isBankSaving || !bankForm.accountHolderName.trim() || !bankForm.accountNumber.trim() || !bankForm.ifscCode.trim() || !bankForm.bankName.trim()}
+                  onClick={async () => {
+                    setIsBankSaving(true);
+                    const result = await saveBankDetails(shop.id, {
+                      accountHolderName: bankForm.accountHolderName.trim(),
+                      accountNumber: bankForm.accountNumber.trim(),
+                      ifscCode: bankForm.ifscCode.trim(),
+                      bankName: bankForm.bankName.trim(),
+                      accountType: bankForm.accountType,
+                      isVerified: false,
+                    });
+                    setIsBankSaving(false);
+                    if (result.success) {
+                      setBankDetails({
+                        accountHolderName: bankForm.accountHolderName.trim(),
+                        accountNumber: bankForm.accountNumber.trim(),
+                        ifscCode: bankForm.ifscCode.trim(),
+                        bankName: bankForm.bankName.trim(),
+                        accountType: bankForm.accountType,
+                        isVerified: false,
+                      });
+                      setIsBankEditing(false);
+                      setShowBankDetails(true);
+                    }
+                  }}
+                >
+                  {isBankSaving ? 'Saving...' : 'Save Bank Details'}
+                </Button>
+                <Button variant="ghost" size="sm" onClick={() => setIsBankEditing(false)}>
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          )}
         </div>
 
         <div>

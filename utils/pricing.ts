@@ -1,5 +1,43 @@
 import { PrintOptions, ShopPricing, PrintColor, DocumentOrder } from '../types';
 
+// --- Student Pass Expiry Helpers ---
+const PASS_DURATION_DAYS = 30;
+
+/**
+ * Checks whether a student pass is still active (within 30 days of activation).
+ * Returns false if no activation date exists or if 30 days have elapsed.
+ */
+export const isStudentPassActive = (hasPass?: boolean, activatedAt?: string): boolean => {
+  if (!hasPass || !activatedAt) return false;
+  const activationDate = new Date(activatedAt).getTime();
+  if (isNaN(activationDate)) return false;
+  const expiryDate = activationDate + PASS_DURATION_DAYS * 24 * 60 * 60 * 1000;
+  return Date.now() < expiryDate;
+};
+
+/**
+ * Returns the number of days remaining on a student pass.
+ * Returns 0 if expired or no activation date.
+ */
+export const getStudentPassDaysRemaining = (activatedAt?: string): number => {
+  if (!activatedAt) return 0;
+  const activationDate = new Date(activatedAt).getTime();
+  if (isNaN(activationDate)) return 0;
+  const expiryDate = activationDate + PASS_DURATION_DAYS * 24 * 60 * 60 * 1000;
+  const remaining = expiryDate - Date.now();
+  return remaining > 0 ? Math.ceil(remaining / (24 * 60 * 60 * 1000)) : 0;
+};
+
+/**
+ * Returns the expiry date of a student pass as a Date object.
+ */
+export const getStudentPassExpiryDate = (activatedAt?: string): Date | null => {
+  if (!activatedAt) return null;
+  const activationDate = new Date(activatedAt).getTime();
+  if (isNaN(activationDate)) return null;
+  return new Date(activationDate + PASS_DURATION_DAYS * 24 * 60 * 60 * 1000);
+};
+
 // --- Helper: New Base Fee Logic ---
 export const calculateBaseFee = (pageCost: number): number => {
   if (pageCost <= 0) return 0;

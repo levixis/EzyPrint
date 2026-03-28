@@ -31,7 +31,6 @@ import {
   orderBy,
   limit,          // Added for capping notification queries
   addDoc,         // Added for creating notification documents
-  runTransaction,
   enableNetwork  // Added for app resume reconnection
 } from 'firebase/firestore';
 import {
@@ -151,7 +150,6 @@ export {
   orderBy,             // Exported orderBy
   limit,               // Exported for notification query limits
   addDoc,              // Exported for creating notification documents
-  runTransaction,      // Exported for atomic updates
   storageRef,          // Exported
   uploadBytesResumable, // Exported
   getDownloadURL,      // Exported

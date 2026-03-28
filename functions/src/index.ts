@@ -308,14 +308,24 @@ export const createOrder = onCall(
 
     const shopData = shopDoc.data()!;
 
-    // Fetch user data to check student pass
+    // Fetch user data to check student pass (with 30-day expiry check)
     const userDoc = await db
       .collection("users")
       .doc(request.auth.uid)
       .get();
-    const hasStudentPass = userDoc.exists
-      ? userDoc.data()?.hasStudentPass === true
-      : false;
+    let hasStudentPass = false;
+    if (userDoc.exists) {
+      const userData = userDoc.data()!;
+      if (userData.hasStudentPass === true && userData.studentPassActivatedAt) {
+        const activatedAt = new Date(userData.studentPassActivatedAt).getTime();
+        const expiryDate = activatedAt + 30 * 24 * 60 * 60 * 1000; // 30 days
+        hasStudentPass = Date.now() < expiryDate;
+        // Auto-expire in DB if past 30 days
+        if (!hasStudentPass) {
+          await db.collection("users").doc(request.auth.uid).update({ hasStudentPass: false });
+        }
+      }
+    }
 
     // Recalculate price server-side
     // Use multi-file pricing if files[] array exists, else fall back to legacy
@@ -374,6 +384,9 @@ export const createOrder = onCall(
 
 /**
  * verifyPayment — Verifies Razorpay payment signature and updates order status.
+ * If signature verification fails, falls back to checking payment status directly
+ * via Razorpay API (handles key mismatch scenarios where money was taken but
+ * signature doesn't match due to key rotation).
  */
 export const verifyPayment = onCall(
   { region: "asia-south1", cors: true },
@@ -401,6 +414,16 @@ export const verifyPayment = onCall(
       );
     }
 
+    // Verify the order belongs to this user
+    const orderDoc = await db.collection("orders").doc(orderId).get();
+    if (!orderDoc.exists) {
+      throw new HttpsError("not-found", "Order not found.");
+    }
+    const orderData = orderDoc.data()!;
+    if (orderData.userId !== request.auth.uid) {
+      throw new HttpsError("permission-denied", "You can only verify your own orders.");
+    }
+
     // Verify signature using HMAC SHA256
     const keySecret = process.env.RAZORPAY_KEY_SECRET || "";
     const generatedSignature = crypto
@@ -409,9 +432,32 @@ export const verifyPayment = onCall(
       .digest("hex");
 
     if (generatedSignature !== razorpay_signature) {
-      // Signature mismatch - potential tampering
+      console.warn(`[verifyPayment] Signature mismatch for order ${orderId}. Falling back to Razorpay API check...`);
+
+      // SAFETY NET: Check the payment status directly via Razorpay API.
+      // This handles cases where the key was rotated or there's a mismatch.
+      try {
+        const payment = await getRazorpay().payments.fetch(razorpay_payment_id);
+        if (payment.status === "captured" || payment.status === "authorized") {
+          console.log(`[verifyPayment] Razorpay API confirms payment ${razorpay_payment_id} is ${payment.status}. Recovering order.`);
+          await db.collection("orders").doc(orderId).update({
+            status: "PENDING_APPROVAL",
+            razorpayPaymentId: razorpay_payment_id,
+            paymentAttemptedAt: new Date().toISOString(),
+            paymentVerifiedVia: "api_fallback",
+          });
+          return { success: true, message: "Payment verified via Razorpay API." };
+        } else {
+          console.log(`[verifyPayment] Razorpay API says payment ${razorpay_payment_id} status is: ${payment.status}`);
+        }
+      } catch (apiError: any) {
+        console.error(`[verifyPayment] Razorpay API fallback failed:`, apiError.message);
+      }
+
+      // If API check also failed, mark as failed
       await db.collection("orders").doc(orderId).update({
         status: "PAYMENT_FAILED",
+        razorpayPaymentId: razorpay_payment_id,
         paymentAttemptedAt: new Date().toISOString(),
       });
 
@@ -422,19 +468,6 @@ export const verifyPayment = onCall(
     }
 
     // Signature is valid — update order
-    const orderDoc = await db.collection("orders").doc(orderId).get();
-    if (!orderDoc.exists) {
-      throw new HttpsError("not-found", "Order not found.");
-    }
-
-    const orderData = orderDoc.data()!;
-    if (orderData.userId !== request.auth.uid) {
-      throw new HttpsError(
-        "permission-denied",
-        "You can only verify your own orders."
-      );
-    }
-
     await db.collection("orders").doc(orderId).update({
       status: "PENDING_APPROVAL",
       razorpayPaymentId: razorpay_payment_id,
@@ -442,6 +475,203 @@ export const verifyPayment = onCall(
     });
 
     return { success: true, message: "Payment verified successfully." };
+  }
+);
+
+/**
+ * checkPaymentStatus — Checks if a payment was actually captured by querying
+ * the Razorpay API directly. Used as a recovery mechanism when:
+ * 1. User clicks "Retry Payment" — check if the previous payment actually went through
+ * 2. User clicks "Cancel Order" — check if payment was captured (needs refund)
+ *
+ * If the payment was captured, it automatically updates the order to PENDING_APPROVAL.
+ */
+export const checkPaymentStatus = onCall(
+  { region: "asia-south1", cors: true },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "You must be logged in.");
+    }
+
+    const { orderId } = request.data;
+    if (!orderId) {
+      throw new HttpsError("invalid-argument", "orderId is required.");
+    }
+
+    const orderDoc = await db.collection("orders").doc(orderId).get();
+    if (!orderDoc.exists) {
+      throw new HttpsError("not-found", "Order not found.");
+    }
+
+    const orderData = orderDoc.data()!;
+    if (orderData.userId !== request.auth.uid) {
+      throw new HttpsError("permission-denied", "You can only check your own orders.");
+    }
+
+    // Check if there's a Razorpay order ID to look up
+    const razorpayOrderId = orderData.razorpayOrderId;
+    if (!razorpayOrderId) {
+      return { paid: false, message: "No payment was initiated for this order." };
+    }
+
+    try {
+      // Fetch the Razorpay order to get its payments
+      const rzpOrder = await getRazorpay().orders.fetch(razorpayOrderId);
+      const payments = await getRazorpay().orders.fetchPayments(razorpayOrderId);
+
+      // Find a captured/authorized payment
+      const successfulPayment = (payments as any).items?.find(
+        (p: any) => p.status === "captured" || p.status === "authorized"
+      );
+
+      if (successfulPayment) {
+        console.log(`[checkPaymentStatus] Order ${orderId} has a captured payment: ${successfulPayment.id}`);
+
+        // If order is still in PENDING_PAYMENT or PAYMENT_FAILED, recover it
+        if (orderData.status === "PENDING_PAYMENT" || orderData.status === "PAYMENT_FAILED") {
+          await db.collection("orders").doc(orderId).update({
+            status: "PENDING_APPROVAL",
+            razorpayPaymentId: successfulPayment.id,
+            paymentAttemptedAt: new Date().toISOString(),
+            paymentVerifiedVia: "manual_check",
+          });
+          return {
+            paid: true,
+            recovered: true,
+            message: "Payment was already captured! Order has been updated.",
+          };
+        }
+
+        return {
+          paid: true,
+          recovered: false,
+          message: "Payment is confirmed.",
+          paymentId: successfulPayment.id,
+        };
+      }
+
+      return {
+        paid: false,
+        message: `No captured payment found. Razorpay order status: ${rzpOrder.status}`,
+      };
+    } catch (error: any) {
+      console.error(`[checkPaymentStatus] Error checking payment:`, error.message);
+      throw new HttpsError("internal", `Failed to check payment status: ${error.message}`);
+    }
+  }
+);
+
+/**
+ * initiateRefund — Admin-only function to manually issue a Razorpay refund.
+ * Used when admin finds a discrepancy reported via support ticket and wants
+ * to refund a student without requiring full order cancellation.
+ *
+ * Validates: caller is admin, order was paid, hasn't been refunded already.
+ * Issues full refund via Razorpay API and records result on the order document.
+ */
+export const initiateRefund = onCall(
+  { region: "asia-south1", cors: true },
+  async (request) => {
+    // Auth check
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "You must be logged in.");
+    }
+
+    // Verify caller is admin
+    const callerDoc = await db.collection("users").doc(request.auth.uid).get();
+    if (!callerDoc.exists || callerDoc.data()?.type !== "ADMIN") {
+      throw new HttpsError("permission-denied", "Only admins can issue refunds.");
+    }
+
+    const { orderId, reason } = request.data;
+    if (!orderId) {
+      throw new HttpsError("invalid-argument", "orderId is required.");
+    }
+
+    // Fetch the order
+    const orderDoc = await db.collection("orders").doc(orderId).get();
+    if (!orderDoc.exists) {
+      throw new HttpsError("not-found", "Order not found.");
+    }
+
+    const orderData = orderDoc.data()!;
+
+    // Ensure order has a payment to refund
+    if (!orderData.razorpayPaymentId) {
+      throw new HttpsError(
+        "failed-precondition",
+        "This order has no captured payment. Cannot issue refund."
+      );
+    }
+
+    // Check if already refunded
+    if (orderData.refundId && orderData.refundStatus !== "FAILED") {
+      throw new HttpsError(
+        "already-exists",
+        `Refund already issued for this order (Refund ID: ${orderData.refundId}, Status: ${orderData.refundStatus}).`
+      );
+    }
+
+    // Issue refund via Razorpay
+    try {
+      const refund = await getRazorpay().payments.refund(orderData.razorpayPaymentId, {
+        speed: "normal", // "normal" for 5-7 day refund
+        notes: {
+          orderId: orderId,
+          reason: reason || "Admin-initiated refund",
+          initiatedBy: request.auth.uid,
+        },
+      });
+
+      // Record refund details on the order document
+      await db.collection("orders").doc(orderId).update({
+        refundId: refund.id,
+        refundStatus: refund.status, // "processed" or "pending"
+        refundAmount: (refund.amount || 0) / 100, // Convert paise to rupees
+        refundedAt: new Date().toISOString(),
+        refundInitiatedBy: request.auth.uid,
+        refundReason: reason || "Admin-initiated refund",
+      });
+
+      console.log(`[initiateRefund] Admin ${request.auth.uid} issued refund ${refund.id} for order #${orderId.slice(-6)}. Status: ${refund.status}, Amount: ₹${((refund.amount || 0) / 100).toFixed(2)}`);
+
+      // Notify the student
+      try {
+        await db.collection("notifications").add({
+          message: `Refund of ₹${((refund.amount || 0) / 100).toFixed(2)} has been initiated for order #${orderId.slice(-6)}. Reason: ${reason || "Admin review"}. It will be credited within 5-7 business days.`,
+          type: "info",
+          recipientUserId: orderData.userId,
+          orderId: orderId,
+          read: false,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (notifError: any) {
+        console.warn(`[initiateRefund] Failed to create student notification:`, notifError.message);
+      }
+
+      return {
+        success: true,
+        refundId: refund.id,
+        refundStatus: refund.status,
+        refundAmount: (refund.amount || 0) / 100,
+        message: `Refund of ₹${((refund.amount || 0) / 100).toFixed(2)} initiated successfully.`,
+      };
+    } catch (refundError: any) {
+      console.error(`[initiateRefund] REFUND FAILED for order #${orderId.slice(-6)}, payment ${orderData.razorpayPaymentId}:`, refundError.message);
+
+      // Record the failure
+      await db.collection("orders").doc(orderId).update({
+        refundStatus: "FAILED",
+        refundError: refundError.message || "Unknown refund error",
+        refundedAt: new Date().toISOString(),
+        refundInitiatedBy: request.auth.uid,
+      });
+
+      throw new HttpsError(
+        "internal",
+        `Refund failed: ${refundError.message || "Unknown error"}. The order has been flagged for manual intervention.`
+      );
+    }
   }
 );
 
@@ -472,11 +702,16 @@ export const createPassOrder = onCall(
       );
     }
 
-    if (userData.hasStudentPass === true) {
-      throw new HttpsError(
-        "failed-precondition",
-        "You already have an active Student Pass."
-      );
+    if (userData.hasStudentPass === true && userData.studentPassActivatedAt) {
+      const activatedAt = new Date(userData.studentPassActivatedAt).getTime();
+      const expiryDate = activatedAt + 30 * 24 * 60 * 60 * 1000;
+      if (Date.now() < expiryDate) {
+        throw new HttpsError(
+          "failed-precondition",
+          "You already have an active Student Pass."
+        );
+      }
+      // Pass has expired — allow renewal
     }
 
     const amountInPaise = 4900; // ₹49
@@ -969,3 +1204,305 @@ export const onUserDeleted = onDocumentDeleted(
   }
 );
 
+// ---------- TICKET FILE CLEANUP ----------
+
+/**
+ * onTicketStatusChange — When a ticket is RESOLVED or CLOSED,
+ * delete any uploaded attachment files from Firebase Storage.
+ */
+export const onTicketStatusChange = onDocumentUpdated(
+  { document: "tickets/{ticketId}", region: "asia-south1" },
+  async (event) => {
+    const beforeData = event.data?.before.data();
+    const afterData = event.data?.after.data();
+
+    if (!beforeData || !afterData) return;
+
+    const oldStatus = beforeData.status;
+    const newStatus = afterData.status;
+
+    // Only trigger on actual status transitions to closed/resolved
+    if (oldStatus === newStatus) return;
+    if (newStatus !== "RESOLVED" && newStatus !== "CLOSED") return;
+
+    const ticketId = event.params.ticketId;
+    const attachmentPaths: string[] = afterData.attachmentPaths || [];
+
+    if (attachmentPaths.length === 0) {
+      console.log(`[onTicketStatusChange] Ticket ${ticketId} has no attachments to clean up.`);
+      return;
+    }
+
+    const bucket = admin.storage().bucket();
+    let deletedCount = 0;
+
+    for (const filePath of attachmentPaths) {
+      try {
+        const storageFile = bucket.file(filePath);
+        const [exists] = await storageFile.exists();
+        if (exists) {
+          await storageFile.delete();
+          deletedCount++;
+          console.log(`[onTicketStatusChange] Deleted ticket attachment: ${filePath}`);
+        }
+      } catch (error: any) {
+        console.error(`[onTicketStatusChange] Failed to delete attachment ${filePath}:`, error.message);
+      }
+    }
+
+    // Clear attachment paths from the ticket document
+    await db.collection("tickets").doc(ticketId).update({
+      attachmentPaths: [],
+      attachmentsCleanedAt: new Date().toISOString(),
+    });
+
+    console.log(`[onTicketStatusChange] Cleaned up ${deletedCount} attachment(s) for ticket ${ticketId}`);
+  }
+);
+
+/**
+ * cleanupOldTickets — Scheduled CRON job that runs daily.
+ * Deletes RESOLVED/CLOSED tickets older than 90 days.
+ */
+export const cleanupOldTickets = onSchedule(
+  {
+    schedule: "every 24 hours",
+    region: "asia-south1",
+    timeoutSeconds: 300,
+  },
+  async () => {
+    const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
+    console.log(`[cleanupOldTickets] Running. Cutoff: ${ninetyDaysAgo}`);
+
+    let totalDeleted = 0;
+
+    try {
+      for (const closedStatus of ["RESOLVED", "CLOSED"]) {
+        const snapshot = await db
+          .collection("tickets")
+          .where("status", "==", closedStatus)
+          .where("updatedAt", "<", ninetyDaysAgo)
+          .limit(500)
+          .get();
+
+        if (!snapshot.empty) {
+          const batch = db.batch();
+          snapshot.docs.forEach((doc) => batch.delete(doc.ref));
+          await batch.commit();
+          totalDeleted += snapshot.size;
+        }
+      }
+      console.log(`[cleanupOldTickets] Deleted ${totalDeleted} old ticket(s).`);
+    } catch (error: any) {
+      console.error(`[cleanupOldTickets] Error:`, error.message);
+    }
+  }
+);
+
+// ---------- EARNINGS REPORT GENERATION ----------
+
+/**
+ * generateEarningsReport — Callable function for admin to generate
+ * an Excel earnings report for a date range. Stores in Firebase Storage
+ * and saves metadata to Firestore 'reports' collection.
+ */
+export const generateEarningsReport = onCall(
+  { region: "asia-south1", cors: true, timeoutSeconds: 120 },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "You must be logged in.");
+    }
+
+    // Verify admin
+    const userDoc = await db.collection("users").doc(request.auth.uid).get();
+    if (!userDoc.exists || userDoc.data()!.type !== "ADMIN") {
+      throw new HttpsError("permission-denied", "Only admins can generate reports.");
+    }
+
+    const { startDate, endDate, reportType } = request.data;
+    if (!startDate || !endDate) {
+      throw new HttpsError("invalid-argument", "startDate and endDate are required.");
+    }
+
+    console.log(`[generateEarningsReport] Generating ${reportType || 'full'} report: ${startDate} to ${endDate}`);
+
+    // Fetch completed orders in the date range
+    const ordersSnap = await db.collection("orders")
+      .where("status", "==", "COMPLETED")
+      .where("uploadedAt", ">=", startDate)
+      .where("uploadedAt", "<=", endDate)
+      .get();
+
+    // Fetch all shops for name mapping
+    const shopsSnap = await db.collection("shops").get();
+    const shopMap: Record<string, string> = {};
+    shopsSnap.docs.forEach(doc => {
+      shopMap[doc.id] = doc.data().name || "Unknown Shop";
+    });
+
+    // Build Excel
+    const ExcelJS = await import("exceljs");
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = "EzyPrint Admin";
+    workbook.created = new Date();
+
+    // --- Sheet 1: Order Details ---
+    const orderSheet = workbook.addWorksheet("Order Details");
+    orderSheet.columns = [
+      { header: "Order ID", key: "orderId", width: 18 },
+      { header: "Date", key: "date", width: 14 },
+      { header: "Shop", key: "shopName", width: 20 },
+      { header: "Student", key: "studentName", width: 20 },
+      { header: "File(s)", key: "fileName", width: 25 },
+      { header: "Pages", key: "pages", width: 8 },
+      { header: "Copies", key: "copies", width: 8 },
+      { header: "Color", key: "color", width: 10 },
+      { header: "Page Cost (₹)", key: "pageCost", width: 14 },
+      { header: "Base Fee (₹)", key: "baseFee", width: 12 },
+      { header: "Total (₹)", key: "total", width: 12 },
+      { header: "Premium", key: "isPremium", width: 10 },
+    ];
+
+    // Style header row
+    orderSheet.getRow(1).font = { bold: true, color: { argb: "FFFFFF" } };
+    orderSheet.getRow(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "4F46E5" } };
+
+    let totalRevenue = 0;
+    let totalBaseFees = 0;
+    let totalPageCosts = 0;
+    const shopEarnings: Record<string, { name: string; pageCost: number; baseFee: number; total: number; orderCount: number }> = {};
+
+    ordersSnap.docs.forEach(doc => {
+      const d = doc.data();
+      const pageCost = d.priceDetails?.pageCost || 0;
+      const baseFee = d.priceDetails?.baseFee || 0;
+      const total = d.priceDetails?.totalPrice || 0;
+      const shopName = shopMap[d.shopId] || "Unknown";
+
+      totalRevenue += total;
+      totalBaseFees += baseFee;
+      totalPageCosts += pageCost;
+
+      if (!shopEarnings[d.shopId]) {
+        shopEarnings[d.shopId] = { name: shopName, pageCost: 0, baseFee: 0, total: 0, orderCount: 0 };
+      }
+      shopEarnings[d.shopId].pageCost += pageCost;
+      shopEarnings[d.shopId].baseFee += baseFee;
+      shopEarnings[d.shopId].total += total;
+      shopEarnings[d.shopId].orderCount++;
+
+      // Determine file info
+      const files = d.files as OrderFileData[] | undefined;
+      let fileNames = d.fileName || "Unknown";
+      let totalPages = d.printOptions?.pages || 0;
+      let totalCopies = d.printOptions?.copies || 0;
+      let colorType = d.printOptions?.color || "BW";
+
+      if (files && files.length > 0) {
+        fileNames = files.map(f => f.fileName).join(", ");
+        totalPages = files.reduce((sum: number, f: OrderFileData) => sum + f.pageCount, 0);
+        totalCopies = files.reduce((sum: number, f: OrderFileData) => sum + f.copies, 0);
+        colorType = files.some(f => f.color === "COLOR") ? "Mixed" : "BW";
+      }
+
+      orderSheet.addRow({
+        orderId: doc.id.slice(-10),
+        date: new Date(d.uploadedAt).toLocaleDateString("en-IN"),
+        shopName,
+        studentName: d.userName || "Unknown",
+        fileName: fileNames,
+        pages: totalPages,
+        copies: totalCopies,
+        color: colorType,
+        pageCost: pageCost.toFixed(2),
+        baseFee: baseFee.toFixed(2),
+        total: total.toFixed(2),
+        isPremium: d.isPremiumOrder ? "Yes" : "No",
+      });
+    });
+
+    // --- Sheet 2: Shop-wise Summary ---
+    const summarySheet = workbook.addWorksheet("Shop Summary");
+    summarySheet.columns = [
+      { header: "Shop Name", key: "shopName", width: 25 },
+      { header: "Orders", key: "orderCount", width: 10 },
+      { header: "Page Cost (₹)", key: "pageCost", width: 14 },
+      { header: "Base Fees (₹)", key: "baseFee", width: 14 },
+      { header: "Total Revenue (₹)", key: "total", width: 16 },
+      { header: "Platform Earnings (₹)", key: "platformEarnings", width: 18 },
+    ];
+
+    summarySheet.getRow(1).font = { bold: true, color: { argb: "FFFFFF" } };
+    summarySheet.getRow(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "059669" } };
+
+    Object.values(shopEarnings).forEach(se => {
+      summarySheet.addRow({
+        shopName: se.name,
+        orderCount: se.orderCount,
+        pageCost: se.pageCost.toFixed(2),
+        baseFee: se.baseFee.toFixed(2),
+        total: se.total.toFixed(2),
+        platformEarnings: se.baseFee.toFixed(2), // Platform earns the base fee
+      });
+    });
+
+    // Total row
+    summarySheet.addRow({
+      shopName: "TOTAL",
+      orderCount: ordersSnap.size,
+      pageCost: totalPageCosts.toFixed(2),
+      baseFee: totalBaseFees.toFixed(2),
+      total: totalRevenue.toFixed(2),
+      platformEarnings: totalBaseFees.toFixed(2),
+    });
+    const lastRow = summarySheet.lastRow;
+    if (lastRow) lastRow.font = { bold: true };
+
+    // Write to buffer
+    const buffer = await workbook.xlsx.writeBuffer();
+
+    // Upload to Firebase Storage
+    const reportFileName = `reports/earnings_${startDate.split("T")[0]}_to_${endDate.split("T")[0]}_${Date.now()}.xlsx`;
+    const bucket = admin.storage().bucket();
+    const file = bucket.file(reportFileName);
+    await file.save(Buffer.from(buffer as ArrayBuffer), {
+      metadata: {
+        contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        metadata: { generatedBy: request.auth.uid },
+      },
+    });
+
+    // Generate signed download URL (valid for 7 days)
+    const [url] = await file.getSignedUrl({
+      action: "read",
+      expires: Date.now() + 7 * 24 * 60 * 60 * 1000,
+    });
+
+    // Save report metadata to Firestore
+    const reportId = `report_${Date.now()}`;
+    await db.collection("reports").doc(reportId).set({
+      id: reportId,
+      type: reportType || "full",
+      startDate,
+      endDate,
+      totalOrders: ordersSnap.size,
+      totalRevenue: parseFloat(totalRevenue.toFixed(2)),
+      totalBaseFees: parseFloat(totalBaseFees.toFixed(2)),
+      totalPageCosts: parseFloat(totalPageCosts.toFixed(2)),
+      storagePath: reportFileName,
+      downloadUrl: url,
+      generatedAt: new Date().toISOString(),
+      generatedBy: request.auth.uid,
+    });
+
+    console.log(`[generateEarningsReport] Report generated: ${reportFileName}, ${ordersSnap.size} orders, ₹${totalRevenue.toFixed(2)} revenue`);
+
+    return {
+      success: true,
+      reportId,
+      downloadUrl: url,
+      totalOrders: ordersSnap.size,
+      totalRevenue: parseFloat(totalRevenue.toFixed(2)),
+    };
+  }
+);

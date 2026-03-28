@@ -161,6 +161,49 @@ const StudentOrderCard: React.FC<StudentOrderCardProps> = ({ order, onPayNow, on
           <p className="text-sm text-brand-lightText whitespace-pre-wrap">{shopNotes}</p>
         </div>
       )}
+
+      {/* Refund Status Display */}
+      {order.refundId && (
+        <div className={`mt-4 p-3 rounded-lg border ${
+          order.refundStatus === 'FAILED'
+            ? 'bg-red-50 dark:bg-red-900/20 border-red-200 dark:border-red-800/50'
+            : 'bg-blue-50 dark:bg-blue-900/20 border-blue-200 dark:border-blue-800/50'
+        }`}>
+          <div className="flex items-center gap-2 mb-1">
+            {order.refundStatus === 'FAILED' ? (
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4 text-red-500">
+                <path fillRule="evenodd" d="M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Zm-8-5a.75.75 0 0 1 .75.75v4.5a.75.75 0 0 1-1.5 0v-4.5A.75.75 0 0 1 10 5Zm0 10a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z" clipRule="evenodd" />
+              </svg>
+            ) : (
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4 text-blue-500">
+                <path fillRule="evenodd" d="M15.312 11.424a5.5 5.5 0 0 1-9.201 2.466l-.312-.311h2.433a.75.75 0 0 0 0-1.5H4.568a.75.75 0 0 0-.75.75v3.664a.75.75 0 0 0 1.5 0v-2.107l.351.35a7 7 0 0 0 11.712-3.138.75.75 0 0 0-1.449-.388Zm1.07-6.244a.75.75 0 0 0-1.5 0v2.107l-.35-.35a7 7 0 0 0-11.713 3.138.75.75 0 0 0 1.45.388 5.5 5.5 0 0 1 9.2-2.466l.313.311h-2.434a.75.75 0 0 0 0 1.5h3.664a.75.75 0 0 0 .75-.75V5.18Z" clipRule="evenodd" />
+              </svg>
+            )}
+            <span className={`text-sm font-semibold ${
+              order.refundStatus === 'FAILED'
+                ? 'text-red-700 dark:text-red-400'
+                : 'text-blue-700 dark:text-blue-400'
+            }`}>
+              {order.refundStatus === 'FAILED' ? 'Refund Failed' :
+               order.refundStatus === 'processed' ? 'Refund Processed' :
+               'Refund Initiated'}
+            </span>
+          </div>
+          {order.refundAmount != null && (
+            <p className="text-sm text-gray-600 dark:text-gray-400">
+              Amount: <strong className="text-gray-900 dark:text-white">₹{order.refundAmount.toFixed(2)}</strong>
+            </p>
+          )}
+          {order.refundedAt && (
+            <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+              {order.refundStatus === 'FAILED'
+                ? 'Please contact support for assistance.'
+                : `Initiated on ${new Date(order.refundedAt).toLocaleDateString()}. Will be credited within 5-7 business days.`
+              }
+            </p>
+          )}
+        </div>
+      )}
     </Card>
   );
 };

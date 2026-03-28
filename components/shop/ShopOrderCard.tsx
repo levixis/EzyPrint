@@ -76,6 +76,14 @@ const ShopOrderCard: React.FC<ShopOrderCardProps> = ({ order, onSelectOrder }) =
           )}
           <p><strong>Order Value:</strong> <span className="font-semibold text-gray-900 dark:text-white">₹{priceDetails.totalPrice.toFixed(2)}</span></p>
           <p className="text-gray-500 dark:text-gray-400 italic">(Page Cost: ₹{priceDetails.pageCost.toFixed(2)}, Base Fee: ₹{priceDetails.baseFee.toFixed(2)})</p>
+          {order.specialInstructions && (
+            <p className="mt-1.5 flex items-center gap-1 text-amber-700 dark:text-amber-400 font-medium">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-3.5 h-3.5">
+                <path fillRule="evenodd" d="M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Zm-7-4a1 1 0 1 1-2 0 1 1 0 0 1 2 0ZM9 9a.75.75 0 0 0 0 1.5h.253a.25.25 0 0 1 .244.304l-.459 2.066A1.75 1.75 0 0 0 10.747 15H11a.75.75 0 0 0 0-1.5h-.253a.25.25 0 0 1-.244-.304l.459-2.066A1.75 1.75 0 0 0 9.253 9H9Z" clipRule="evenodd" />
+              </svg>
+              Has special instructions
+            </p>
+          )}
         </div>
         {status === OrderStatus.READY_FOR_PICKUP && order.pickupCode && (
           <div className="mt-3 flex items-center gap-2 px-3 py-2 rounded-lg bg-emerald-50 dark:bg-emerald-900/30 border border-emerald-200 dark:border-emerald-700">

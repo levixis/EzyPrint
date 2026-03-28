@@ -48,6 +48,29 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
   const handlePayNow = useCallback(async (order: DocumentOrder) => {
     if (processingOrderId) return;
     setProcessingOrderId(order.id);
+
+    // SAFETY: If this is a retry (PAYMENT_FAILED), check if the previous payment
+    // was actually captured by Razorpay before creating a new payment.
+    if (order.status === OrderStatus.PAYMENT_FAILED && order.razorpayOrderId) {
+      setStatusMessage('Checking previous payment...');
+      try {
+        const checkPaymentFn = httpsCallable(functions, 'checkPaymentStatus');
+        const checkResult = await checkPaymentFn({ orderId: order.id });
+        const checkData = checkResult.data as { paid: boolean; recovered?: boolean; message: string };
+
+        if (checkData.paid && checkData.recovered) {
+          // Payment was already captured! Order has been recovered.
+          alert('Good news! Your previous payment was successful. The order has been updated.');
+          setProcessingOrderId(null);
+          setStatusMessage('');
+          return;
+        }
+      } catch (checkErr) {
+        console.warn('Payment status check failed, proceeding with new payment:', checkErr);
+        // Continue with new payment if check fails
+      }
+    }
+
     setStatusMessage('Creating order...');
 
     try {
@@ -220,28 +243,50 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
   };
 
   const handleCancelOrder = async (order: DocumentOrder) => {
-    if (window.confirm("Are you sure you want to cancel this order? It will be hidden from your list.")) {
+    // SAFETY: Before cancelling, check if the payment was actually captured
+    // (handles case where verification failed but money was taken)
+    if ((order.status === OrderStatus.PAYMENT_FAILED || order.status === OrderStatus.PENDING_PAYMENT) && order.razorpayOrderId) {
       try {
-        const result = await updateOrderStatus(order.id, OrderStatus.CANCELLED, {
-          actingUserType: UserType.STUDENT
-        });
-        if (!result) {
-          alert('Failed to cancel order. Please try again.');
+        const checkPaymentFn = httpsCallable(functions, 'checkPaymentStatus');
+        const checkResult = await checkPaymentFn({ orderId: order.id });
+        const checkData = checkResult.data as { paid: boolean; recovered?: boolean; message: string };
+
+        if (checkData.paid && checkData.recovered) {
+          alert('Your previous payment was actually successful! The order has been recovered instead of cancelled.');
+          return;
         }
-      } catch (err) {
-        console.error('[StudentOrderList] Cancel order failed:', err);
-        alert('Failed to cancel order. Please check your connection and try again.');
+
+        if (checkData.paid && !checkData.recovered) {
+          // Payment exists but order is already in a paid state
+          if (!window.confirm('A payment was captured for this order. Cancelling will trigger an automatic refund. Continue?')) {
+            return;
+          }
+        }
+      } catch (checkErr) {
+        console.warn('Payment check before cancel failed:', checkErr);
+        // Continue with cancel if check fails
       }
+    } else {
+      if (!window.confirm("Are you sure you want to cancel this order?")) return;
+    }
+
+    try {
+      const result = await updateOrderStatus(order.id, OrderStatus.CANCELLED, {
+        actingUserType: UserType.STUDENT
+      });
+      if (!result) {
+        alert('Failed to cancel order. Please try again.');
+      }
+    } catch (err) {
+      console.error('[StudentOrderList] Cancel order failed:', err);
+      alert('Failed to cancel order. Please check your connection and try again.');
     }
   };
 
-  const visibleOrders = orders.filter(o => o.status !== OrderStatus.CANCELLED);
+  const [activeTab, setActiveTab] = useState<'recent' | 'history'>('recent');
 
-  if (visibleOrders.length === 0) {
-    return <p className="text-brand-lightText text-center py-6">No orders found.</p>;
-  }
-
-  const ordersWithOptimistic = visibleOrders.map(order => {
+  // Apply optimistic statuses to all orders
+  const ordersWithOptimistic = orders.map(order => {
     const optimisticStatus = optimisticStatuses[order.id];
     if (optimisticStatus && order.status !== optimisticStatus) {
       return { ...order, status: optimisticStatus };
@@ -249,7 +294,8 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
     return order;
   });
 
-  const sortedOrders = [...ordersWithOptimistic].sort((a, b) => {
+  // Sort: pending payment first, then payment failed, then by date
+  const sortAll = (list: DocumentOrder[]) => [...list].sort((a, b) => {
     if (a.status === OrderStatus.PENDING_PAYMENT && b.status !== OrderStatus.PENDING_PAYMENT) return -1;
     if (a.status !== OrderStatus.PENDING_PAYMENT && b.status === OrderStatus.PENDING_PAYMENT) return 1;
     if (a.status === OrderStatus.PAYMENT_FAILED && b.status !== OrderStatus.PAYMENT_FAILED) return -1;
@@ -257,17 +303,91 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
     return new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime();
   });
 
+  // Recent: only active (non-cancelled, non-completed), max 5
+  const activeOrders = ordersWithOptimistic.filter(o =>
+    o.status !== OrderStatus.CANCELLED && o.status !== OrderStatus.COMPLETED
+  );
+  const recentOrders = sortAll(activeOrders).slice(0, 5);
+
+  // History: all orders sorted by date (newest first)
+  const allOrdersSorted = [...ordersWithOptimistic].sort((a, b) =>
+    new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime()
+  );
+
+  const cancelledCount = ordersWithOptimistic.filter(o => o.status === OrderStatus.CANCELLED).length;
+  const completedCount = ordersWithOptimistic.filter(o => o.status === OrderStatus.COMPLETED).length;
+
+  if (orders.length === 0) {
+    return <p className="text-brand-lightText text-center py-6">No orders found.</p>;
+  }
+
+  const renderOrders = activeTab === 'recent' ? recentOrders : allOrdersSorted;
+
   return (
-    <div className="space-y-6">
-      {sortedOrders.map(order => (
-        <StudentOrderCard
-          key={order.id}
-          order={order}
-          onPayNow={handlePayNow}
-          onCancelOrder={handleCancelOrder}
-          isProcessingPayment={processingOrderId === order.id}
-        />
-      ))}
+    <div className="space-y-4">
+      {/* Tab Switcher */}
+      <div className="flex bg-gray-100 dark:bg-zinc-800/80 rounded-xl p-1 gap-1">
+        <button
+          onClick={() => setActiveTab('recent')}
+          className={`flex-1 relative py-2 px-3 text-sm font-medium rounded-lg transition-all duration-200
+            ${activeTab === 'recent'
+              ? 'bg-white dark:bg-zinc-900 text-gray-900 dark:text-white shadow-sm'
+              : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300'
+            }`}
+        >
+          Recent
+          {activeOrders.length > 0 && (
+            <span className="ml-1.5 px-1.5 py-0.5 text-[10px] font-semibold rounded-full bg-red-500 text-white">
+              {activeOrders.length}
+            </span>
+          )}
+        </button>
+        <button
+          onClick={() => setActiveTab('history')}
+          className={`flex-1 relative py-2 px-3 text-sm font-medium rounded-lg transition-all duration-200
+            ${activeTab === 'history'
+              ? 'bg-white dark:bg-zinc-900 text-gray-900 dark:text-white shadow-sm'
+              : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300'
+            }`}
+        >
+          Order History
+          {(cancelledCount + completedCount) > 0 && (
+            <span className="ml-1.5 px-1.5 py-0.5 text-[10px] font-medium rounded-full bg-gray-300 dark:bg-zinc-600 text-gray-700 dark:text-gray-300">
+              {cancelledCount + completedCount}
+            </span>
+          )}
+        </button>
+      </div>
+
+      {/* Orders */}
+      {renderOrders.length > 0 ? (
+        <div className="space-y-6">
+          {renderOrders.map(order => (
+            <StudentOrderCard
+              key={order.id}
+              order={order}
+              onPayNow={handlePayNow}
+              onCancelOrder={handleCancelOrder}
+              isProcessingPayment={processingOrderId === order.id}
+            />
+          ))}
+          {activeTab === 'recent' && activeOrders.length > 5 && (
+            <button
+              onClick={() => setActiveTab('history')}
+              className="w-full py-2.5 text-sm font-medium text-brand-primary hover:text-brand-primary/80 transition-colors"
+            >
+              View all {activeOrders.length} active orders →
+            </button>
+          )}
+        </div>
+      ) : (
+        <div className="text-center py-8">
+          <p className="text-gray-500 dark:text-gray-400">
+            {activeTab === 'recent' ? 'No active orders' : 'No orders yet'}
+          </p>
+        </div>
+      )}
+
       {showOverlay && (
         <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/40 backdrop-blur-sm">
           <div className="bg-white dark:bg-zinc-900 rounded-2xl shadow-2xl p-6 flex flex-col items-center gap-3 mx-4 max-w-xs w-full">

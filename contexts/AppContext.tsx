@@ -1,5 +1,5 @@
 import React, { createContext, useState, useContext, useCallback, useMemo, ReactNode, useEffect, useRef } from 'react';
-import { DocumentOrder, OrderFile, NotificationMessage, OrderStatus, User, UserType, ShopProfile, ShopPricing, PayoutMethod, AppView, ShopPayout, PayoutStatus, PrintColor } from '../types';
+import { DocumentOrder, OrderFile, NotificationMessage, OrderStatus, User, UserType, ShopProfile, ShopPricing, PayoutMethod, AppView, ShopPayout, PayoutStatus, PrintColor, BankDetails, SupportTicket, TicketCategory, TicketStatus, TicketMessage, TicketStatusChange, EarningsReport } from '../types';
 import { DEFAULT_SHOP_PRICING, ADMIN_EMAILS } from '../constants';
 import {
   auth,
@@ -24,12 +24,12 @@ import {
   orderBy,
   limit,
   addDoc,
+  getDocs,
   FirebaseUser,
   storageRef,
   uploadBytesResumable,
   updateProfile,
   onSnapshot,
-  runTransaction,
   enableNetwork
 } from '../firebase';
 
@@ -43,8 +43,8 @@ const getErrorMessage = (err: unknown): string => {
 };
 
 // Pricing utilities — imported from dedicated module for clean HMR
-import { calculateBaseFee, calculateOrderPrice, calculateMultiFileOrderPrice } from '../utils/pricing';
-export { calculateBaseFee, calculateOrderPrice, calculateMultiFileOrderPrice };
+import { calculateBaseFee, calculateOrderPrice, calculateMultiFileOrderPrice, isStudentPassActive, getStudentPassDaysRemaining, getStudentPassExpiryDate } from '../utils/pricing';
+export { calculateBaseFee, calculateOrderPrice, calculateMultiFileOrderPrice, isStudentPassActive, getStudentPassDaysRemaining, getStudentPassExpiryDate };
 
 // Push notification registration for native mobile
 import { registerPushNotifications, unregisterPushNotifications } from '../utils/pushNotifications';
@@ -79,7 +79,8 @@ interface AppContextType {
     userId: string;
     shopId: string;
     fileInputs: { file: File; fileType: string; pageCount: number; color: PrintColor; copies: number; doubleSided: boolean }[];
-  }) => Promise<{ success: boolean, orderId?: string }>;
+    specialInstructions?: string;
+  }, onProgress?: (progress: { currentFile: number; totalFiles: number; fileProgress: number; overallProgress: number; fileName: string }) => void) => Promise<{ success: boolean, orderId?: string }>;
   updateOrderStatus: (orderId: string, status: OrderStatus, details?: { shopNotes?: string; paymentAttemptedAt?: string; actingUserType?: UserType }) => Promise<DocumentOrder | undefined>;
 
   addNotification: (notification: Omit<NotificationMessage, 'id' | 'timestamp' | 'read'>) => void;
@@ -111,6 +112,22 @@ interface AppContextType {
 
   // Shop owner self-delete
   deleteOwnShopAccount: () => Promise<{ success: boolean; message?: string }>;
+  deleteOwnStudentAccount: () => Promise<{ success: boolean; message?: string }>;
+
+  // Bank Details (stored in private sub-collection)
+  getBankDetails: (shopId: string) => Promise<BankDetails | null>;
+  saveBankDetails: (shopId: string, details: BankDetails) => Promise<{ success: boolean; message?: string }>;
+  verifyBankDetails: (shopId: string) => Promise<{ success: boolean; message?: string }>;
+  logBankAccess: (shopId: string, action: 'VIEW' | 'EDIT' | 'VERIFY') => Promise<void>;
+
+  // Support Tickets
+  tickets: SupportTicket[];
+  createTicket: (ticketData: { subject: string; category: TicketCategory; description: string; relatedOrderId?: string; attachmentFiles?: File[] }) => Promise<{ success: boolean; ticketId?: string; message?: string }>;
+  addTicketMessage: (ticketId: string, message: string) => Promise<{ success: boolean; message?: string }>;
+  updateTicketStatus: (ticketId: string, newStatus: TicketStatus, note?: string) => Promise<{ success: boolean; message?: string }>;
+
+  // Earnings Reports
+  reports: EarningsReport[];
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
@@ -421,8 +438,15 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
             console.log(`[AppContext] Shops listener will retry in ${delay}ms (attempt ${retryCount}/${MAX_RETRIES})`);
             retryTimeout = setTimeout(() => {
               if (isCleaned) return;
-              // Kick Firestore connection before re-subscribing
-              enableNetwork(db).catch(() => {});
+              // Properly clean up the dead listener before re-subscribing.
+              // Without this, Firestore throws 'Target ID already exists' because
+              // the old listener's internal target wasn't fully removed.
+              unsubscribeShops?.();
+              unsubscribeShops = null;
+              // Kick Firestore connection safely on native only before re-subscribing
+              if (Capacitor.isNativePlatform()) {
+                enableNetwork(db).catch(() => {});
+              }
               subscribe();
             }, delay);
           } else {
@@ -594,6 +618,20 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       } else {
         // Document was updated — sync the latest data (e.g., role changes, pass status)
         const updatedData = docSnap.data() as User;
+
+        // Auto-expire Student Pass if 30 days have elapsed
+        if (updatedData.hasStudentPass && updatedData.studentPassActivatedAt) {
+          const passStillActive = isStudentPassActive(updatedData.hasStudentPass, updatedData.studentPassActivatedAt);
+          if (!passStillActive) {
+            console.log('[AppContext] Student Pass expired — auto-deactivating.');
+            const userRef = doc(db, "users", updatedData.id);
+            updateDoc(userRef, { hasStudentPass: false }).catch(err =>
+              console.warn('[AppContext] Failed to auto-expire pass in Firestore:', err)
+            );
+            updatedData.hasStudentPass = false;
+          }
+        }
+
         setCurrentUserInternal(updatedData);
       }
     }, (error) => {
@@ -668,7 +706,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
             } catch (fetchErr) {
               if (attempt < retries) {
                 console.warn(`[AppContext] Profile fetch attempt ${attempt + 1} failed, retrying...`, fetchErr);
-                await enableNetwork(db).catch(() => { });
+                if (Capacitor.isNativePlatform()) {
+                  await enableNetwork(db).catch(() => { });
+                }
                 await new Promise(r => setTimeout(r, 1500));
               } else {
                 throw fetchErr;
@@ -1093,13 +1133,17 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   const getShopById = useCallback((shopId: string) => shops.find(s => s.id === shopId), [shops]);
 
-  const updateShopSettings = useCallback(async (shopId: string, newSettings: { pricing: ShopPricing; isOpen: boolean; payoutMethods?: PayoutMethod[] }) => {
+  const updateShopSettings = useCallback(async (shopId: string, newSettings: { pricing: ShopPricing; isOpen: boolean; payoutMethods?: PayoutMethod[]; contactPhone?: string; contactPhoneAlt?: string; contactEmail?: string; whatsappNumber?: string }) => {
     try {
       const shopRef = doc(db, "shops", shopId);
       const updateData: Partial<ShopProfile> = {
         customPricing: newSettings.pricing,
         isOpen: newSettings.isOpen,
         payoutMethods: cleanPayoutMethods(newSettings.payoutMethods),
+        contactPhone: newSettings.contactPhone || '',
+        contactPhoneAlt: newSettings.contactPhoneAlt || '',
+        contactEmail: newSettings.contactEmail || '',
+        whatsappNumber: newSettings.whatsappNumber || '',
       };
       await updateDoc(shopRef, updateData);
       const shopFromState = shops.find(s => s.id === shopId);
@@ -1120,9 +1164,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       userId: string;
       shopId: string;
       fileInputs: { file: File; fileType: string; pageCount: number; color: PrintColor; copies: number; doubleSided: boolean }[];
-    }
+      specialInstructions?: string;
+    },
+    onProgress?: (progress: { currentFile: number; totalFiles: number; fileProgress: number; overallProgress: number; fileName: string }) => void
   ): Promise<{ success: boolean, orderId?: string }> => {
-    const { userId, shopId, fileInputs } = orderData;
+    const { userId, shopId, fileInputs, specialInstructions } = orderData;
 
     if (!fileInputs || fileInputs.length === 0) {
       addNotification({ message: "No files selected.", type: 'error', targetUserId: userId });
@@ -1140,50 +1186,96 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
 
     // Calculate price using multi-file pricing (per-file copies, color, doubleSided)
-    const hasStudentPass = currentUserRef.current?.hasStudentPass ?? false;
+    // Use expiry-aware pass check — pass only counts if still within 30-day window
+    const userPassActive = isStudentPassActive(
+      currentUserRef.current?.hasStudentPass,
+      currentUserRef.current?.studentPassActivatedAt
+    );
     const calculatedPriceDetails = calculateMultiFileOrderPrice(
       fileInputs.map(f => ({ pageCount: f.pageCount, color: f.color, copies: f.copies, doubleSided: f.doubleSided })),
       targetShop.customPricing,
-      hasStudentPass
+      userPassActive
     );
 
     const orderDocRef = doc(collection(db, "orders"));
     const orderId = orderDocRef.id;
     const uploadedAtTimestamp = new Date().toISOString();
 
-    // Upload all files
+    // Upload files with progress tracking and parallel uploads (up to 3 concurrent)
     const uploadedFiles: OrderFile[] = [];
-    addNotification({ message: `Uploading ${fileInputs.length} file(s)...`, type: 'info', targetUserId: userId });
+    const totalFiles = fileInputs.length;
+    const fileProgressMap = new Map<number, number>(); // index -> progress (0-1)
+    addNotification({ message: `Uploading ${totalFiles} file(s)...`, type: 'info', targetUserId: userId });
 
-    for (let i = 0; i < fileInputs.length; i++) {
-      const fi = fileInputs[i];
+    const reportProgress = (fileIndex: number, fileProgress: number) => {
+      fileProgressMap.set(fileIndex, fileProgress);
+      // Calculate overall progress: average of all file progresses
+      let totalProgress = 0;
+      for (let i = 0; i < totalFiles; i++) {
+        totalProgress += fileProgressMap.get(i) ?? 0;
+      }
+      const overallProgress = Math.round((totalProgress / totalFiles) * 100);
+      onProgress?.({
+        currentFile: fileIndex + 1,
+        totalFiles,
+        fileProgress: Math.round(fileProgress * 100),
+        overallProgress,
+        fileName: fileInputs[fileIndex].file.name,
+      });
+    };
+
+    // Upload a single file and return its OrderFile data
+    const uploadSingleFile = async (fi: typeof fileInputs[0], index: number): Promise<OrderFile> => {
       const filePath = `orders/${userId}/${orderId}/${fi.file.name}`;
       const fileRef = storageRef(storage, filePath);
 
-      try {
-        const uploadTask = uploadBytesResumable(fileRef, fi.file, {
-          contentType: fi.file.type || 'application/octet-stream',
-          customMetadata: { originalFileName: fi.file.name },
-        });
-        await new Promise<void>((resolve, reject) => {
-          uploadTask.on('state_changed', null, reject, () => resolve());
-        });
+      const uploadTask = uploadBytesResumable(fileRef, fi.file, {
+        contentType: fi.file.type || 'application/octet-stream',
+        customMetadata: { originalFileName: fi.file.name },
+      });
 
-        uploadedFiles.push({
-          fileName: fi.file.name,
-          fileType: fi.fileType,
-          fileStoragePath: filePath,
-          fileSizeBytes: fi.file.size,
-          isFileDeleted: false,
-          pageCount: fi.pageCount,
-          color: fi.color,
-          copies: fi.copies,
-          doubleSided: fi.doubleSided,
-        });
-      } catch (uploadError: unknown) {
-        addNotification({ message: `Failed to upload ${fi.file.name}: ${getErrorMessage(uploadError)}`, type: 'error', targetUserId: userId });
-        return { success: false };
+      await new Promise<void>((resolve, reject) => {
+        uploadTask.on(
+          'state_changed',
+          (snapshot) => {
+            const progress = snapshot.bytesTransferred / snapshot.totalBytes;
+            reportProgress(index, progress);
+          },
+          reject,
+          () => {
+            reportProgress(index, 1);
+            resolve();
+          }
+        );
+      });
+
+      return {
+        fileName: fi.file.name,
+        fileType: fi.fileType,
+        fileStoragePath: filePath,
+        fileSizeBytes: fi.file.size,
+        isFileDeleted: false,
+        pageCount: fi.pageCount,
+        color: fi.color,
+        copies: fi.copies,
+        doubleSided: fi.doubleSided,
+      };
+    };
+
+    // Upload files in parallel batches of 3 for speed
+    const CONCURRENCY = 3;
+    try {
+      for (let batchStart = 0; batchStart < totalFiles; batchStart += CONCURRENCY) {
+        const batchEnd = Math.min(batchStart + CONCURRENCY, totalFiles);
+        const batch = fileInputs.slice(batchStart, batchEnd).map((fi, i) =>
+          uploadSingleFile(fi, batchStart + i)
+        );
+        const batchResults = await Promise.all(batch);
+        uploadedFiles.push(...batchResults);
       }
+    } catch (uploadError: unknown) {
+      addNotification({ message: `Upload failed: ${getErrorMessage(uploadError)}`, type: 'error', targetUserId: userId });
+      return { success: false };
     }
 
     if (uploadedFiles.length === 0) {
@@ -1220,7 +1312,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         pages: totalPages,
         doubleSided: anyDoubleSided,
       },
-      isPremiumOrder: hasStudentPass,
+      isPremiumOrder: userPassActive,
+      userName: currentUserRef.current?.name || 'Student',
+      ...(specialInstructions ? { specialInstructions } : {}),
     };
 
     try {
@@ -1239,38 +1333,49 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     const orderDocRef = doc(db, "orders", orderId);
 
     try {
-      // Use Firestore transaction for atomic read-then-write
-      const updatedOrderInstance = await runTransaction(db, async (transaction) => {
-        const orderSnap = await transaction.get(orderDocRef);
+      // Read current order state first, then validate and write.
+      // NOTE: We intentionally avoid runTransaction here because Firebase SDK v11.x
+      // has a known bug where transactions conflict with active onSnapshot listeners,
+      // causing "INTERNAL ASSERTION FAILED: Unexpected state" errors with {"Fe":-1}.
+      // A simple getDoc→validate→updateDoc is safe for order status updates since
+      // only one shopkeeper processes each order (no concurrent writers).
+      const orderSnap = await getDoc(orderDocRef);
 
-        if (!orderSnap.exists()) {
-          throw new Error(`Order #${orderId.slice(-6)} not found.`);
-        }
+      if (!orderSnap.exists()) {
+        throw new Error(`Order #${orderId.slice(-6)} not found.`);
+      }
 
-        const currentOrderData = orderSnap.data() as DocumentOrder;
-        const currentStatus = currentOrderData.status;
+      const currentOrderData = orderSnap.data() as DocumentOrder;
+      const currentStatus = currentOrderData.status;
 
-        // Validate status transition
+      // If status is changing, validate the transition
+      if (status !== currentStatus) {
         const allowedTransitions = VALID_STATUS_TRANSITIONS[currentStatus];
         if (!allowedTransitions || !allowedTransitions.includes(status)) {
           throw new Error(
             `Invalid status transition: cannot move from "${currentStatus.replace(/_/g, ' ')}" to "${status.replace(/_/g, ' ')}".`
           );
         }
+      }
 
-        // Build update payload
-        const updatePayload: Partial<DocumentOrder> = { status };
-        if (details?.shopNotes !== undefined) updatePayload.shopNotes = details.shopNotes;
-        if (details?.paymentAttemptedAt) updatePayload.paymentAttemptedAt = details.paymentAttemptedAt;
-        if (status === OrderStatus.READY_FOR_PICKUP && !currentOrderData.pickupCode) {
-          updatePayload.pickupCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-        }
+      // Build update payload
+      const updatePayload: Partial<DocumentOrder> = {};
+      if (status !== currentStatus) updatePayload.status = status;
+      if (details?.shopNotes !== undefined) updatePayload.shopNotes = details.shopNotes;
+      if (details?.paymentAttemptedAt) updatePayload.paymentAttemptedAt = details.paymentAttemptedAt;
+      if (status === OrderStatus.READY_FOR_PICKUP && !currentOrderData.pickupCode) {
+        updatePayload.pickupCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+      }
 
-        // Atomic write inside transaction
-        transaction.update(orderDocRef, updatePayload);
+      // Only write if there's something to update
+      if (Object.keys(updatePayload).length === 0) {
+        return currentOrderData;
+      }
 
-        return { ...currentOrderData, ...updatePayload };
-      });
+      // Simple updateDoc — no transaction needed for single-writer status updates
+      await updateDoc(orderDocRef, updatePayload);
+
+      const updatedOrderInstance = { ...currentOrderData, ...updatePayload };
 
       // NOTE: File cleanup is handled exclusively by the server-side onOrderStatusChange
       // Cloud Function trigger, which handles both legacy single-file and multi-file orders.
@@ -1279,12 +1384,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       // Send notifications
       if (updatedOrderInstance) {
         const targetShop = getShopById(updatedOrderInstance.shopId);
-        let studentUserName = 'Student';
-        try {
-          const userDocRefFs = doc(db, "users", updatedOrderInstance.userId);
-          const userDocSnap = await getDoc(userDocRefFs);
-          if (userDocSnap.exists()) { studentUserName = (userDocSnap.data() as User).name || studentUserName; }
-        } catch (e) { console.warn("[AppContext/updateOrderStatus] Could not fetch student user's name for notification", e) }
+        // Use userName from the order document instead of fetching the user's profile.
+        // Shopkeepers don't have Firestore permission to read other users' documents.
+        let studentUserName = updatedOrderInstance.userName || 'Student';
 
         let studentMessage = `Order #${orderId.slice(-6)} (${updatedOrderInstance.fileName}) at ${targetShop?.name || 'shop'} is now ${status.replace(/_/g, ' ').toLowerCase()}.`;
         const shopMessage = `Order #${orderId.slice(-6)} (${updatedOrderInstance.fileName}) by ${studentUserName} is now ${status.replace(/_/g, ' ').toLowerCase()}.`;
@@ -1594,8 +1696,289 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
   }, [currentUser, addNotification]);
 
+  // Student self-delete account
+  const deleteOwnStudentAccount = useCallback(async (): Promise<{ success: boolean; message?: string }> => {
+    if (!currentUser || currentUser.type !== UserType.STUDENT) {
+      return { success: false, message: "Only students can delete their own account." };
+    }
+    try {
+      // Delete the user profile document
+      await deleteDoc(doc(db, "users", currentUser.id));
+      // Sign out
+      await signOut(auth);
+      addNotification({ message: "Your account has been deleted.", type: 'info' });
+      return { success: true };
+    } catch (err: unknown) {
+      const message = getErrorMessage(err);
+      addNotification({ message: `Failed to delete account: ${message}`, type: 'error' });
+      return { success: false, message };
+    }
+  }, [currentUser, addNotification]);
+
   // Approved shops — only approved and non-archived shops visible to students
   const approvedShops = useMemo(() => shops.filter(s => s.isApproved && !s.isArchived), [shops]);
+
+  // ---- TICKETS STATE + LISTENER ----
+  const [tickets, setTickets] = useState<SupportTicket[]>([]);
+  const [reports, setReports] = useState<EarningsReport[]>([]);
+
+  useEffect(() => {
+    if (!currentUser) { setTickets([]); return; }
+
+    let unsubTickets: (() => void) | null = null;
+    let isCleaned = false;
+
+    const subscribeTickets = (useFallback: boolean) => {
+      if (isCleaned) return;
+
+      let ticketsQuery;
+      if (currentUser.type === UserType.ADMIN) {
+        // Admin: all tickets — single-field orderBy doesn't need composite index
+        ticketsQuery = useFallback
+          ? query(collection(db, 'tickets'))
+          : query(collection(db, 'tickets'), orderBy('updatedAt', 'desc'));
+      } else {
+        // Non-admin: own tickets only
+        ticketsQuery = useFallback
+          ? query(collection(db, 'tickets'), where('raisedBy', '==', currentUser.id))
+          : query(collection(db, 'tickets'), where('raisedBy', '==', currentUser.id), orderBy('updatedAt', 'desc'));
+      }
+
+      unsubTickets = onSnapshot(ticketsQuery, (snap) => {
+        const ticketList: SupportTicket[] = snap.docs.map(d => ({ id: d.id, ...d.data() } as SupportTicket));
+        // Sort client-side to guarantee order (especially for fallback queries without orderBy)
+        ticketList.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+        setTickets(ticketList);
+      }, (err) => {
+        console.error('[AppContext] Tickets listener error:', err);
+        // If the error is about a missing/building index we haven't already fallen back, retry with fallback
+        if (!useFallback && err?.message?.includes('index')) {
+          console.log('[AppContext] Falling back to simple tickets query (index not ready)');
+          unsubTickets?.();
+          unsubTickets = null;
+          subscribeTickets(true);
+        }
+      });
+    };
+
+    subscribeTickets(false);
+
+    // Reports listener (admin only)
+    let unsubReports: (() => void) | undefined;
+    if (currentUser.type === UserType.ADMIN) {
+      const reportsQuery = query(collection(db, 'reports'), orderBy('generatedAt', 'desc'));
+      unsubReports = onSnapshot(reportsQuery, (snap) => {
+        const reportList: EarningsReport[] = snap.docs.map(d => ({ id: d.id, ...d.data() } as EarningsReport));
+        setReports(reportList);
+      });
+    }
+
+    return () => {
+      isCleaned = true;
+      unsubTickets?.();
+      unsubReports?.();
+    };
+  }, [currentUser]);
+
+  // ---- BANK DETAILS FUNCTIONS ----
+  const getBankDetails = useCallback(async (shopId: string): Promise<BankDetails | null> => {
+    try {
+      const bankDocRef = doc(db, 'shops', shopId, 'private', 'bankDetails');
+      const snap = await getDoc(bankDocRef);
+      if (snap.exists()) return snap.data() as BankDetails;
+      return null;
+    } catch (err) {
+      console.error('[AppContext] getBankDetails error:', err);
+      return null;
+    }
+  }, []);
+
+  const saveBankDetails = useCallback(async (shopId: string, details: BankDetails): Promise<{ success: boolean; message?: string }> => {
+    try {
+      const bankDocRef = doc(db, 'shops', shopId, 'private', 'bankDetails');
+      await setDoc(bankDocRef, { ...details, updatedAt: new Date().toISOString() });
+      // Log the edit
+      await addDoc(collection(db, 'shops', shopId, 'bankAccessLogs'), {
+        userId: currentUser?.id || 'unknown',
+        userRole: currentUser?.type || 'unknown',
+        action: 'EDIT',
+        timestamp: new Date().toISOString(),
+      });
+      addNotification({ message: 'Bank details saved securely.', type: 'success', targetShopId: shopId });
+      return { success: true };
+    } catch (err: unknown) {
+      const message = getErrorMessage(err);
+      addNotification({ message: `Failed to save bank details: ${message}`, type: 'error' });
+      return { success: false, message };
+    }
+  }, [currentUser, addNotification]);
+
+  const verifyBankDetails = useCallback(async (shopId: string): Promise<{ success: boolean; message?: string }> => {
+    try {
+      const bankDocRef = doc(db, 'shops', shopId, 'private', 'bankDetails');
+      await updateDoc(bankDocRef, { isVerified: true, verifiedAt: new Date().toISOString() });
+      await addDoc(collection(db, 'shops', shopId, 'bankAccessLogs'), {
+        userId: currentUser?.id || 'unknown',
+        userRole: currentUser?.type || 'unknown',
+        action: 'VERIFY',
+        timestamp: new Date().toISOString(),
+      });
+      addNotification({ message: 'Bank details verified.', type: 'success', targetShopId: shopId });
+      return { success: true };
+    } catch (err: unknown) {
+      return { success: false, message: getErrorMessage(err) };
+    }
+  }, [currentUser, addNotification]);
+
+  const logBankAccess = useCallback(async (shopId: string, action: 'VIEW' | 'EDIT' | 'VERIFY') => {
+    try {
+      await addDoc(collection(db, 'shops', shopId, 'bankAccessLogs'), {
+        userId: currentUser?.id || 'unknown',
+        userRole: currentUser?.type || 'unknown',
+        action,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err) {
+      console.error('[AppContext] logBankAccess error:', err);
+    }
+  }, [currentUser]);
+
+  // ---- TICKET FUNCTIONS ----
+  const createTicket = useCallback(async (ticketData: { subject: string; category: TicketCategory; description: string; relatedOrderId?: string; attachmentFiles?: File[] }): Promise<{ success: boolean; ticketId?: string; message?: string }> => {
+    if (!currentUser) return { success: false, message: 'Not logged in' };
+
+    // Guard: shopkeepers must have shopId resolved before creating tickets
+    if (currentUser.type === UserType.SHOP_OWNER && !currentUser.shopId) {
+      return { success: false, message: 'Shop data is still loading. Please wait a moment and try again.' };
+    }
+
+    try {
+      const now = new Date().toISOString();
+      const ticketId = `ticket_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+
+      // Upload attachment files if any
+      const attachmentPaths: string[] = [];
+      if (ticketData.attachmentFiles && ticketData.attachmentFiles.length > 0) {
+        for (const file of ticketData.attachmentFiles.slice(0, 3)) { // max 3 files
+          if (file.size > 5 * 1024 * 1024) continue; // skip files > 5MB
+          const path = `tickets/${ticketId}/${file.name}`;
+          const fileRef = storageRef(storage, path);
+          await uploadBytesResumable(fileRef, file);
+          attachmentPaths.push(path);
+        }
+      }
+
+      // Build ticket object — only include optional fields when they have actual values
+      // to prevent Firestore's "Unsupported field value: undefined" error
+      const newTicket: Record<string, unknown> = {
+        id: ticketId,
+        raisedBy: currentUser.id,
+        raisedByType: currentUser.type,
+        raisedByName: currentUser.name || 'Unknown',
+        raisedByEmail: currentUser.email || '',
+        subject: ticketData.subject,
+        category: ticketData.category,
+        description: ticketData.description,
+        status: TicketStatus.OPEN,
+        attachmentPaths,
+        messages: [],
+        statusHistory: [{ from: TicketStatus.OPEN, to: TicketStatus.OPEN, changedBy: currentUser.id, changedByName: currentUser.name || 'Unknown', timestamp: now, note: 'Ticket created' }],
+        createdAt: now,
+        updatedAt: now,
+        raiserLastRepliedAt: now,
+      };
+
+      // Conditionally add optional fields only when they have real values
+      if (currentUser.type === UserType.SHOP_OWNER && currentUser.shopId) {
+        newTicket.shopId = currentUser.shopId;
+      }
+      if (ticketData.relatedOrderId) {
+        newTicket.relatedOrderId = ticketData.relatedOrderId;
+      }
+
+      await setDoc(doc(db, 'tickets', ticketId), newTicket);
+      addNotification({ message: `Ticket "${ticketData.subject}" submitted. We'll respond within 24 hours.`, type: 'success', targetUserId: currentUser.id });
+      return { success: true, ticketId };
+    } catch (err: unknown) {
+      const message = getErrorMessage(err);
+      addNotification({ message: `Failed to create ticket: ${message}`, type: 'error' });
+      return { success: false, message };
+    }
+  }, [currentUser, addNotification]);
+
+  const addTicketMessage = useCallback(async (ticketId: string, message: string): Promise<{ success: boolean; message?: string }> => {
+    if (!currentUser) return { success: false, message: 'Not logged in' };
+
+    try {
+      const ticketRef = doc(db, 'tickets', ticketId);
+      const ticketSnap = await getDoc(ticketRef);
+      if (!ticketSnap.exists()) return { success: false, message: 'Ticket not found' };
+      const ticketData = ticketSnap.data() as SupportTicket;
+
+      const now = new Date().toISOString();
+      const newMessage: TicketMessage = {
+        id: `msg_${Date.now()}`,
+        senderId: currentUser.id,
+        senderName: currentUser.name || 'Unknown',
+        senderType: currentUser.type,
+        message,
+        timestamp: now,
+      };
+
+      const updatedMessages = [...ticketData.messages, newMessage];
+      const updateData: Partial<SupportTicket> = {
+        messages: updatedMessages,
+        updatedAt: now,
+      };
+
+      if (currentUser.type === UserType.ADMIN) {
+        updateData.adminLastRepliedAt = now;
+        if (ticketData.status === TicketStatus.OPEN) {
+          updateData.status = TicketStatus.IN_REVIEW;
+          updateData.statusHistory = [...ticketData.statusHistory, { from: ticketData.status, to: TicketStatus.IN_REVIEW, changedBy: currentUser.id, changedByName: currentUser.name || 'Admin', timestamp: now, note: 'Admin replied' }];
+        }
+      } else {
+        updateData.raiserLastRepliedAt = now;
+      }
+
+      await updateDoc(ticketRef, updateData as { [x: string]: unknown });
+      return { success: true };
+    } catch (err: unknown) {
+      return { success: false, message: getErrorMessage(err) };
+    }
+  }, [currentUser]);
+
+  const updateTicketStatus = useCallback(async (ticketId: string, newStatus: TicketStatus, note?: string): Promise<{ success: boolean; message?: string }> => {
+    if (!currentUser) return { success: false, message: 'Not logged in' };
+
+    try {
+      const ticketRef = doc(db, 'tickets', ticketId);
+      const ticketSnap = await getDoc(ticketRef);
+      if (!ticketSnap.exists()) return { success: false, message: 'Ticket not found' };
+      const ticketData = ticketSnap.data() as SupportTicket;
+
+      const now = new Date().toISOString();
+      const statusChange: TicketStatusChange = {
+        from: ticketData.status,
+        to: newStatus,
+        changedBy: currentUser.id,
+        changedByName: currentUser.name || 'Unknown',
+        timestamp: now,
+        note,
+      };
+
+      await updateDoc(ticketRef, {
+        status: newStatus,
+        statusHistory: [...ticketData.statusHistory, statusChange],
+        updatedAt: now,
+      });
+
+      addNotification({ message: `Ticket "${ticketData.subject}" status changed to ${newStatus.replace(/_/g, ' ')}.`, type: 'info', targetUserId: ticketData.raisedBy });
+      return { success: true };
+    } catch (err: unknown) {
+      return { success: false, message: getErrorMessage(err) };
+    }
+  }, [currentUser, addNotification]);
 
   const contextValue = useMemo(() => ({
     currentUser, isLoadingAuth, pendingFirebaseProfileCreationUser, setPendingFirebaseProfileCreationUser,
@@ -1610,11 +1993,16 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     payouts, createPayout, requestPayout, markPayoutPaid, confirmPayout, disputePayout,
     approveShop, rejectShop, deleteShopAndOwner, archiveShop, unarchiveShop, approvedShops,
     deleteOwnShopAccount,
-    studentPassHolders
+    deleteOwnStudentAccount,
+    studentPassHolders,
+    getBankDetails, saveBankDetails, verifyBankDetails, logBankAccess,
+    tickets, createTicket, addTicketMessage, updateTicketStatus,
+    reports,
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }), [
     currentUser, isLoadingAuth, pendingFirebaseProfileCreationUser,
-    shops, isLoadingShops, orders, allOrders, notifications, currentView, payouts, approvedShops, studentPassHolders
+    shops, isLoadingShops, orders, allOrders, notifications, currentView, payouts, approvedShops, studentPassHolders,
+    tickets, reports
   ]);
 
   return (

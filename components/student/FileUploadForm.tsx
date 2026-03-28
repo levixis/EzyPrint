@@ -42,7 +42,9 @@ const FileUploadForm: React.FC<FileUploadFormProps> = ({ userId, isLoadingShops,
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [selectedShopId, setSelectedShopId] = useState<string>('');
   const [error, setError] = useState('');
+  const [specialInstructions, setSpecialInstructions] = useState('');
   const [priceDetails, setPriceDetails] = useState<DocumentOrder['priceDetails']>({ pageCost: 0, baseFee: 0, totalPrice: 0 });
+  const [uploadProgress, setUploadProgress] = useState<{ currentFile: number; totalFiles: number; fileProgress: number; overallProgress: number; fileName: string } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const activeShops = useMemo(() => approvedShops.filter(shop => shop.isOpen), [approvedShops]);
@@ -171,6 +173,13 @@ const FileUploadForm: React.FC<FileUploadFormProps> = ({ userId, isLoadingShops,
     setFileEntries(prev => prev.map(e => e.id === id ? { ...e, copies: Math.max(1, copies) } : e));
   };
 
+  // Handle number input that allows clearing while typing
+  const handleNumberInput = (value: string, setter: (id: string, val: number) => void, id: string) => {
+    if (value === '') return; // Allow empty during typing, validated on blur
+    const num = parseInt(value, 10);
+    if (!isNaN(num)) setter(id, num);
+  };
+
   const updateFileDoubleSided = (id: string, doubleSided: boolean) => {
     setFileEntries(prev => prev.map(e => e.id === id ? { ...e, doubleSided } : e));
   };
@@ -189,6 +198,7 @@ const FileUploadForm: React.FC<FileUploadFormProps> = ({ userId, isLoadingShops,
 
     setError('');
     setIsSubmitting(true);
+    setUploadProgress(null);
 
     const result = await addOrder({
       userId,
@@ -201,12 +211,17 @@ const FileUploadForm: React.FC<FileUploadFormProps> = ({ userId, isLoadingShops,
         copies: entry.copies,
         doubleSided: entry.doubleSided,
       })),
+      specialInstructions: specialInstructions.trim() || undefined,
+    }, (progress) => {
+      setUploadProgress(progress);
     });
 
     setIsSubmitting(false);
+    setUploadProgress(null);
 
     if (result.success) {
       setFileEntries([]);
+      setSpecialInstructions('');
     }
   };
 
@@ -322,30 +337,58 @@ const FileUploadForm: React.FC<FileUploadFormProps> = ({ userId, isLoadingShops,
 
               {/* Per-file settings row */}
               <div className="flex flex-wrap items-center gap-3">
-                {/* Pages (editable for non-PDF or if parse failed) */}
-                {(!entry.isParsing && (entry.fileType !== 'PDF' || entry.parseError)) && (
+                {/* Pages — always editable with stepper */}
+                {!entry.isParsing && (
                   <div className="flex items-center gap-1.5">
                     <label className="text-xs text-brand-lightText whitespace-nowrap">Pages:</label>
-                    <input
-                      type="number"
-                      min="1"
-                      value={entry.pageCount}
-                      onChange={(e) => updateFilePages(entry.id, parseInt(e.target.value, 10) || 1)}
-                      className="w-16 px-2 py-1.5 text-xs rounded-lg border border-brand-muted dark:border-zinc-600 bg-white dark:bg-zinc-800 text-brand-text dark:text-white focus:ring-1 focus:ring-brand-primary focus:outline-none"
-                    />
+                    <div className="flex items-center rounded-lg border border-brand-muted dark:border-zinc-600 overflow-hidden">
+                      <button
+                        type="button"
+                        onClick={() => updateFilePages(entry.id, entry.pageCount - 1)}
+                        disabled={entry.pageCount <= 1}
+                        className="px-2 py-1.5 text-xs text-gray-500 hover:bg-gray-100 dark:hover:bg-zinc-700 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                      >−</button>
+                      <input
+                        type="number"
+                        min="1"
+                        value={entry.pageCount}
+                        onChange={(e) => handleNumberInput(e.target.value, updateFilePages, entry.id)}
+                        onBlur={(e) => { if (!e.target.value || parseInt(e.target.value) < 1) updateFilePages(entry.id, 1); }}
+                        className="w-12 px-1 py-1.5 text-xs text-center bg-white dark:bg-zinc-800 text-brand-text dark:text-white focus:outline-none border-x border-brand-muted dark:border-zinc-600"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => updateFilePages(entry.id, entry.pageCount + 1)}
+                        className="px-2 py-1.5 text-xs text-gray-500 hover:bg-gray-100 dark:hover:bg-zinc-700 transition-colors"
+                      >+</button>
+                    </div>
                   </div>
                 )}
 
-                {/* Copies */}
+                {/* Copies — stepper with editable input */}
                 <div className="flex items-center gap-1.5">
                   <label className="text-xs text-brand-lightText whitespace-nowrap">Copies:</label>
-                  <input
-                    type="number"
-                    min="1"
-                    value={entry.copies}
-                    onChange={(e) => updateFileCopies(entry.id, parseInt(e.target.value, 10) || 1)}
-                    className="w-16 px-2 py-1.5 text-xs rounded-lg border border-brand-muted dark:border-zinc-600 bg-white dark:bg-zinc-800 text-brand-text dark:text-white focus:ring-1 focus:ring-brand-primary focus:outline-none"
-                  />
+                  <div className="flex items-center rounded-lg border border-brand-muted dark:border-zinc-600 overflow-hidden">
+                    <button
+                      type="button"
+                      onClick={() => updateFileCopies(entry.id, entry.copies - 1)}
+                      disabled={entry.copies <= 1}
+                      className="px-2 py-1.5 text-xs text-gray-500 hover:bg-gray-100 dark:hover:bg-zinc-700 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                    >−</button>
+                    <input
+                      type="number"
+                      min="1"
+                      value={entry.copies}
+                      onChange={(e) => handleNumberInput(e.target.value, updateFileCopies, entry.id)}
+                      onBlur={(e) => { if (!e.target.value || parseInt(e.target.value) < 1) updateFileCopies(entry.id, 1); }}
+                      className="w-12 px-1 py-1.5 text-xs text-center bg-white dark:bg-zinc-800 text-brand-text dark:text-white focus:outline-none border-x border-brand-muted dark:border-zinc-600"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => updateFileCopies(entry.id, entry.copies + 1)}
+                      className="px-2 py-1.5 text-xs text-gray-500 hover:bg-gray-100 dark:hover:bg-zinc-700 transition-colors"
+                    >+</button>
+                  </div>
                 </div>
 
                 {/* Color toggle */}
@@ -457,8 +500,51 @@ const FileUploadForm: React.FC<FileUploadFormProps> = ({ userId, isLoadingShops,
         </button>
       )}
 
+      {/* Special Instructions */}
+      <div className="mb-6">
+        <label htmlFor="specialInstructions" className="block text-sm font-semibold text-brand-text dark:text-brand-dark-text mb-2">
+          📝 Special Instructions <span className="text-xs font-normal text-brand-lightText">(optional)</span>
+        </label>
+        <textarea
+          id="specialInstructions"
+          value={specialInstructions}
+          onChange={(e) => setSpecialInstructions(e.target.value.slice(0, 500))}
+          placeholder="e.g. Print first 5 pages only, staple together, bind with spiral, etc."
+          rows={3}
+          className="w-full px-4 py-3 rounded-xl bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-700 text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-brand-primary focus:border-transparent transition-all resize-none text-sm"
+        />
+        <p className="text-xs text-brand-lightText dark:text-gray-500 mt-1 text-right">{specialInstructions.length}/500</p>
+      </div>
+
+      {/* Upload progress bar */}
+      {isSubmitting && uploadProgress && (
+        <div className="mb-4 p-4 bg-brand-secondaryLight/60 dark:bg-zinc-800/50 rounded-xl border border-brand-primary/30">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-sm font-medium text-brand-text dark:text-white">
+              Uploading file {uploadProgress.currentFile}/{uploadProgress.totalFiles}
+            </span>
+            <span className="text-sm font-bold text-brand-primary">
+              {uploadProgress.overallProgress}%
+            </span>
+          </div>
+          <div className="w-full bg-gray-200 dark:bg-zinc-700 rounded-full h-3 overflow-hidden">
+            <div
+              className="h-full rounded-full bg-gradient-to-r from-brand-primary to-emerald-400 transition-all duration-300 ease-out"
+              style={{ width: `${uploadProgress.overallProgress}%` }}
+            />
+          </div>
+          <p className="text-xs text-brand-lightText dark:text-gray-400 mt-1.5 truncate">
+            {uploadProgress.fileName}
+          </p>
+        </div>
+      )}
+
       <Button type="submit" size="lg" disabled={fileEntries.length === 0 || !selectedShopId || anyParsing || isSubmitting || isLoadingShops} fullWidth>
-        {isSubmitting ? 'Uploading & Placing Order...' : anyParsing ? 'Processing Files...' : `Place Order & Proceed to Payment`}
+        {isSubmitting
+          ? uploadProgress
+            ? `Uploading... ${uploadProgress.overallProgress}%`
+            : 'Uploading & Placing Order...'
+          : anyParsing ? 'Processing Files...' : `Place Order & Proceed to Payment`}
       </Button>
     </form>
   );

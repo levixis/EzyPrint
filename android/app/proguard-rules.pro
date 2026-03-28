@@ -10,6 +10,7 @@
 # Google Services/Firebase rules (if applicable)
 -keep class com.google.firebase.** { *; }
 -keep class com.google.android.gms.** { *; }
+-dontwarn com.google.firebase.ktx.Firebase
 
 # Standard optimization rules
 -dontwarn okio.**

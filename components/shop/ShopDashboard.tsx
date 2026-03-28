@@ -7,6 +7,8 @@ import ShopOrderDetailsModal from './ShopOrderDetailsModal';
 import ShopSettingsModal from './ShopSettingsModal';
 import { Card } from '../common/Card';
 import { Button } from '../common/Button';
+import TicketForm from '../tickets/TicketForm';
+import TicketList from '../tickets/TicketList';
 
 interface ShopDashboardProps {
   shopId: string;
@@ -17,7 +19,7 @@ import { useGSAP } from '@gsap/react';
 import gsap from 'gsap';
 
 const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
-  const { getOrdersForCurrentUser, updateOrderStatus, getShopById, updateShopSettings, payouts, requestPayout, confirmPayout, disputePayout } = useAppContext();
+  const { getOrdersForCurrentUser, updateOrderStatus, getShopById, updateShopSettings, payouts, requestPayout, confirmPayout, disputePayout, tickets } = useAppContext();
   const [selectedOrderId, setSelectedOrderId] = useState<string | null>(null);
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
   const [disputePayoutId, setDisputePayoutId] = useState<string | null>(null);
@@ -26,7 +28,9 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
   const [payoutRequestNote, setPayoutRequestNote] = useState('');
   const [isRequestingPayout, setIsRequestingPayout] = useState(false);
   const [showPayoutRequestForm, setShowPayoutRequestForm] = useState(false);
-  const [activeTab, setActiveTab] = useState<'orders' | 'earnings' | 'payouts'>('orders');
+  const [activeTab, setActiveTab] = useState<'orders' | 'earnings' | 'payouts' | 'support'>('orders');
+  const [orderView, setOrderView] = useState<'today' | 'history'>('today');
+  const [showTicketForm, setShowTicketForm] = useState(false);
 
   const dashboardRef = useRef<HTMLDivElement>(null);
 
@@ -108,7 +112,7 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
   const handleOpenSettingsModal = () => setIsSettingsModalOpen(true);
   const handleCloseSettingsModal = () => setIsSettingsModalOpen(false);
 
-  const handleSaveShopSettings = (sId: string, newSettings: { pricing: ShopPricing; isOpen: boolean; payoutMethods?: PayoutMethod[] }) => {
+  const handleSaveShopSettings = (sId: string, newSettings: { pricing: ShopPricing; isOpen: boolean; payoutMethods?: PayoutMethod[]; contactPhone?: string; contactPhoneAlt?: string; contactEmail?: string; whatsappNumber?: string }) => {
     updateShopSettings(sId, newSettings);
   };
 
@@ -125,6 +129,15 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
   };
 
   const shopRelevantOrders = allShopOrders.filter(o => o.status !== OrderStatus.PENDING_PAYMENT && o.status !== OrderStatus.PAYMENT_FAILED && o.status !== OrderStatus.CANCELLED);
+
+  // Today's orders — filtered from shopRelevantOrders by upload date
+  const todayOrders = useMemo(() =>
+    shopRelevantOrders.filter(o => new Date(o.uploadedAt) >= todayStart),
+    [shopRelevantOrders, todayStart]
+  );
+
+  // Display orders based on view toggle
+  const displayOrders = orderView === 'today' ? todayOrders : shopRelevantOrders;
 
   if (!shopProfile) {
     return <p className="text-status-error text-center p-5">Shop profile not found. Please contact support.</p>;
@@ -192,6 +205,7 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
     { key: 'orders' as const, label: 'Orders', badge: pendingOrders.length > 0 ? pendingOrders.length : undefined },
     { key: 'earnings' as const, label: 'Earnings' },
     { key: 'payouts' as const, label: 'Payouts', badge: shopPayouts.filter(p => p.status === PayoutStatus.PAID).length > 0 ? shopPayouts.filter(p => p.status === PayoutStatus.PAID).length : undefined },
+    { key: 'support' as const, label: 'Support', badge: tickets.filter(t => t.status !== 'CLOSED' && t.status !== 'RESOLVED').length > 0 ? tickets.filter(t => t.status !== 'CLOSED' && t.status !== 'RESOLVED').length : undefined },
   ];
 
   return (
@@ -264,9 +278,38 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
 
       {/* ===== ORDERS TAB ===== */}
       {activeTab === 'orders' && (
-        <div className="dashboard-item animation-fade-in">
-          {shopRelevantOrders.length > 0 ? (
-            <ShopOrderList orders={shopRelevantOrders} onSelectOrder={handleSelectOrder} />
+        <div className="dashboard-item animation-fade-in space-y-3">
+          {/* Today / History sub-tabs */}
+          <div className="flex bg-gray-50 dark:bg-zinc-800/50 rounded-lg p-0.5 gap-0.5">
+            <button
+              onClick={() => setOrderView('today')}
+              className={`flex-1 py-1.5 px-2 text-xs font-medium rounded-md transition-all duration-200
+                ${orderView === 'today'
+                  ? 'bg-white dark:bg-zinc-900 text-gray-900 dark:text-white shadow-sm'
+                  : 'text-gray-500 dark:text-gray-400 hover:text-gray-700'
+                }`}
+            >
+              Today
+              {todayOrders.length > 0 && (
+                <span className="ml-1 px-1.5 py-0.5 text-[9px] font-semibold rounded-full bg-red-500 text-white">
+                  {todayOrders.length}
+                </span>
+              )}
+            </button>
+            <button
+              onClick={() => setOrderView('history')}
+              className={`flex-1 py-1.5 px-2 text-xs font-medium rounded-md transition-all duration-200
+                ${orderView === 'history'
+                  ? 'bg-white dark:bg-zinc-900 text-gray-900 dark:text-white shadow-sm'
+                  : 'text-gray-500 dark:text-gray-400 hover:text-gray-700'
+                }`}
+            >
+              History ({shopRelevantOrders.length})
+            </button>
+          </div>
+
+          {displayOrders.length > 0 ? (
+            <ShopOrderList orders={displayOrders} onSelectOrder={handleSelectOrder} />
           ) : (
             <div className="text-center py-12">
               <div className="w-16 h-16 mx-auto mb-4 rounded-2xl bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center">
@@ -274,8 +317,12 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
                   <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75 11.25 15 15 9.75M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />
                 </svg>
               </div>
-              <p className="text-gray-600 dark:text-gray-400 text-lg font-medium">All caught up!</p>
-              <p className="text-gray-400 dark:text-gray-500 text-sm mt-1">No orders requiring attention</p>
+              <p className="text-gray-600 dark:text-gray-400 text-lg font-medium">
+                {orderView === 'today' ? 'No orders today!' : 'No order history'}
+              </p>
+              <p className="text-gray-400 dark:text-gray-500 text-sm mt-1">
+                {orderView === 'today' ? 'Fresh start — new orders will appear here' : 'Completed and cancelled orders will appear here'}
+              </p>
             </div>
           )}
         </div>
@@ -542,6 +589,26 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {/* ===== SUPPORT TAB ===== */}
+      {activeTab === 'support' && (
+        <div className="space-y-4 dashboard-item animation-fade-in">
+          <div className="flex items-center justify-between">
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-white">Support Tickets</h3>
+            <Button variant="primary" size="sm" onClick={() => setShowTicketForm(true)}>
+              Raise Ticket
+            </Button>
+          </div>
+          {tickets.length > 0 ? (
+            <TicketList tickets={tickets} />
+          ) : (
+            <Card className="bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-700 text-center py-8">
+              <p className="text-gray-500 dark:text-gray-400">No tickets yet. Need help? Raise a ticket above.</p>
+            </Card>
+          )}
+          <TicketForm isOpen={showTicketForm} onClose={() => setShowTicketForm(false)} />
         </div>
       )}
 

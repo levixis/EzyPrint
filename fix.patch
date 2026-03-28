@@ -1,0 +1,5 @@
+--- components/admin/AdminDashboard.tsx
++++ components/admin/AdminDashboard.tsx
+@@ -565 +565 @@
+-                      className="admin-card text-left bg-white dark:bg-zinc-900 rounded-xl border border-gray-200 dark:border-zinc-700 p-5 hover:border-brand-primary/50 hover:shadow-lg transition-all duration-200 group"
++                      className="text-left bg-white dark:bg-zinc-900 rounded-xl border border-gray-200 dark:border-zinc-700 p-5 hover:border-brand-primary/50 hover:shadow-lg transition-all duration-200 group animate-fade-in"
