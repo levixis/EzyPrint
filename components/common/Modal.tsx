@@ -1,5 +1,6 @@
 
 import React, { ReactNode, useEffect, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { Button } from './Button'; 
 
 interface ModalProps {
@@ -26,6 +27,7 @@ export const Modal: React.FC<ModalProps> = ({ isOpen, onClose, title, children, 
   }, [isOpen]);
 
   if (!showModal && !isOpen) return null; // Fully hidden and unmounted
+  if (typeof document === 'undefined') return null;
 
   const sizeClasses = {
     sm: 'sm:max-w-sm',
@@ -36,7 +38,7 @@ export const Modal: React.FC<ModalProps> = ({ isOpen, onClose, title, children, 
     'full': 'sm:max-w-5xl',
   };
 
-  return (
+  const modalContent = (
     <div 
       className={`fixed inset-0 z-[100] overflow-y-auto flex items-end sm:items-center justify-center p-0 sm:p-4 transition-opacity duration-300 ease-out
                   ${isOpen ? 'opacity-100 bg-brand-bg/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`}
@@ -84,4 +86,6 @@ export const Modal: React.FC<ModalProps> = ({ isOpen, onClose, title, children, 
       </div>
     </div>
   );
+  
+  return createPortal(modalContent, document.body);
 };
