@@ -355,7 +355,7 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
                     variant="primary"
                     onClick={handleSendReply}
                     disabled={!replyText.trim() || isSending}
-                    className="self-end"
+                    className="self-end shrink-0 w-11 h-11 !p-0 flex items-center justify-center rounded-xl"
                   >
                     {isSending ? (
                       <svg className="animate-spin w-5 h-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
