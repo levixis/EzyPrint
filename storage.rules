@@ -8,8 +8,12 @@ service firebase.storage {
       // Allow students to upload files only to their own order folder
       allow write: if request.auth != null && request.auth.uid == userId;
 
-      // Allow authenticated users to read (shop owner logic handled in app)
-      allow read: if request.auth != null;
+      // PREVENT PRIVACY LEAK (Bug 6): Only allow the student, the specific shopkeeper, or admin to read
+      allow read: if request.auth != null && (
+        request.auth.uid == userId ||
+        firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data.type == 'ADMIN' ||
+        firestore.get(/databases/(default)/documents/orders/$(orderId)).data.shopId == firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data.shopId
+      );
     }
 
     // Specific rules for support tickets path

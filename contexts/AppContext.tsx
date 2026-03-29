@@ -24,13 +24,11 @@ import {
   orderBy,
   limit,
   addDoc,
-  getDocs,
   FirebaseUser,
   storageRef,
   uploadBytesResumable,
   updateProfile,
-  onSnapshot,
-  enableNetwork
+  onSnapshot
 } from '../firebase';
 
 import { Capacitor } from '@capacitor/core';
@@ -201,18 +199,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const addNotification = useCallback((notificationData: Omit<NotificationMessage, 'id' | 'timestamp' | 'read'>) => {
     const timestamp = new Date().toISOString();
 
-    // Determine the recipient for Firestore persistence
-    // Use shopsRef to avoid depending on shops state (which would cause re-render cycles)
     let recipientUserId = notificationData.targetUserId;
 
-    // Route 'ADMIN' notifications to actual admin user IDs
+    // Route 'ADMIN' notifications locally
     if (recipientUserId === 'ADMIN') {
-      // Find admin users from the current user list or fall back
-      // Admin emails are known at build time — look up their UIDs from Firestore
-      recipientUserId = undefined; // Clear the placeholder
-      // Admin notifications: persist for each known admin by targeting all admin emails
-      // Since we can't reliably resolve UIDs without a query, create a local notification instead
-      // The server-side Cloud Functions handle critical admin notifications via recipientUserId
+      recipientUserId = undefined; 
       const localNotif: NotificationMessage = {
         ...notificationData,
         id: `local_${Date.now()}_${Math.random().toString(16).slice(2)}`,
@@ -231,27 +222,21 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       recipientUserId = shop?.ownerUserId;
     }
 
-    if (recipientUserId) {
-      // Persist to Firestore — the onSnapshot listener will deliver it to the recipient
-      const firestoreNotif = {
-        ...notificationData,
-        recipientUserId,
-        timestamp,
-        read: false,
-      };
-      addDoc(collection(db, "notifications"), firestoreNotif).catch(err => {
-        console.error("[AppContext] Failed to persist notification:", err);
-      });
-    } else {
-      // Local-only notification (error toasts, confirmations for the acting user)
-      const localNotif: NotificationMessage = {
-        ...notificationData,
-        id: `local_${Date.now()}_${Math.random().toString(16).slice(2)}`,
-        timestamp,
-        read: false,
-      };
-      setLocalNotifications(prev => [localNotif, ...prev].slice(0, 20));
+    // Bug 12: Notification creation removed from client to prevent phishing.
+    // Cloud Functions handle cross-user DB messaging.
+    // If recipient is NOT the current user, skip local toast.
+    if (recipientUserId && recipientUserId !== currentUserRef.current?.id) {
+      return;
     }
+
+    // Local-only session toast for the acting user
+    const localNotif: NotificationMessage = {
+      ...notificationData,
+      id: `local_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+      timestamp,
+      read: false,
+    };
+    setLocalNotifications(prev => [localNotif, ...prev].slice(0, 20));
   }, []);
 
   // Keep the ref in sync with the latest addNotification
@@ -276,12 +261,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         // Show in-app notification when push arrives while app is in foreground
         addNotificationRef.current({ message: body || title, type: 'info' });
 
-        // Force Firestore to reconnect — the push means server data changed,
-        // but the WebSocket may still be serving cached data
-        if (Capacitor.isNativePlatform()) {
-          console.log('[AppContext] Push received — kicking Firestore to pick up changes');
-          enableNetwork(db).catch(() => { });
-        }
+        // Note: We used to forcefully reconnect Firestore here via enableNetwork(db),
+        // but that causes INTERNAL ASSERTION FAILED crashes in Firestore v11.9.0
+        // Firebase handles its own WebSocket reconnection.
       });
     }
     return () => {
@@ -291,100 +273,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     };
   }, [currentUser?.id]);
 
-  // Reconnect Firestore when app resumes from background (native + web)
-  // Android WebView's WebSocket to Firestore goes stale very easily — even brief
-  // background periods cause onSnapshot listeners to silently serve cached data.
-  // On native: always reconnect on resume (no threshold) + periodic heartbeat
-  // On web: reconnect after 5s background (avoid Razorpay popup false triggers)
-  useEffect(() => {
-    let lastBackgroundedAt = 0;
-    let isAppActive = true;
-    let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
-    const isNativePlatform = Capacitor.isNativePlatform();
-    // Web needs a threshold to avoid reconnecting during Razorpay popup; native doesn't
-    const MIN_BACKGROUND_MS = isNativePlatform ? 0 : 5000;
-
-    const reconnectFirestore = (reason: string) => {
-      const backgroundDuration = Date.now() - lastBackgroundedAt;
-      if (lastBackgroundedAt > 0 && backgroundDuration < MIN_BACKGROUND_MS) {
-        console.log(`[AppContext] App resumed after ${backgroundDuration}ms — skipping reconnect (${reason})`);
-        return;
-      }
-      // Only call enableNetwork — do NOT call disableNetwork first.
-      // The disableNetwork→enableNetwork cycle corrupts Firestore's internal state
-      // when onSnapshot listeners are active, causing:
-      //   INTERNAL ASSERTION FAILED: Unexpected state {"Fe":-1}
-      // enableNetwork alone is safe: it's a no-op when connected, and gently
-      // reconnects stale WebSockets without disrupting active listeners.
-      console.log(`[AppContext] Refreshing Firestore connection — ${reason}`);
-      enableNetwork(db)
-        .then(() => console.log('[AppContext] Firestore connection refreshed'))
-        .catch(err => {
-          console.warn('[AppContext] Firestore enableNetwork failed:', err);
-        });
-    };
-
-    // On native, run a periodic heartbeat to keep Firestore listeners alive
-    // This cycles the network connection every 30s while the app is in the foreground
-    const startHeartbeat = () => {
-      if (heartbeatInterval || !isNativePlatform) return;
-      heartbeatInterval = setInterval(() => {
-        if (isAppActive) {
-          console.log('[AppContext] Heartbeat — refreshing Firestore connection');
-          enableNetwork(db).catch(() => { });
-        }
-      }, 30_000); // Every 30 seconds
-    };
-
-    const stopHeartbeat = () => {
-      if (heartbeatInterval) {
-        clearInterval(heartbeatInterval);
-        heartbeatInterval = null;
-      }
-    };
-
-    let nativeCleanup: (() => void) | undefined;
-
-    if (isNativePlatform) {
-      // Start heartbeat immediately on native
-      startHeartbeat();
-
-      import('@capacitor/app').then(({ App }) => {
-        const listener = App.addListener('appStateChange', ({ isActive }) => {
-          isAppActive = isActive;
-          if (!isActive) {
-            lastBackgroundedAt = Date.now();
-            stopHeartbeat();
-          } else {
-            // Always reconnect on native resume — WebView WebSocket is unreliable
-            reconnectFirestore('app resumed from background');
-            startHeartbeat();
-          }
-        });
-        listener.then(handle => {
-          nativeCleanup = () => handle.remove();
-        });
-      }).catch(err => {
-        console.warn('[AppContext] App plugin not available for state change:', err);
-      });
-    } else {
-      // Web-only: use visibilitychange with threshold (safe since no native payment popups)
-      const handleVisibilityChange = () => {
-        if (document.visibilityState === 'hidden') {
-          lastBackgroundedAt = Date.now();
-        } else if (document.visibilityState === 'visible') {
-          reconnectFirestore('tab became visible');
-        }
-      };
-      document.addEventListener('visibilitychange', handleVisibilityChange);
-      nativeCleanup = () => document.removeEventListener('visibilitychange', handleVisibilityChange);
-    }
-
-    return () => {
-      nativeCleanup?.();
-      stopHeartbeat();
-    };
-  }, []);
+  // (Removed legacy enableNetwork() heartbeat polling logic here)
+  // Firestore v11.9.0 strictly asserts internal thread state. Calling enableNetwork()
+  // while the SDK is concurrently resetting due to Auth swaps or backgrounding 
+  // causes fatal `INTERNAL ASSERTION FAILED: Unexpected state {"fe":-1}` crashes.
+  // The SDK correctly manages its own graceful retries internally.
 
   // Shop data listener — self-healing: retries on error instead of wiping data.
   // Firebase auto-closes onSnapshot listeners on error, so we must re-subscribe.
@@ -438,15 +331,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
             console.log(`[AppContext] Shops listener will retry in ${delay}ms (attempt ${retryCount}/${MAX_RETRIES})`);
             retryTimeout = setTimeout(() => {
               if (isCleaned) return;
-              // Properly clean up the dead listener before re-subscribing.
-              // Without this, Firestore throws 'Target ID already exists' because
-              // the old listener's internal target wasn't fully removed.
               unsubscribeShops?.();
               unsubscribeShops = null;
-              // Kick Firestore connection safely on native only before re-subscribing
-              if (Capacitor.isNativePlatform()) {
-                enableNetwork(db).catch(() => {});
-              }
               subscribe();
             }, delay);
           } else {
@@ -706,9 +592,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
             } catch (fetchErr) {
               if (attempt < retries) {
                 console.warn(`[AppContext] Profile fetch attempt ${attempt + 1} failed, retrying...`, fetchErr);
-                if (Capacitor.isNativePlatform()) {
-                  await enableNetwork(db).catch(() => { });
-                }
                 await new Promise(r => setTimeout(r, 1500));
               } else {
                 throw fetchErr;
@@ -867,9 +750,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       // completes, and its handler already has retry logic.
       if (auth.currentUser) {
         console.log('[AppContext] Auth succeeded for:', auth.currentUser.email, '— onAuthStateChanged will handle profile loading');
-        // Gently nudge Firestore to reconnect its WebSocket (the popup may have
-        // caused it to go stale). enableNetwork alone is safe — no disableNetwork.
-        enableNetwork(db).catch(() => { });
       }
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : String(err);
@@ -1925,7 +1805,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         timestamp: now,
       };
 
-      const updatedMessages = [...ticketData.messages, newMessage];
+      const existingMessages = Array.isArray(ticketData.messages) ? ticketData.messages : [];
+      const updatedMessages = [...existingMessages, newMessage];
+
       const updateData: Partial<SupportTicket> = {
         messages: updatedMessages,
         updatedAt: now,
@@ -1935,18 +1817,22 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         updateData.adminLastRepliedAt = now;
         if (ticketData.status === TicketStatus.OPEN) {
           updateData.status = TicketStatus.IN_REVIEW;
-          updateData.statusHistory = [...ticketData.statusHistory, { from: ticketData.status, to: TicketStatus.IN_REVIEW, changedBy: currentUser.id, changedByName: currentUser.name || 'Admin', timestamp: now, note: 'Admin replied' }];
+          const statusChange: TicketStatusChange = { from: ticketData.status, to: TicketStatus.IN_REVIEW, changedBy: currentUser.id, changedByName: currentUser.name || 'Admin', timestamp: now, note: 'Admin replied' };
+          const existingHistory = Array.isArray(ticketData.statusHistory) ? ticketData.statusHistory : [];
+          updateData.statusHistory = [...existingHistory, statusChange];
         }
       } else {
         updateData.raiserLastRepliedAt = now;
       }
 
-      await updateDoc(ticketRef, updateData as { [x: string]: unknown });
+      await updateDoc(ticketRef, updateData as { [x: string]: any });
       return { success: true };
     } catch (err: unknown) {
-      return { success: false, message: getErrorMessage(err) };
+      const errorMessage = getErrorMessage(err);
+      addNotification({ message: `Failed to send reply: ${errorMessage}`, type: 'error' });
+      return { success: false, message: errorMessage };
     }
-  }, [currentUser]);
+  }, [currentUser, addNotification]);
 
   const updateTicketStatus = useCallback(async (ticketId: string, newStatus: TicketStatus, note?: string): Promise<{ success: boolean; message?: string }> => {
     if (!currentUser) return { success: false, message: 'Not logged in' };
@@ -1958,25 +1844,32 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       const ticketData = ticketSnap.data() as SupportTicket;
 
       const now = new Date().toISOString();
-      const statusChange: TicketStatusChange = {
+      const statusChange: Record<string, unknown> = {
         from: ticketData.status,
         to: newStatus,
         changedBy: currentUser.id,
         changedByName: currentUser.name || 'Unknown',
         timestamp: now,
-        note,
       };
+
+      if (note) {
+        statusChange.note = note;
+      }
+
+      const existingHistory = Array.isArray(ticketData.statusHistory) ? ticketData.statusHistory : [];
 
       await updateDoc(ticketRef, {
         status: newStatus,
-        statusHistory: [...ticketData.statusHistory, statusChange],
+        statusHistory: [...existingHistory, statusChange],
         updatedAt: now,
       });
 
       addNotification({ message: `Ticket "${ticketData.subject}" status changed to ${newStatus.replace(/_/g, ' ')}.`, type: 'info', targetUserId: ticketData.raisedBy });
       return { success: true };
     } catch (err: unknown) {
-      return { success: false, message: getErrorMessage(err) };
+      const errorMessage = getErrorMessage(err);
+      addNotification({ message: `Failed to update ticket: ${errorMessage}`, type: 'error' });
+      return { success: false, message: errorMessage };
     }
   }, [currentUser, addNotification]);
 

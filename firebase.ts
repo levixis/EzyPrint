@@ -91,7 +91,6 @@ try {
 } catch (e) {
 }
 
-const isLocalHostname = actualHostname === "localhost" || actualHostname === "127.0.0.1";
 
 // FORCE DISABLE EMULATORS for now to allow connection to live Firebase
 // Change this back to `viteDevMode || isLocalHostname` if you want to use local emulators and have started them with `firebase emulators:start`

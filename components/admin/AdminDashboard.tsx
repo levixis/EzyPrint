@@ -4,7 +4,7 @@ import { ShopProfile, OrderStatus, PayoutStatus, DocumentOrder } from '../../typ
 import AdminShopCard from './AdminShopCard';
 import AdminPayoutModal from './AdminPayoutModal';
 import { Card } from '../common/Card';
-import { Modal } from '../common/Modal';
+import { RefundOtpModal } from '../common/RefundOtpModal';
 import { useGSAP } from '@gsap/react';
 import gsap from 'gsap';
 import TicketList from '../tickets/TicketList';
@@ -30,6 +30,10 @@ const AdminDashboard: React.FC = () => {
   const [refundReason, setRefundReason] = useState('');
   const [isIssuingRefund, setIsIssuingRefund] = useState(false);
   const [refundResult, setRefundResult] = useState<{ success: boolean; message: string } | null>(null);
+
+  // OTP State
+  const [isRequestingOTP, setIsRequestingOTP] = useState(false);
+  const [otpSent, setOtpSent] = useState(false);
 
   // Report generation state
   const [reportStartDate, setReportStartDate] = useState(() => {
@@ -179,9 +183,26 @@ const AdminDashboard: React.FC = () => {
     };
   };
 
-  // Handle refund issuance
-  const handleIssueRefund = async () => {
+  // Handle requesting the OTP
+  const handleRequestOTP = async () => {
     if (!refundModalOrder) return;
+    setIsRequestingOTP(true);
+    setRefundResult(null);
+    try {
+      const functions = getFunctions(app, 'asia-south1');
+      const requestRefundOTPFn = httpsCallable(functions, 'requestRefundOTP');
+      await requestRefundOTPFn({ orderId: refundModalOrder.id });
+      setOtpSent(true);
+      setRefundResult({ success: true, message: 'OTP sent! Please check your admin mailbox.' });
+    } catch (err: any) {
+      setRefundResult({ success: false, message: err.message || 'Failed to send OTP.' });
+    }
+    setIsRequestingOTP(false);
+  };
+
+  // Handle confirming refund with OTP
+  const handleConfirmRefund = async (enteredOtp: string) => {
+    if (!refundModalOrder || !enteredOtp.trim()) return;
     setIsIssuingRefund(true);
     setRefundResult(null);
     try {
@@ -190,11 +211,13 @@ const AdminDashboard: React.FC = () => {
       const result = await initiateRefundFn({
         orderId: refundModalOrder.id,
         reason: refundReason.trim() || 'Admin-initiated refund',
+        otp: enteredOtp.trim(),
       });
       const data = result.data as { success: boolean; message: string };
       setRefundResult({ success: true, message: data.message || 'Refund initiated successfully.' });
+      setOtpSent(false); // Reset
     } catch (err: any) {
-      setRefundResult({ success: false, message: err.message || 'Refund failed. Please try again.' });
+      setRefundResult({ success: false, message: err.message || 'Refund failed. Invalid OTP?' });
     }
     setIsIssuingRefund(false);
   };
@@ -870,90 +893,53 @@ const AdminDashboard: React.FC = () => {
 
       {/* Issue Refund Confirmation Modal */}
       {refundModalOrder && (
-        <Modal
+        <RefundOtpModal
           isOpen={!!refundModalOrder}
-          onClose={() => { setRefundModalOrder(null); setRefundResult(null); setRefundReason(''); }}
-          title="Issue Refund"
-          size="md"
+          onClose={() => { setRefundModalOrder(null); setRefundResult(null); setRefundReason(''); setOtpSent(false); }}
+          orderId={refundModalOrder.id}
+          onConfirm={handleConfirmRefund}
+          onRequestOTP={handleRequestOTP}
+          isIssuingRefund={isIssuingRefund}
+          isRequestingOTP={isRequestingOTP}
+          otpSent={otpSent}
+          resultMessage={refundResult}
         >
-          <div className="space-y-4">
-            {refundResult ? (
-              <div className={`p-4 rounded-xl border ${refundResult.success ? 'bg-emerald-50 dark:bg-emerald-900/20 border-emerald-200 dark:border-emerald-800' : 'bg-red-50 dark:bg-red-900/20 border-red-200 dark:border-red-800'}`}>
-                <p className={`text-sm font-medium ${refundResult.success ? 'text-emerald-700 dark:text-emerald-300' : 'text-red-700 dark:text-red-300'}`}>
-                  {refundResult.success ? '✅' : '❌'} {refundResult.message}
-                </p>
-              </div>
-            ) : (
-              <>
-                <div className="bg-gray-50 dark:bg-zinc-800 rounded-xl p-4 border border-gray-200 dark:border-zinc-700">
-                  <div className="flex justify-between items-center mb-2">
-                    <span className="text-sm text-gray-500 dark:text-gray-400">Order</span>
-                    <span className="text-sm font-mono text-gray-900 dark:text-white">#{refundModalOrder.id.slice(-6)}</span>
-                  </div>
-                  <div className="flex justify-between items-center mb-2">
-                    <span className="text-sm text-gray-500 dark:text-gray-400">Student</span>
-                    <span className="text-sm text-gray-900 dark:text-white">{refundModalOrder.userName || refundModalOrder.userId.slice(-6)}</span>
-                  </div>
-                  <div className="flex justify-between items-center mb-2">
-                    <span className="text-sm text-gray-500 dark:text-gray-400">Payment ID</span>
-                    <span className="text-xs font-mono text-gray-700 dark:text-gray-300">{refundModalOrder.razorpayPaymentId}</span>
-                  </div>
-                  <div className="flex justify-between items-center">
-                    <span className="text-sm text-gray-500 dark:text-gray-400">Refund Amount</span>
-                    <span className="text-lg font-bold text-gray-900 dark:text-white">₹{refundModalOrder.priceDetails.totalPrice.toFixed(2)}</span>
-                  </div>
-                </div>
-
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Reason (optional)</label>
-                  <textarea
-                    value={refundReason}
-                    onChange={(e) => setRefundReason(e.target.value)}
-                    placeholder="e.g. Print quality issue, wrong document printed..."
-                    rows={2}
-                    className="w-full px-3 py-2 rounded-lg bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-700 text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-brand-primary text-sm resize-none"
-                  />
-                </div>
-
-                <div className="p-3 bg-amber-50 dark:bg-amber-900/20 rounded-lg border border-amber-200 dark:border-amber-800">
-                  <p className="text-xs text-amber-700 dark:text-amber-300">
-                    ⚠️ This will issue a full refund of <strong>₹{refundModalOrder.priceDetails.totalPrice.toFixed(2)}</strong> to the student's original payment method. The refund typically takes 5-7 business days.
-                  </p>
-                </div>
-
-                <div className="flex gap-3">
-                  <Button
-                    variant="secondary"
-                    onClick={() => { setRefundModalOrder(null); setRefundResult(null); setRefundReason(''); }}
-                    disabled={isIssuingRefund}
-                    fullWidth
-                  >
-                    Cancel
-                  </Button>
-                  <Button
-                    variant="primary"
-                    onClick={handleIssueRefund}
-                    disabled={isIssuingRefund}
-                    fullWidth
-                    className="!bg-gradient-to-r !from-violet-500 !to-purple-600"
-                  >
-                    {isIssuingRefund ? 'Processing...' : '💸 Confirm Refund'}
-                  </Button>
-                </div>
-              </>
-            )}
-
-            {refundResult && (
-              <Button
-                variant="secondary"
-                onClick={() => { setRefundModalOrder(null); setRefundResult(null); setRefundReason(''); }}
-                fullWidth
-              >
-                Close
-              </Button>
-            )}
+          <div className="bg-gray-50 dark:bg-zinc-800 rounded-xl p-4 border border-gray-200 dark:border-zinc-700 mb-4">
+            <div className="flex justify-between items-center mb-2">
+              <span className="text-sm text-gray-500 dark:text-gray-400">Order</span>
+              <span className="text-sm font-mono text-gray-900 dark:text-white">#{refundModalOrder.id.slice(-6)}</span>
+            </div>
+            <div className="flex justify-between items-center mb-2">
+              <span className="text-sm text-gray-500 dark:text-gray-400">Student</span>
+              <span className="text-sm text-gray-900 dark:text-white">{refundModalOrder.userName || refundModalOrder.userId.slice(-6)}</span>
+            </div>
+            <div className="flex justify-between items-center mb-2">
+              <span className="text-sm text-gray-500 dark:text-gray-400">Payment ID</span>
+              <span className="text-xs font-mono text-gray-700 dark:text-gray-300">{refundModalOrder.razorpayPaymentId}</span>
+            </div>
+            <div className="flex justify-between items-center">
+              <span className="text-sm text-gray-500 dark:text-gray-400">Refund Amount</span>
+              <span className="text-lg font-bold text-gray-900 dark:text-white">₹{refundModalOrder.priceDetails.totalPrice.toFixed(2)}</span>
+            </div>
           </div>
-        </Modal>
+
+          <div className="mb-4">
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Reason (optional)</label>
+            <textarea
+              value={refundReason}
+              onChange={(e) => setRefundReason(e.target.value)}
+              placeholder="e.g. Print quality issue, wrong document printed..."
+              rows={2}
+              className="w-full px-3 py-2 rounded-lg bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-700 text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-brand-primary text-sm resize-none"
+            />
+          </div>
+
+          <div className="p-3 bg-amber-50 dark:bg-amber-900/20 rounded-lg border border-amber-200 dark:border-amber-800 mb-2">
+            <p className="text-xs text-amber-700 dark:text-amber-300">
+              ⚠️ This will issue a full refund of <strong>₹{refundModalOrder.priceDetails.totalPrice.toFixed(2)}</strong> to the student's original payment method. The refund typically takes 5-7 business days.
+            </p>
+          </div>
+        </RefundOtpModal>
       )}
     </div>
   );

@@ -3,7 +3,9 @@ import { SupportTicket, TicketStatus, UserType } from '../../types';
 import { Modal } from '../common/Modal';
 import { Button } from '../common/Button';
 import { useAppContext } from '../../contexts/AppContext';
-import { storage, storageRef, getDownloadURL } from '../../firebase';
+import { storage, storageRef, getDownloadURL, app } from '../../firebase';
+import { getFunctions, httpsCallable } from 'firebase/functions';
+import { RefundOtpModal } from '../common/RefundOtpModal';
 
 interface TicketDetailProps {
   ticket: SupportTicket;
@@ -42,7 +44,7 @@ const getFileIcon = (fileName: string): string => {
 };
 
 const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) => {
-  const { addTicketMessage, updateTicketStatus, currentUser, tickets } = useAppContext();
+  const { addTicketMessage, updateTicketStatus, currentUser, tickets, allOrders } = useAppContext();
   const [replyText, setReplyText] = useState('');
   const [isSending, setIsSending] = useState(false);
   const [isUpdatingStatus, setIsUpdatingStatus] = useState(false);
@@ -56,6 +58,51 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
   const liveTicket = tickets.find(t => t.id === ticket.id) || ticket;
   const isAdmin = currentUser?.type === UserType.ADMIN;
   const isClosed = liveTicket.status === TicketStatus.CLOSED || liveTicket.status === TicketStatus.RESOLVED;
+
+  const relatedOrder = liveTicket.relatedOrderId ? allOrders.find(o => o.id === liveTicket.relatedOrderId) : null;
+  const [isIssuingRefund, setIsIssuingRefund] = useState(false);
+  const [refundResult, setRefundResult] = useState<{ success: boolean; message: string } | null>(null);
+
+  const [isRequestingOTP, setIsRequestingOTP] = useState(false);
+  const [otpSent, setOtpSent] = useState(false);
+  const [isRefundModalOpen, setIsRefundModalOpen] = useState(false);
+
+  const handleRequestOTP = async () => {
+    if (!relatedOrder) return;
+    setIsRequestingOTP(true);
+    setRefundResult(null);
+    try {
+      const functions = getFunctions(app, 'asia-south1');
+      const requestRefundOTPFn = httpsCallable(functions, 'requestRefundOTP');
+      await requestRefundOTPFn({ orderId: relatedOrder.id });
+      setOtpSent(true);
+      setRefundResult({ success: true, message: 'OTP sent to your admin email!' });
+    } catch (err: any) {
+      setRefundResult({ success: false, message: err.message || 'Failed to send OTP.' });
+    }
+    setIsRequestingOTP(false);
+  };
+
+  const handleConfirmRefund = async (enteredOtp: string) => {
+    if (!relatedOrder || !enteredOtp.trim()) return;
+    setIsIssuingRefund(true);
+    setRefundResult(null);
+    try {
+      const functions = getFunctions(app, 'asia-south1');
+      const initiateRefundFn = httpsCallable(functions, 'initiateRefund');
+      const result = await initiateRefundFn({
+        orderId: relatedOrder.id,
+        reason: `Refund requested from Ticket #${liveTicket.id.slice(-6)}`,
+        otp: enteredOtp.trim(),
+      });
+      const data = result.data as { success: boolean; message: string };
+      setRefundResult({ success: true, message: data.message || 'Refund successfully initiated.' });
+      setOtpSent(false);
+    } catch (err: any) {
+      setRefundResult({ success: false, message: err.message || 'Refund failed. Invalid OTP?' });
+    }
+    setIsIssuingRefund(false);
+  };
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -258,6 +305,66 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
                   <Button size="sm" variant="ghost" onClick={() => handleStatusChange(TicketStatus.CLOSED)} disabled={isUpdatingStatus}>
                     🔒 Close
                   </Button>
+                </div>
+              </div>
+            )}
+
+            {/* Payment & Refund Controls (Admin Only) */}
+            {isAdmin && relatedOrder && (
+              <div className="bg-white dark:bg-zinc-900 rounded-xl p-4 border border-gray-200 dark:border-zinc-700 space-y-3">
+                <h5 className="text-xs font-bold text-gray-500 dark:text-gray-400 uppercase tracking-wider">Payment Details</h5>
+                <div className="space-y-2">
+                  <div>
+                    <p className="text-[10px] text-gray-400">Razorpay Payment ID</p>
+                    <p className="text-xs font-mono text-gray-900 dark:text-white break-all">
+                      {relatedOrder.razorpayPaymentId || <span className="text-gray-400 italic">No payment captured</span>}
+                    </p>
+                  </div>
+                  {relatedOrder.refundId ? (
+                    <div>
+                       <p className="text-[10px] text-gray-400">Refund Status</p>
+                       <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
+                         relatedOrder.refundStatus === 'FAILED'
+                           ? 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400'
+                           : relatedOrder.refundStatus === 'processed'
+                             ? 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400'
+                             : 'bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400'
+                       }`}>
+                         {relatedOrder.refundStatus === 'FAILED' ? '❌ Failed' :
+                          relatedOrder.refundStatus === 'processed' ? '✅ Processed' : '⏳ Pending'}
+                       </span>
+                    </div>
+                  ) : relatedOrder.razorpayPaymentId && !isClosed ? (
+                    <>
+                      <Button 
+                        size="sm" 
+                        variant="primary" 
+                        onClick={() => setIsRefundModalOpen(true)}
+                        className="!bg-gradient-to-r !from-violet-500 !to-purple-600 w-full mt-2"
+                      >
+                        💸 Issue Refund
+                      </Button>
+
+                      {isRefundModalOpen && (
+                        <RefundOtpModal
+                          isOpen={isRefundModalOpen}
+                          onClose={() => { setIsRefundModalOpen(false); setRefundResult(null); setOtpSent(false); }}
+                          orderId={relatedOrder.id}
+                          onConfirm={handleConfirmRefund}
+                          onRequestOTP={handleRequestOTP}
+                          isIssuingRefund={isIssuingRefund}
+                          isRequestingOTP={isRequestingOTP}
+                          otpSent={otpSent}
+                          resultMessage={refundResult}
+                        />
+                      )}
+                    </>
+                  ) : null}
+                  {refundResult && !isRefundModalOpen && (
+                    <p className={`text-xs mt-1 p-2 rounded ${refundResult.success ? 'bg-emerald-50 text-emerald-600' : 'bg-red-50 text-red-600'}`}>
+                      {refundResult.message}
+                    </p>
+                  )}
                 </div>
               </div>
             )}

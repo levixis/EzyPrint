@@ -4,6 +4,7 @@ import { onSchedule } from "firebase-functions/v2/scheduler";
 import * as admin from "firebase-admin";
 import Razorpay from "razorpay";
 import * as crypto from "crypto";
+import * as nodemailer from "nodemailer";
 
 admin.initializeApp();
 const db = admin.firestore();
@@ -331,15 +332,39 @@ export const createOrder = onCall(
     // Use multi-file pricing if files[] array exists, else fall back to legacy
     let verifiedPrice: { pageCost: number; baseFee: number; totalPrice: number };
     const filesArray = orderData.files as OrderFileData[] | undefined;
+
+    // SERVER-SIDE HEURISTICS: Prevent Page Count Forgery (Bug 2)
     if (filesArray && filesArray.length > 0) {
+      for (const file of filesArray) {
+        // Hard cap
+        if (file.pageCount > 300) {
+          throw new HttpsError("out-of-range", `File "${file.fileName}" exceeds the 300 page limit.`);
+        }
+        // Size-to-Page Heuristic: An extremely blank PDF page is still ~400 bytes.
+        // E.g. a 10KB file (10,240 bytes) could hold at most ~25 blank pages. 
+        // If they bypass this by spoofing fileSizeBytes, the 300 page cap and the human shopkeeper act as backups.
+        if (file.fileSizeBytes && file.pageCount > 5) {
+          const estimatedMinBytesPerPage = 350;
+          const maxPossiblePages = Math.floor(file.fileSizeBytes / estimatedMinBytesPerPage);
+          if (file.pageCount > maxPossiblePages) {
+            console.warn(`[createOrder] Forgery caught: ${file.fileName} is ${file.fileSizeBytes}B but claims ${file.pageCount} pages.`);
+            throw new HttpsError("invalid-argument", `File "${file.fileName}" claims too many pages (${file.pageCount}) for its physical size.`);
+          }
+        }
+      }
+
       verifiedPrice = calculateMultiFilePrice(
         filesArray,
         shopData.customPricing as ShopPricing,
         hasStudentPass
       );
     } else {
+      const printOpts = orderData.printOptions as PrintOptions;
+      if (printOpts.pages > 300) {
+        throw new HttpsError("out-of-range", "Total pages exceed the 300 limit.");
+      }
       verifiedPrice = calculateOrderPrice(
-        orderData.printOptions as PrintOptions,
+        printOpts,
         shopData.customPricing as ShopPricing,
         hasStudentPass
       );
@@ -467,6 +492,14 @@ export const verifyPayment = onCall(
       );
     }
 
+    // Bug 10: Enforce strict Razorpay Order ID match to prevent replay attacks
+    if (orderData.razorpayOrderId !== razorpay_order_id) {
+      throw new HttpsError(
+        "permission-denied",
+        "Payment verification failed. Razorpay Order ID mismatch."
+      );
+    }
+
     // Signature is valid — update order
     await db.collection("orders").doc(orderId).update({
       status: "PENDING_APPROVAL",
@@ -562,6 +595,97 @@ export const checkPaymentStatus = onCall(
 );
 
 /**
+ * Mailer Transporter (Lazy Loaded for cold start performance)
+ */
+let mailTransporter: nodemailer.Transporter | null = null;
+const getMailTransporter = () => {
+  if (!mailTransporter) {
+    mailTransporter = nodemailer.createTransport({
+      service: "gmail",
+      auth: {
+        user: process.env.GMAIL_USER || "",
+        pass: process.env.GMAIL_APP_PASSWORD || "",
+      },
+    });
+  }
+  return mailTransporter;
+};
+
+/**
+ * requestRefundOTP — Admin-only function to request a 6-digit verification code.
+ * Stores the OTP temporarily in Firestore and emails it securely.
+ */
+export const requestRefundOTP = onCall(
+  { region: "asia-south1", cors: true, secrets: ["GMAIL_USER", "GMAIL_APP_PASSWORD"] },
+  async (request) => {
+    if (!request.auth) throw new HttpsError("unauthenticated", "You must be logged in.");
+
+    const callerDoc = await db.collection("users").doc(request.auth.uid).get();
+    if (!callerDoc.exists || callerDoc.data()?.type !== "ADMIN") {
+      throw new HttpsError("permission-denied", "Only admins can request refund OTPs.");
+    }
+
+    const adminEmail = request.auth.token.email || callerDoc.data()?.email;
+    if (!adminEmail) {
+      throw new HttpsError("failed-precondition", "Admin account lacks a verified email address.");
+    }
+
+    const { orderId } = request.data;
+    if (!orderId) throw new HttpsError("invalid-argument", "orderId is required.");
+
+    // Check if account is locked
+    const otpDoc = await db.collection("refundOtps").doc(request.auth.uid).get();
+    if (otpDoc.exists && otpDoc.data()?.lockUntil && Date.now() < otpDoc.data()?.lockUntil) {
+      const lockRemainingSeconds = Math.ceil((otpDoc.data()!.lockUntil - Date.now()) / 1000);
+      throw new HttpsError("resource-exhausted", `Too many failed attempts. Try again in ${lockRemainingSeconds}s.`);
+    }
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes
+
+    await db.collection("refundOtps").doc(request.auth.uid).set({
+      otp,
+      orderId,
+      expiresAt,
+      failedAttempts: 0,
+    });
+
+    try {
+      const emailHtml = `
+      <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; color: #18181B; border: 1px solid #E4E4E7; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);">
+        <div style="background-color: #EF4444; padding: 24px; text-align: center;">
+          <h1 style="color: #FFFFFF; margin: 0; font-size: 24px; font-weight: bold; letter-spacing: -0.5px;">EzyPrint Security</h1>
+        </div>
+        <div style="padding: 32px 24px;">
+          <p style="margin-top: 0; font-size: 16px; line-height: 1.5;">You requested to issue a refund for Order <strong>#${orderId.slice(-6)}</strong>.</p>
+          <p style="font-size: 16px; line-height: 1.5; margin-bottom: 24px;">Your verification code is:</p>
+          <div style="background-color: #F4F4F5; padding: 16px; border-radius: 8px; text-align: center; margin-bottom: 32px;">
+            <span style="font-size: 32px; font-weight: bold; letter-spacing: 4px; color: #18181B;">${otp}</span>
+          </div>
+          <p style="font-size: 14px; color: #71717A; margin-bottom: 8px;">⚠️ This code will expire in 5 minutes.</p>
+          <p style="font-size: 14px; color: #71717A; margin: 0;">If you did not request this code, please ignore this email and secure your admin account immediately.</p>
+        </div>
+        <div style="background-color: #FAFAFA; border-top: 1px solid #E4E4E7; padding: 16px; text-align: center;">
+          <p style="font-size: 12px; color: #A1A1AA; margin: 0;">© ${new Date().getFullYear()} EzyPrint. All rights reserved.</p>
+        </div>
+      </div>
+      `;
+
+      await getMailTransporter().sendMail({
+        from: `"EzyPrint Security" <${process.env.GMAIL_USER}>`,
+        to: adminEmail,
+        subject: `Verification Code: ${otp} (EzyPrint Refund)`,
+        html: emailHtml,
+      });
+      return { success: true, message: `OTP sent successfully to ${adminEmail}` };
+    } catch (error: any) {
+      console.error("[requestRefundOTP] Failed to send email:", error);
+      throw new HttpsError("internal", "Failed to send OTP email. Verify SMTP settings.");
+    }
+  }
+);
+
+/**
  * initiateRefund — Admin-only function to manually issue a Razorpay refund.
  * Used when admin finds a discrepancy reported via support ticket and wants
  * to refund a student without requiring full order cancellation.
@@ -583,10 +707,45 @@ export const initiateRefund = onCall(
       throw new HttpsError("permission-denied", "Only admins can issue refunds.");
     }
 
-    const { orderId, reason } = request.data;
-    if (!orderId) {
-      throw new HttpsError("invalid-argument", "orderId is required.");
+    const { orderId, reason, otp } = request.data;
+    if (!orderId || !otp) {
+      throw new HttpsError("invalid-argument", "orderId and otp are required.");
     }
+
+    // OTP Verification Block
+    const otpDoc = await db.collection("refundOtps").doc(request.auth.uid).get();
+    if (!otpDoc.exists) {
+      throw new HttpsError("failed-precondition", "No OTP found. Please request a new one.");
+    }
+    const otpData = otpDoc.data()!;
+
+    if (otpData.lockUntil && Date.now() < otpData.lockUntil) {
+      const lockRemainingSeconds = Math.ceil((otpData.lockUntil - Date.now()) / 1000);
+      throw new HttpsError("resource-exhausted", `Too many failed attempts. Try again in ${lockRemainingSeconds}s.`);
+    }
+
+    if (Date.now() > otpData.expiresAt) {
+      await db.collection("refundOtps").doc(request.auth.uid).delete();
+      throw new HttpsError("failed-precondition", "OTP has expired. Please request a new one.");
+    }
+
+    if (otpData.otp !== otp || otpData.orderId !== orderId) {
+      const newAttempts = (otpData.failedAttempts || 0) + 1;
+      if (newAttempts >= 3) {
+        await db.collection("refundOtps").doc(request.auth.uid).update({
+          failedAttempts: newAttempts,
+          lockUntil: Date.now() + 15 * 60 * 1000,
+          otp: "LOCKED",
+        });
+        throw new HttpsError("resource-exhausted", "Too many failed attempts. Try again in 900s.");
+      } else {
+        await db.collection("refundOtps").doc(request.auth.uid).update({ failedAttempts: newAttempts });
+        throw new HttpsError("invalid-argument", `Invalid OTP. ${3 - newAttempts} attempts remaining.`);
+      }
+    }
+
+    // Delete OTP successfully consumed
+    await db.collection("refundOtps").doc(request.auth.uid).delete();
 
     // Fetch the order
     const orderDoc = await db.collection("orders").doc(orderId).get();
@@ -634,6 +793,21 @@ export const initiateRefund = onCall(
       });
 
       console.log(`[initiateRefund] Admin ${request.auth.uid} issued refund ${refund.id} for order #${orderId.slice(-6)}. Status: ${refund.status}, Amount: ₹${((refund.amount || 0) / 100).toFixed(2)}`);
+
+      // Write to refund audit log
+      const ip = request.rawRequest?.ip || request.rawRequest?.headers['x-forwarded-for'] || "unknown";
+      try {
+        await db.collection("refundAuditLog").add({
+          adminUid: request.auth.uid,
+          orderId: orderId,
+          amount: (refund.amount || 0) / 100,
+          timestamp: new Date().toISOString(),
+          ipAddress: ip,
+          reason: reason || "Admin-initiated refund"
+        });
+      } catch (logErr: any) {
+        console.warn("[initiateRefund] Failed to write to audit log:", logErr);
+      }
 
       // Notify the student
       try {
@@ -772,6 +946,22 @@ export const verifyPassPayment = onCall(
       );
     }
 
+    // Verify via Razorpay API to prevent signature spoofing (Bug 3)
+    try {
+      const payment = await getRazorpay().payments.fetch(razorpay_payment_id);
+      if (payment.amount !== 4900) {
+        throw new HttpsError("failed-precondition", "Payment amount mismatch. Expected ₹49.");
+      }
+
+      const rzpOrder = await getRazorpay().orders.fetch(razorpay_order_id);
+      if (rzpOrder.notes?.type !== "student_pass") {
+        throw new HttpsError("failed-precondition", "Invalid order type. Expected student_pass.");
+      }
+    } catch (apiError: any) {
+      console.error(`[verifyPassPayment] Razorpay API verification failed:`, apiError.message);
+      throw new HttpsError("internal", `Payment verification check failed: ${apiError.message}`);
+    }
+
     // Activate Student Pass
     await db.collection("users").doc(request.auth.uid).update({
       hasStudentPass: true,
@@ -824,6 +1014,29 @@ export const onOrderStatusChange = onDocumentUpdated(
           `Order #${orderShortId} (${fileName}) — ₹${afterData.priceDetails?.totalPrice?.toFixed(2) || "?"} paid. Ready to print.`,
           { orderId, type: "new_order" }
         );
+
+        // Bug 12: DB notifications
+        await db.collection("notifications").add({
+          message: `Order #${orderShortId} (${fileName}) at shop is now pending approval.`,
+          type: "success",
+          orderId,
+          recipientUserId: afterData.userId,
+          read: false,
+          timestamp: new Date().toISOString(),
+        });
+        
+        const shopDoc = await db.collection("shops").doc(afterData.shopId).get();
+        if (shopDoc.exists) {
+          await db.collection("notifications").add({
+            message: `Order #${orderShortId} (${fileName}) by ${afterData.userName || "Student"} is now pending approval.`,
+            type: "success",
+            orderId,
+            targetShopId: afterData.shopId,
+            recipientUserId: shopDoc.data()!.ownerUserId,
+            read: false,
+            timestamp: new Date().toISOString(),
+          });
+        }
       } else if (newStatus === "PRINTING") {
         await sendPushToUser(
           afterData.userId,
@@ -839,6 +1052,16 @@ export const onOrderStatusChange = onDocumentUpdated(
           `Order #${orderShortId} is ready! ${pickupCode ? `Pickup code: ${pickupCode}` : "Show your order ID."}`,
           { orderId, type: "order_status", pickupCode }
         );
+
+        // Bug 12: DB Notification
+        await db.collection("notifications").add({
+          message: `Order #${orderShortId} (${fileName}) at shop is now ready for pickup. Pickup code: ${pickupCode}`,
+          type: "success",
+          orderId,
+          recipientUserId: afterData.userId,
+          read: false,
+          timestamp: new Date().toISOString(),
+        });
       } else if (newStatus === "COMPLETED") {
         await sendPushToUser(
           afterData.userId,
@@ -853,6 +1076,18 @@ export const onOrderStatusChange = onDocumentUpdated(
           `Order #${orderShortId} (${fileName}) has been cancelled.${afterData.shopNotes ? " Reason: " + afterData.shopNotes : ""}`,
           { orderId, type: "order_status" }
         );
+
+        // Bug 12: DB Notification
+        let studentMessage = `Order #${orderShortId} has been cancelled by the shop.`;
+        if (afterData.shopNotes) studentMessage += ` Reason: ${afterData.shopNotes}`;
+        await db.collection("notifications").add({
+          message: studentMessage,
+          type: "warning",
+          orderId,
+          recipientUserId: afterData.userId,
+          read: false,
+          timestamp: new Date().toISOString(),
+        });
       } else if (newStatus === "PAYMENT_FAILED") {
         await sendPushToUser(
           afterData.userId,
@@ -860,6 +1095,29 @@ export const onOrderStatusChange = onDocumentUpdated(
           `Payment failed for order #${orderShortId}. Please try again.`,
           { orderId, type: "order_status" }
         );
+
+        // Bug 12: DB Notification
+        await db.collection("notifications").add({
+          message: `Order #${orderShortId} (${fileName}) at shop is now payment failed.`,
+          type: "error",
+          orderId,
+          recipientUserId: afterData.userId,
+          read: false,
+          timestamp: new Date().toISOString(),
+        });
+
+        const shopDoc = await db.collection("shops").doc(afterData.shopId).get();
+        if (shopDoc.exists) {
+          await db.collection("notifications").add({
+            message: `Order #${orderShortId} (${fileName}) by ${afterData.userName || "Student"} is now payment failed.`,
+            type: "error",
+            orderId,
+            targetShopId: afterData.shopId,
+            recipientUserId: shopDoc.data()!.ownerUserId,
+            read: false,
+            timestamp: new Date().toISOString(),
+          });
+        }
       }
     } catch (pushError: any) {
       // Push notification failures should never break the main flow
@@ -1104,6 +1362,17 @@ export const onNewOrder = onDocumentCreated(
         `Order #${orderShortId} (${fileLabel}) — ₹${totalPrice}. Awaiting payment.`,
         { orderId, type: "new_order" }
       );
+
+      // Bug 12: DB notifications
+      await db.collection("notifications").add({
+        message: `Order #${orderShortId} for ${fileLabel} (₹${totalPrice}) placed. Proceed to payment.`,
+        type: "info",
+        orderId,
+        recipientUserId: orderData.userId,
+        read: false,
+        timestamp: new Date().toISOString(),
+      });
+
     } catch (error: any) {
       console.error(`[onNewOrder] Push notification error:`, error.message);
     }
@@ -1504,5 +1773,165 @@ export const generateEarningsReport = onCall(
       totalOrders: ordersSnap.size,
       totalRevenue: parseFloat(totalRevenue.toFixed(2)),
     };
+  }
+);
+
+
+// ---------- BUG 12: SERVER-SIDE NOTIFICATION TRIGGERS ----------
+
+/**
+ * onShopUpdated — Handles shop approval and archiving notifications
+ */
+export const onShopUpdated = onDocumentUpdated(
+  { document: "shops/{shopId}", region: "asia-south1" },
+  async (event) => {
+    const beforeData = event.data?.before.data();
+    const afterData = event.data?.after.data();
+    if (!beforeData || !afterData) return;
+
+    const shopId = event.params.shopId;
+    const notifications = [];
+    const timestamp = new Date().toISOString();
+
+    if (!beforeData.isApproved && afterData.isApproved) {
+      notifications.push({
+        message: `Your shop "${afterData.name}" has been approved by the admin! You can now accept orders.`,
+        type: "success",
+        recipientUserId: afterData.ownerUserId,
+        targetShopId: shopId,
+        read: false,
+        timestamp,
+      });
+    }
+
+    if (!beforeData.isArchived && afterData.isArchived) {
+      notifications.push({
+        message: `Your shop "${afterData.name}" has been archived by the admin. It is no longer visible to students.`,
+        type: "warning",
+        recipientUserId: afterData.ownerUserId,
+        targetShopId: shopId,
+        read: false,
+        timestamp,
+      });
+    }
+
+    if (beforeData.isArchived && !afterData.isArchived) {
+      notifications.push({
+        message: `Your shop "${afterData.name}" has been restored by the admin. You can now accept orders again.`,
+        type: "success",
+        recipientUserId: afterData.ownerUserId,
+        targetShopId: shopId,
+        read: false,
+        timestamp,
+      });
+    }
+
+    if (notifications.length > 0) {
+      const batch = db.batch();
+      for (const notif of notifications) {
+        const docRef = db.collection("notifications").doc();
+        batch.set(docRef, notif);
+      }
+      await batch.commit();
+    }
+  }
+);
+
+/**
+ * onPayoutCreated — Handles payout requests
+ */
+export const onPayoutCreated = onDocumentCreated(
+  { document: "payouts/{payoutId}", region: "asia-south1" },
+  async (event) => {
+    const payoutData = event.data?.data();
+    if (!payoutData) return;
+
+    // Only notify if it's PENDING
+    if (payoutData.status === "PENDING") {
+      const adminsSnap = await db.collection("users").where("type", "==", "ADMIN").get();
+      const batch = db.batch();
+      
+      for (const adminDoc of adminsSnap.docs) {
+        const docRef = db.collection("notifications").doc();
+        batch.set(docRef, {
+          message: `${payoutData.shopName} has requested a payout of ₹${payoutData.amount.toFixed(2)}.`,
+          type: "info",
+          recipientUserId: adminDoc.id,
+          read: false,
+          timestamp: new Date().toISOString(),
+        });
+      }
+      await batch.commit();
+    }
+  }
+);
+
+/**
+ * onTicketCreated — Handles new ticket creation
+ */
+export const onTicketCreated = onDocumentCreated(
+  { document: "tickets/{ticketId}", region: "asia-south1" },
+  async (event) => {
+    const ticketData = event.data?.data();
+    if (!ticketData) return;
+
+    await db.collection("notifications").add({
+      message: `Ticket "${ticketData.subject}" submitted. We'll respond within 24 hours.`,
+      type: "success",
+      recipientUserId: ticketData.raisedBy,
+      read: false,
+      timestamp: new Date().toISOString(),
+    });
+  }
+);
+
+/**
+ * onTicketStatusChangedNotify - explicitly separate from ticket status file cleanup
+ */
+export const onTicketStatusChangedNotify = onDocumentUpdated(
+  { document: "tickets/{ticketId}", region: "asia-south1" },
+  async (event) => {
+    const beforeData = event.data?.before.data();
+    const afterData = event.data?.after.data();
+    if (!beforeData || !afterData) return;
+
+    if (beforeData.status !== afterData.status) {
+      await db.collection("notifications").add({
+        message: `Ticket "${afterData.subject}" status changed to ${afterData.status.replace(/_/g, " ")}.`,
+        type: "info",
+        recipientUserId: afterData.raisedBy,
+        read: false,
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+);
+
+/**
+ * onUserCreated — Handles welcome notifications
+ */
+export const onUserCreated = onDocumentCreated(
+  { document: "users/{userId}", region: "asia-south1" },
+  async (event) => {
+    const userData = event.data?.data();
+    if (!userData) return;
+
+    const userId = event.params.userId;
+    let message = "";
+    if (userData.type === "STUDENT") {
+      message = `Welcome, ${userData.name || "Student"}! Registration successful.`;
+    } else if (userData.type === "SHOP_OWNER") {
+      message = `Welcome, ${userData.name || "Shop Owner"}! Shop registered and is pending admin approval.`;
+    }
+
+    if (message) {
+      await db.collection("notifications").add({
+        message,
+        type: "success",
+        recipientUserId: userId,
+        read: false,
+        timestamp: new Date().toISOString(),
+      });
+    }
   }
 );

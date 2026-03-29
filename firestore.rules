@@ -10,10 +10,23 @@ service cloud.firestore {
              get(/databases/$(database)/documents/users/$(request.auth.uid)).data.type == 'ADMIN';
     }
 
-    // Users can read and write their own profile
-    // Admin can read/write any user profile (for account conversion)
+    // Users can read their own profile, admin can read any
     match /users/{userId} {
-      allow read, write: if request.auth != null && (request.auth.uid == userId || isAdmin());
+      allow read, delete: if request.auth != null && (request.auth.uid == userId || isAdmin());
+      
+      allow create: if request.auth != null && (
+        isAdmin() || 
+        (request.auth.uid == userId && request.resource.data.type in ['STUDENT', 'SHOP_OWNER'])
+      );
+
+      // Bug 8: Block client identity escalation and privilege mutation
+      allow update: if request.auth != null && (
+        isAdmin() || 
+        (
+          request.auth.uid == userId && 
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['type', 'walletBalance', 'hasStudentPass', 'studentPassActivatedAt', 'studentPassPaymentId'])
+        )
+      );
     }
 
     // Shops
@@ -23,15 +36,23 @@ service cloud.firestore {
 
       // Authenticated users who are shop owners can create their shop
       // Ensure the ownerUserId in the new shop document matches the authenticated user
-      allow create: if request.auth != null && request.auth.uid == request.resource.data.ownerUserId;
+      // Bug 11: Shop Verification Bypass
+      allow create: if request.auth != null && 
+                    request.auth.uid == request.resource.data.ownerUserId &&
+                    request.resource.data.isVerified == false &&
+                    request.resource.data.isApproved == false;
 
       // Only the owner of the shop (or admin) can update it
+      // SECURITY: ownerUserId cannot be mutated by shop owner.
       // PRICING VALIDATION: bwPerPage and colorPerPage must be >= 0 to prevent
       // negative pricing attacks that could crash Razorpay or create free orders
       allow update: if request.auth != null &&
-        (request.auth.uid == resource.data.ownerUserId || isAdmin()) &&
-        request.resource.data.customPricing.bwPerPage >= 0 &&
-        request.resource.data.customPricing.colorPerPage >= 0;
+        (isAdmin() || (
+          request.auth.uid == resource.data.ownerUserId &&
+          request.resource.data.ownerUserId == resource.data.ownerUserId &&
+          request.resource.data.customPricing.bwPerPage >= 0 &&
+          request.resource.data.customPricing.colorPerPage >= 0
+        ));
 
       // Only the owner or admin can delete
       allow delete: if request.auth != null && (request.auth.uid == resource.data.ownerUserId || isAdmin());
@@ -39,16 +60,41 @@ service cloud.firestore {
 
     // Orders
     match /orders/{orderId} {
-      // Students can create their own orders
-      allow create: if request.auth != null && request.auth.uid == request.resource.data.userId;
+      // Students can create their own orders (Bug 9: Enforce exact starting status)
+      allow create: if request.auth != null && 
+                    request.auth.uid == request.resource.data.userId &&
+                    request.resource.data.status == 'PENDING_PAYMENT';
 
       // Students can read/update their own orders
       // Shop owners can read/update orders for their shop
       // Admin can read/update any order
-      allow read, update: if request.auth != null && 
+      allow read: if request.auth != null && 
                           (request.auth.uid == resource.data.userId || 
                            resource.data.shopId == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.shopId ||
                            isAdmin());
+
+      // SECURITY: Prevent automated refund theft by restricting status transitions
+      // AND prevent Razorpay Order ID and pricing forgery by freezing financial fields
+      allow update: if request.auth != null && (
+        isAdmin() ||
+        (
+          resource.data.shopId == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.shopId &&
+          request.resource.data.status in ['PENDING_PAYMENT', 'PENDING_APPROVAL', 'PRINTING', 'READY_FOR_PICKUP', 'COMPLETED', 'CANCELLED', 'PAYMENT_FAILED']
+        ) ||
+        (
+          request.auth.uid == resource.data.userId &&
+          // Students can only cancel if it hasn't been printed or completed yet
+          (
+            request.resource.data.status == resource.data.status || 
+            (request.resource.data.status == 'CANCELLED' && resource.data.status in ['PENDING_PAYMENT', 'PENDING_APPROVAL']) ||
+            (request.resource.data.status == 'PAYMENT_FAILED' && resource.data.status == 'PENDING_PAYMENT')
+          )
+        )
+      ) && (
+        // Bug 7: Completely freeze financial indicators on the client side
+        isAdmin() || 
+        (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['razorpayOrderId', 'priceDetails', 'files', 'shopId', 'userId']))
+      );
       
       // Deletion of orders might be restricted or handled by functions
       allow delete: if false;
@@ -68,23 +114,28 @@ service cloud.firestore {
                   resource.data.shopId == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.shopId;
 
       // Shop owners can update status on their own payouts (confirm/dispute)
-      allow update: if request.auth != null && 
-                    resource.data.shopId == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.shopId;
+      allow update: if request.auth != null && (
+                      isAdmin() || (
+                        resource.data.shopId == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.shopId &&
+                        request.resource.data.amount == resource.data.amount &&
+                        request.resource.data.shopId == resource.data.shopId &&
+                        request.resource.data.id == resource.data.id &&
+                        request.resource.data.status in ['CONFIRMED', 'DISPUTED']
+                      )
+                    );
     }
 
     // Notifications — Firestore-backed cross-user notification system
     match /notifications/{notificationId} {
-      // Users can read their own notifications (filtered by recipientUserId)
+      // Bug 12: Users can read/delete their own notifications, admin can delete any
       allow read: if request.auth != null && resource.data.recipientUserId == request.auth.uid;
-
-      // Any authenticated user can create notifications (for cross-user communication)
-      allow create: if request.auth != null;
-
-      // Users can update their own notifications (e.g., mark as read)
-      allow update: if request.auth != null && resource.data.recipientUserId == request.auth.uid;
-
-      // Users can delete their own notifications, admin can delete any
       allow delete: if request.auth != null && (resource.data.recipientUserId == request.auth.uid || isAdmin());
+      
+      // Clients can only update the 'read' status; creation is moved to Cloud Functions
+      allow update: if request.auth != null && 
+                    resource.data.recipientUserId == request.auth.uid &&
+                    request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read']);
+      allow create: if false; // Only Cloud Functions can create
     }
 
     // Bank Details — Private sub-collection for shops
@@ -115,9 +166,17 @@ service cloud.firestore {
       allow read: if request.auth != null &&
         (request.auth.uid == resource.data.raisedBy || isAdmin());
 
-      // Users can update their own tickets (add messages), admin can update any
-      allow update: if request.auth != null &&
-        (request.auth.uid == resource.data.raisedBy || isAdmin());
+      // Users can update their own tickets (Bug 13: append-only messages)
+      allow update: if request.auth != null && (
+        isAdmin() ||
+        (
+          request.auth.uid == resource.data.raisedBy &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['messages', 'raiserLastRepliedAt', 'updatedAt']) &&
+          request.resource.data.messages.hasAll(resource.data.messages) &&
+          request.resource.data.messages.size() == resource.data.messages.size() + 1 &&
+          request.resource.data.messages[request.resource.data.messages.size() - 1].senderId == request.auth.uid
+        )
+      );
 
       // Only admin can delete tickets
       allow delete: if request.auth != null && isAdmin();
@@ -126,6 +185,17 @@ service cloud.firestore {
     // Earnings Reports metadata
     match /reports/{reportId} {
       allow read, write: if request.auth != null && isAdmin();
+    }
+
+    // Secure Refund OTPs (only accessible via Cloud Functions)
+    match /refundOtps/{adminId} {
+      allow read, write: if false;
+    }
+
+    // Refund Audit Log (Admin can read, no one can write directly from client)
+    match /refundAuditLog/{logId} {
+      allow read: if request.auth != null && isAdmin();
+      allow write: if false;
     }
   }
 }

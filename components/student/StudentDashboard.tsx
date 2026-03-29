@@ -127,25 +127,25 @@ const StudentDashboard: React.FC<StudentDashboardProps> = ({ userId, onNavigateT
         )}
       </Card>
 
+      <Card 
+        title="Support Tickets" 
+        className="bg-brand-secondary/80 backdrop-blur-sm"
+        actions={
+          <Button variant="primary" size="sm" onClick={() => setShowTicketForm(true)}>
+            Raise Ticket
+          </Button>
+        }
+      >
+        {tickets.length > 0 ? (
+          <TicketList tickets={tickets} />
+        ) : (
+          <p className="text-brand-lightText text-center py-4">No tickets raised yet.</p>
+        )}
+      </Card>
+
       {/* Settings Modal */}
       <Modal isOpen={isSettingsModalOpen} onClose={() => setIsSettingsModalOpen(false)} title="Student Settings" size="lg">
         <div className="space-y-6 pb-2">
-          {/* Support Tickets */}
-          <div className="space-y-3">
-            <div className="flex items-center justify-between">
-              <h4 className="text-sm font-semibold text-brand-lightText dark:text-gray-400 uppercase tracking-wider">Support</h4>
-              <Button variant="primary" size="sm" onClick={() => setShowTicketForm(true)}>
-                Raise Ticket
-              </Button>
-            </div>
-            {tickets.length > 0 ? (
-              <TicketList tickets={tickets} />
-            ) : (
-              <p className="text-brand-lightText text-center py-4 bg-gray-50 dark:bg-zinc-800/50 rounded-xl">No tickets raised yet.</p>
-            )}
-          </div>
-
-          <div className="h-px bg-gray-200 dark:bg-zinc-700" />
 
           {/* Account Management */}
           <div className="space-y-3">
