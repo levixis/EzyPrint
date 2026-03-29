@@ -42,17 +42,23 @@ export const Modal: React.FC<ModalProps> = ({ isOpen, onClose, title, children, 
 
   const modalContent = (
     <div 
-      className={`fixed inset-0 z-[100] flex ${isFull ? 'items-center p-0' : 'items-end p-0 sm:items-center sm:p-4'} justify-center transition-opacity duration-300 ease-out
+      className={`fixed inset-0 z-[100] flex ${isFull ? 'items-center p-0 m-0' : 'items-end p-0 sm:items-center sm:p-4'} justify-center transition-opacity duration-300 ease-out
                   ${isOpen ? 'opacity-100 bg-brand-bg/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`}
       aria-labelledby="modal-title" 
       role="dialog" 
       aria-modal="true"
     >
       <div 
-        className={`bg-brand-secondary ${isFull ? 'rounded-none h-[100dvh] sm:h-auto sm:rounded-xl' : 'rounded-t-2xl sm:rounded-xl my-0 sm:my-8'} text-left overflow-hidden shadow-modal transform transition-all duration-300 ease-out sm:align-middle w-full ${sizeClasses[size]} flex flex-col
+        className={`bg-brand-secondary ${isFull ? 'rounded-none h-[100dvh] w-full sm:h-auto sm:rounded-xl' : 'rounded-t-2xl sm:rounded-xl my-0 sm:my-8 w-full'} text-left overflow-hidden shadow-modal transform transition-all duration-300 ease-out sm:align-middle ${sizeClasses[size]} flex flex-col
                     ${isOpen ? 'opacity-100 translate-y-0 sm:scale-100' : `opacity-0 ${isFull ? 'translate-y-4' : 'translate-y-8'} sm:translate-y-0 sm:scale-95`}`}
       >
-        <div className={`px-4 pt-5 pb-4 sm:p-6 sm:pb-5 ${isFull ? 'flex-1 flex flex-col min-h-0' : ''}`}>
+        <div 
+          className={`px-4 pt-5 pb-4 sm:p-6 sm:pb-5 ${isFull ? 'flex-1 flex flex-col min-h-0' : ''}`}
+          style={{
+            paddingTop: isFull ? 'max(1.5rem, calc(env(safe-area-inset-top) + 0.75rem))' : undefined,
+            paddingBottom: (hideCloseButton && !footerContent) ? 'max(1rem, calc(env(safe-area-inset-bottom) + 0.5rem))' : undefined
+          }}
+        >
           <div className="sm:flex sm:items-start w-full h-full">
             <div className={`mt-3 text-center sm:mt-0 sm:text-left w-full ${isFull ? 'flex-1 flex flex-col min-h-0' : ''}`}>
               {(title || !hideCloseButton) && (
@@ -76,7 +82,10 @@ export const Modal: React.FC<ModalProps> = ({ isOpen, onClose, title, children, 
           </div>
         </div>
         {(footerContent || !hideCloseButton) && (
-          <div className="bg-brand-secondaryLight/50 px-4 py-3 sm:px-6 flex justify-end sm:flex-row-reverse items-center w-full">
+          <div 
+            className="bg-brand-secondaryLight/50 px-4 py-3 sm:px-6 flex justify-end sm:flex-row-reverse items-center w-full"
+            style={{ paddingBottom: 'max(0.75rem, calc(env(safe-area-inset-bottom) + 0.25rem))' }}
+          >
             {footerContent}
             {!hideCloseButton && !footerContent && (
                  <Button onClick={onClose} variant="secondary" size="sm">
