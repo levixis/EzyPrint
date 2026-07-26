@@ -10,10 +10,14 @@ export interface User {
   type: UserType;
   name?: string;
   email?: string;
+  phone?: string;
   shopId?: string;
   hasStudentPass?: boolean;
   studentPassActivatedAt?: string; // ISO date string — pass expires 30 days after this
+  studentPassPaymentId?: string;
   fcmTokens?: string[]; // Push notification device tokens
+  profilePhotoUrl?: string;
+  preferredLanguage?: string;
 }
 
 export interface ShopPricing {
@@ -49,16 +53,26 @@ export interface ShopProfile {
   ownerUserId: string;
   name: string;
   address: string;
+  createdAt?: string;
   customPricing: ShopPricing;
   isOpen: boolean;
   isApproved: boolean; // Admin must approve before shop is visible to students
   isArchived?: boolean; // Admin can archive shops — hides from students but keeps data
-  payoutMethods?: PayoutMethod[]; // Updated to support multiple payout methods
   // Store Contact Info
   contactPhone?: string;
   contactPhoneAlt?: string;
   contactEmail?: string;
   whatsappNumber?: string;
+  isVerified?: boolean;
+  // Ledger balances
+  pendingBalance?: number;
+  ledgerBalance?: number;
+  debtAmount?: number;
+  lastSettlementAt?: string;
+  financialVersion?: number;
+  // Migration Flags
+  migrationVerified?: boolean;
+  migratedAt?: string;
 }
 
 export enum PrintColor {
@@ -74,6 +88,7 @@ export enum OrderStatus {
   COMPLETED = 'COMPLETED',
   CANCELLED = 'CANCELLED',
   PAYMENT_FAILED = 'PAYMENT_FAILED',
+  REFUNDED = 'REFUNDED',
 }
 
 export interface PrintOptions {
@@ -101,6 +116,8 @@ export interface DocumentOrder {
   id: string;
   userId: string;
   shopId: string;
+  shopName?: string;
+  deletedShop?: boolean;
   fileName: string;      // Legacy: first file name (backward compat)
   fileType: string;       // Legacy: first file type (backward compat)
   fileStoragePath?: string; // Legacy: first file storage path
@@ -128,7 +145,14 @@ export interface DocumentOrder {
   refundStatus?: string; // "processed", "pending", "FAILED"
   refundAmount?: number;
   refundedAt?: string;
+  cancelledAt?: string;
+  completedAt?: string;
   refundError?: string;
+  refundInitiatedBy?: string;
+  refundReason?: string;
+  refundProcessingStartedAt?: string;
+  // Ledger tracking
+  ledgerEntryId?: string; // Links to shopLedger doc for O(1) lookups
   // Payment verification method
   paymentVerifiedVia?: string; // "signature", "api_fallback", "manual_check"
 }
@@ -151,6 +175,8 @@ export enum PayoutStatus {
   PAID = 'PAID',
   CONFIRMED = 'CONFIRMED',
   DISPUTED = 'DISPUTED',
+  REJECTED = 'REJECTED',
+  CANCELLED = 'CANCELLED',
 }
 
 export interface ShopPayout {
@@ -158,6 +184,7 @@ export interface ShopPayout {
   shopId: string;
   shopName: string;
   amount: number;
+  payoutOrderIds?: string[];
   adminNote?: string;
   shopOwnerNote?: string;
   status: PayoutStatus;
@@ -177,8 +204,7 @@ export type AppView =
   | 'refund'
   | 'shipping'
   | 'contact'
-  | 'getPass'
-  | 'tickets';
+  | 'getPass';
 
 // --- Bank Details (stored in shops/{shopId}/private/bankDetails sub-collection) ---
 export type BankAccountType = 'SAVINGS' | 'CURRENT';
@@ -192,6 +218,13 @@ export interface BankDetails {
   upiId?: string;
   isVerified?: boolean; // Admin sets this
   verifiedAt?: string;
+  verifiedBy?: string;
+  updatedAt?: string;
+}
+
+// --- Payment Config (stored in shops/{shopId}/private/paymentConfig sub-collection) ---
+export interface PaymentConfiguration {
+  payoutMethods: PayoutMethod[];
   updatedAt?: string;
 }
 
@@ -244,18 +277,22 @@ export interface SupportTicket {
   raisedByName: string;
   raisedByEmail?: string;
   shopId?: string; // Only for shop-owner tickets
+  shopName?: string;
+  deletedShop?: boolean;
   relatedOrderId?: string;
   subject: string;
   category: TicketCategory;
   description: string;
   status: TicketStatus;
-  attachmentPaths: string[]; // Firebase Storage paths
+  attachmentPaths?: string[]; // Firebase Storage paths — absent if no files were uploaded
   messages: TicketMessage[];
   statusHistory: TicketStatusChange[];
   createdAt: string;
   updatedAt: string;
   adminLastRepliedAt?: string;
   raiserLastRepliedAt?: string;
+  shopLastRepliedAt?: string;
+  attachmentsCleanedAt?: string;
 }
 
 // --- Earnings Reports ---
@@ -272,4 +309,110 @@ export interface EarningsReport {
   downloadUrl: string;
   generatedAt: string;
   generatedBy: string;
+}
+
+// --- Reactivation Requests ---
+export type ReactivationRequestStatus = 'pending' | 'approved' | 'rejected';
+
+export interface ReactivationRequest {
+  id: string;
+  shopId: string;
+  ownerUid: string;
+  ownerEmail: string;
+  ownerName: string;
+  shopName: string;
+  requestedAt: string;
+  status: ReactivationRequestStatus;
+  resolvedAt?: string;
+  resolvedBy?: string;
+  rejectionReason?: string;
+}
+
+// --- Ledger System ---
+export enum LedgerEntryType {
+  ORDER_EARNING = 'ORDER_EARNING',
+  REFUND_DEDUCTION = 'REFUND_DEDUCTION',
+  PAYOUT = 'PAYOUT',
+  MANUAL_PAYOUT_DEDUCTION = 'MANUAL_PAYOUT_DEDUCTION',
+  PAYOUT_CANCEL_REFUND = 'PAYOUT_CANCEL_REFUND',
+  PAYOUT_REJECT_REFUND = 'PAYOUT_REJECT_REFUND',
+  CLAWBACK = 'CLAWBACK',
+  ADJUSTMENT = 'ADJUSTMENT',
+}
+
+export enum LedgerEntryStatus {
+  PENDING = 'PENDING',   // Within settlement window (24h)
+  SETTLED = 'SETTLED',   // Claimable — moved to ledgerBalance
+  VOID = 'VOID',         // Refunded during pending window
+}
+
+export type LedgerCounterparty = 'PLATFORM' | 'SHOP' | 'STUDENT';
+
+export interface ShopLedgerEntry {
+  id: string;
+  eventId?: string; // Deterministic dedup key (e.g. earn_<orderId>, refund_<orderId>, payout_<payoutId>)
+  shopId: string;
+  orderId?: string;
+  type: LedgerEntryType;
+  status: LedgerEntryStatus;
+  amount: number;
+  counterparty: LedgerCounterparty;
+  description: string;
+  createdBy: 'SYSTEM' | 'ADMIN' | 'SHOP';
+  createdAt: string;
+  settledAt?: string;
+}
+
+export interface ShopAggregate {
+  shopId: string;
+  totalOrders: number;
+  activeOrders: number;
+  completedOrders: number;
+  totalRevenue: number;
+  totalBaseFees: number;
+  totalPaidOut: number;
+  pendingPayouts: number;
+  pendingPayoutCount: number;
+  updatedAt?: string;
+}
+
+// --- Refund Requests ---
+export enum RefundRequestStatus {
+  PENDING_SHOP = 'PENDING_SHOP',
+  APPROVED_BY_SHOP = 'APPROVED_BY_SHOP',
+  REJECTED_BY_SHOP = 'REJECTED_BY_SHOP',
+  ESCALATED_TO_ADMIN = 'ESCALATED_TO_ADMIN',
+  AUTO_ESCALATED = 'AUTO_ESCALATED',
+  RESOLVED_REFUNDED = 'RESOLVED_REFUNDED',
+  RESOLVED_DENIED = 'RESOLVED_DENIED',
+}
+
+export interface RefundRequest {
+  id: string;
+  orderId: string;
+  studentId: string;
+  shopId: string;
+  reason: string;
+  status: RefundRequestStatus;
+  refundAmount?: number;
+  razorpayRefundId?: string;
+  studentRequestedAt: string;
+  shopRespondedAt?: string;
+  shopResponse?: string;
+  adminResolvedAt?: string;
+  adminNote?: string;
+  resolvedBy?: string;
+}
+
+export interface RazorpayRefund {
+  id: string;
+  amount: number;
+  status: 'pending' | 'processed' | 'failed' | string;
+  created_at: number;
+  payment_id: string;
+  notes?: Record<string, string>;
+  receipt?: string;
+  acquirer_data?: {
+    arn?: string;
+  };
 }

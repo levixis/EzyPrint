@@ -1,7 +1,7 @@
 
-import React, { useState, useMemo } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useAppContext } from '../../contexts/AppContext';
-import { OrderStatus, ShopPricing, PayoutMethod, PayoutStatus } from '../../types';
+import { LedgerEntryStatus, LedgerEntryType, OrderStatus, PayoutMethod, PayoutStatus, ShopAggregate, ShopLedgerEntry, ShopPricing } from '../../types';
 import ShopOrderList from './ShopOrderList';
 import ShopOrderDetailsModal from './ShopOrderDetailsModal';
 import ShopSettingsModal from './ShopSettingsModal';
@@ -9,17 +9,52 @@ import { Card } from '../common/Card';
 import { Button } from '../common/Button';
 import TicketForm from '../tickets/TicketForm';
 import TicketList from '../tickets/TicketList';
+import { collection, db, doc, limit, onSnapshot, orderBy, query, where } from '../../firebase';
 
 interface ShopDashboardProps {
   shopId: string;
 }
-
-import { useRef } from 'react';
 import { useGSAP } from '@gsap/react';
 import gsap from 'gsap';
 
+const getLedgerEntryTone = (entry: ShopLedgerEntry) => {
+  if (entry.type === LedgerEntryType.PAYOUT) {
+    return 'bg-rose-50 dark:bg-rose-900/20 border-rose-200 dark:border-rose-800/30';
+  }
+  if (entry.type === LedgerEntryType.REFUND_DEDUCTION || entry.type === LedgerEntryType.CLAWBACK) {
+    return 'bg-amber-50 dark:bg-amber-900/20 border-amber-200 dark:border-amber-800/30';
+  }
+  if (entry.status === LedgerEntryStatus.PENDING) {
+    return 'bg-indigo-50 dark:bg-indigo-900/20 border-indigo-200 dark:border-indigo-800/30';
+  }
+  return 'bg-emerald-50 dark:bg-emerald-900/20 border-emerald-200 dark:border-emerald-800/30';
+};
+
+const getLedgerEntryLabel = (entry: ShopLedgerEntry) => {
+  switch (entry.type) {
+    case LedgerEntryType.ORDER_EARNING:
+      return entry.status === LedgerEntryStatus.PENDING ? 'Order earning pending settlement' : 'Order earning settled';
+    case LedgerEntryType.PAYOUT:
+      return 'Payout reserve / withdrawal';
+    case LedgerEntryType.MANUAL_PAYOUT_DEDUCTION:
+      return 'Manual payout deduction';
+    case LedgerEntryType.REFUND_DEDUCTION:
+      return 'Refund deduction';
+    case LedgerEntryType.PAYOUT_CANCEL_REFUND:
+      return 'Payout cancellation reversal';
+    case LedgerEntryType.PAYOUT_REJECT_REFUND:
+      return 'Payout rejection reversal';
+    case LedgerEntryType.CLAWBACK:
+      return 'Clawback / adjustment';
+    case LedgerEntryType.ADJUSTMENT:
+      return 'Manual adjustment';
+    default:
+      return entry.description || 'Ledger activity';
+  }
+};
+
 const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
-  const { getOrdersForCurrentUser, updateOrderStatus, getShopById, updateShopSettings, payouts, requestPayout, confirmPayout, disputePayout, tickets } = useAppContext();
+  const { getOrdersForCurrentUser, updateOrderStatus, getShopById, updateShopSettings, payouts, requestPayout, confirmPayout, disputePayout, tickets, loadMoreOrders, ordersLimit, loadMorePayouts, payoutsLimit } = useAppContext();
   const [selectedOrderId, setSelectedOrderId] = useState<string | null>(null);
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
   const [disputePayoutId, setDisputePayoutId] = useState<string | null>(null);
@@ -28,13 +63,48 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
   const [payoutRequestNote, setPayoutRequestNote] = useState('');
   const [isRequestingPayout, setIsRequestingPayout] = useState(false);
   const [showPayoutRequestForm, setShowPayoutRequestForm] = useState(false);
-  const [activeTab, setActiveTab] = useState<'orders' | 'earnings' | 'payouts' | 'support'>('orders');
+  const [activeTab, setActiveTab] = useState<'orders' | 'payouts' | 'support'>('orders');
   const [orderView, setOrderView] = useState<'today' | 'history'>('today');
   const [showTicketForm, setShowTicketForm] = useState(false);
+  const [ledgerEntries, setLedgerEntries] = useState<ShopLedgerEntry[]>([]);
+  const [ledgerError, setLedgerError] = useState(false);
+  const [shopAggregate, setShopAggregate] = useState<ShopAggregate | null>(null);
 
   const dashboardRef = useRef<HTMLDivElement>(null);
 
   const allShopOrders = getOrdersForCurrentUser();
+
+  useEffect(() => {
+    const ledgerQuery = query(
+      collection(db, "shopLedger"),
+      where("shopId", "==", shopId),
+      orderBy("createdAt", "desc"),
+      limit(300)
+    );
+
+    const unsubscribeLedger = onSnapshot(ledgerQuery, (querySnapshot) => {
+      const fetchedEntries: ShopLedgerEntry[] = [];
+      querySnapshot.forEach((docSnap) => {
+        fetchedEntries.push({ id: docSnap.id, ...docSnap.data() } as ShopLedgerEntry);
+      });
+      setLedgerEntries(fetchedEntries);
+      setLedgerError(false);
+    }, (error) => {
+      console.error("[ShopDashboard] Ledger listener error:", error);
+      setLedgerError(true);
+    });
+
+    return () => unsubscribeLedger();
+  }, [shopId]);
+
+  useEffect(() => {
+    const aggregateRef = doc(db, "shopAggregates", shopId);
+    const unsubscribeAggregate = onSnapshot(aggregateRef, (docSnap) => {
+      setShopAggregate(docSnap.exists() ? ({ shopId: docSnap.id, ...docSnap.data() } as ShopAggregate) : null);
+    });
+
+    return () => unsubscribeAggregate();
+  }, [shopId]);
 
   // Derive selectedOrder from live orders so it always reflects real-time Firestore data
   const selectedOrder = useMemo(() => {
@@ -45,45 +115,50 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
   const shopPayouts = payouts.filter(p => p.shopId === shopId);
 
   // --- Computed Stats ---
-  const completedOrders = useMemo(() =>
-    allShopOrders.filter(o => o.status === OrderStatus.COMPLETED), [allShopOrders]);
-
-  const totalEarned = useMemo(() =>
-    completedOrders.reduce((sum, order) => sum + (order.priceDetails?.pageCost || 0), 0),
-    [completedOrders]);
+  const fallbackCompletedOrderCount = useMemo(() =>
+    allShopOrders.filter(o => o.status === OrderStatus.COMPLETED).length, [allShopOrders]);
 
   const totalPaidOut = useMemo(() =>
+    shopAggregate?.totalPaidOut ??
     shopPayouts
       .filter(p => p.status === PayoutStatus.PAID || p.status === PayoutStatus.CONFIRMED)
       .reduce((sum, payout) => sum + payout.amount, 0),
-    [shopPayouts]);
+    [shopAggregate, shopPayouts]);
 
-  const redeemableAmount = Math.max(0, totalEarned - totalPaidOut);
+  const rawLedgerBalance = shopProfile?.ledgerBalance || 0;
+  const redeemableAmount = Math.max(0, rawLedgerBalance);
+  const pendingAmount = shopProfile?.pendingBalance || 0;
+  const debtAmount = shopProfile?.debtAmount || 0;
+  const lifetimeNetEarned = rawLedgerBalance + pendingAmount + totalPaidOut;
+  const hasRefundOffset = debtAmount > 0;
 
-  // Time-based earnings
-  const now = new Date();
-  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const weekStart = new Date(todayStart);
-  weekStart.setDate(weekStart.getDate() - weekStart.getDay());
-  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-
-  const todayEarnings = useMemo(() =>
-    completedOrders
-      .filter(o => new Date(o.uploadedAt) >= todayStart)
-      .reduce((sum, o) => sum + (o.priceDetails?.pageCost || 0), 0),
-    [completedOrders, todayStart]);
-
-  const weekEarnings = useMemo(() =>
-    completedOrders
-      .filter(o => new Date(o.uploadedAt) >= weekStart)
-      .reduce((sum, o) => sum + (o.priceDetails?.pageCost || 0), 0),
-    [completedOrders, weekStart]);
-
-  const monthEarnings = useMemo(() =>
-    completedOrders
-      .filter(o => new Date(o.uploadedAt) >= monthStart)
-      .reduce((sum, o) => sum + (o.priceDetails?.pageCost || 0), 0),
-    [completedOrders, monthStart]);
+  const todayStart = useMemo(() => {
+    const now = new Date();
+    return new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  }, []);
+  const todayStartIso = useMemo(() => todayStart.toISOString(), [todayStart]);
+  const sortedLedgerEntries = useMemo(
+    () => [...ledgerEntries].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()),
+    [ledgerEntries]
+  );
+  const todayEarnings = useMemo(
+    () => sortedLedgerEntries
+      .filter(entry =>
+        entry.type === LedgerEntryType.ORDER_EARNING &&
+        entry.status !== LedgerEntryStatus.VOID &&
+        entry.amount > 0 &&
+        entry.createdAt >= todayStartIso
+      )
+      .reduce((sum, entry) => sum + entry.amount, 0),
+    [sortedLedgerEntries, todayStartIso]
+  );
+  const recentLedgerEntries = useMemo(() => sortedLedgerEntries.slice(0, 6), [sortedLedgerEntries]);
+  const lastSettlementAt = useMemo(() => {
+    const settledEntry = [...sortedLedgerEntries]
+      .filter(entry => entry.settledAt)
+      .sort((a, b) => new Date(b.settledAt || b.createdAt).getTime() - new Date(a.settledAt || a.createdAt).getTime())[0];
+    return settledEntry?.settledAt || null;
+  }, [sortedLedgerEntries]);
 
   // Active orders count
   const pendingOrders = allShopOrders.filter(o =>
@@ -92,13 +167,10 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
   const activeOrders = allShopOrders.filter(o =>
     [OrderStatus.PENDING_APPROVAL, OrderStatus.PRINTING, OrderStatus.READY_FOR_PICKUP].includes(o.status)
   );
+  const activeOrderCount = shopAggregate?.activeOrders ?? activeOrders.length;
+  const completedOrderCount = shopAggregate?.completedOrders ?? fallbackCompletedOrderCount;
 
-  // Recent completed orders for earnings tab
-  const recentCompleted = useMemo(() =>
-    completedOrders
-      .sort((a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime())
-      .slice(0, 10),
-    [completedOrders]);
+
 
   useGSAP(() => {
     gsap.set(".dashboard-item", { opacity: 1, y: 0 });
@@ -112,8 +184,8 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
   const handleOpenSettingsModal = () => setIsSettingsModalOpen(true);
   const handleCloseSettingsModal = () => setIsSettingsModalOpen(false);
 
-  const handleSaveShopSettings = (sId: string, newSettings: { pricing: ShopPricing; isOpen: boolean; payoutMethods?: PayoutMethod[]; contactPhone?: string; contactPhoneAlt?: string; contactEmail?: string; whatsappNumber?: string }) => {
-    updateShopSettings(sId, newSettings);
+  const handleSaveShopSettings = async (sId: string, newSettings: { pricing: ShopPricing; isOpen: boolean; payoutMethods?: PayoutMethod[]; contactPhone?: string; contactPhoneAlt?: string; contactEmail?: string; whatsappNumber?: string }) => {
+    return updateShopSettings(sId, newSettings);
   };
 
   const handleConfirmPayout = async (payoutId: string) => {
@@ -128,7 +200,7 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
     }
   };
 
-  const shopRelevantOrders = allShopOrders.filter(o => o.status !== OrderStatus.PENDING_PAYMENT && o.status !== OrderStatus.PAYMENT_FAILED && o.status !== OrderStatus.CANCELLED);
+  const shopRelevantOrders = allShopOrders.filter(o => o.status !== OrderStatus.PENDING_PAYMENT && o.status !== OrderStatus.PAYMENT_FAILED);
 
   // Today's orders — filtered from shopRelevantOrders by upload date
   const todayOrders = useMemo(() =>
@@ -197,13 +269,14 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
       case PayoutStatus.PAID: return 'bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400 border-blue-300 dark:border-blue-700';
       case PayoutStatus.CONFIRMED: return 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400 border-emerald-300 dark:border-emerald-700';
       case PayoutStatus.DISPUTED: return 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400 border-red-300 dark:border-red-700';
-      default: return 'bg-gray-100 dark:bg-zinc-800 text-gray-600 dark:text-gray-400 border-gray-300 dark:border-zinc-700';
+      case PayoutStatus.CANCELLED: return 'bg-slate-100 dark:bg-slate-800/50 text-slate-500 dark:text-slate-400 border-slate-200 dark:border-slate-700 opacity-75 line-through';
+      case PayoutStatus.REJECTED: return 'bg-rose-100 dark:bg-rose-900/30 text-rose-700 dark:text-rose-400 border-rose-300 dark:border-rose-700 opacity-75 line-through';
+      default: return 'bg-gray-100 dark:bg-zinc-800/50 text-gray-500 dark:text-gray-400 border-gray-200 dark:border-zinc-700';
     }
   };
 
   const tabs = [
     { key: 'orders' as const, label: 'Orders', badge: pendingOrders.length > 0 ? pendingOrders.length : undefined },
-    { key: 'earnings' as const, label: 'Earnings' },
     { key: 'payouts' as const, label: 'Payouts', badge: shopPayouts.filter(p => p.status === PayoutStatus.PAID).length > 0 ? shopPayouts.filter(p => p.status === PayoutStatus.PAID).length : undefined },
     { key: 'support' as const, label: 'Support', badge: tickets.filter(t => t.status !== 'CLOSED' && t.status !== 'RESOLVED').length > 0 ? tickets.filter(t => t.status !== 'CLOSED' && t.status !== 'RESOLVED').length : undefined },
   ];
@@ -231,11 +304,11 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
         </button>
       </div>
 
-      {/* Quick Stats Bar — always visible */}
-      <div className="grid grid-cols-3 gap-2.5 sm:gap-4 dashboard-item">
+      {/* Earnings + ops snapshot */}
+      <div className="grid grid-cols-2 xl:grid-cols-4 gap-2.5 sm:gap-4 dashboard-item">
         <div className="bg-white dark:bg-zinc-900 rounded-xl sm:rounded-2xl p-3 sm:p-4 border border-gray-200 dark:border-zinc-700 shadow-sm text-center">
           <div className="relative inline-block">
-            <p className="text-2xl sm:text-3xl font-bold text-brand-primary">{activeOrders.length}</p>
+            <p className="text-2xl sm:text-3xl font-bold text-brand-primary">{activeOrderCount}</p>
             {pendingOrders.length > 0 && (
               <span className="absolute -top-1 -right-4 w-5 h-5 bg-red-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center animate-pulse">
                 {pendingOrders.length}
@@ -246,13 +319,34 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
         </div>
         <div className="bg-white dark:bg-zinc-900 rounded-xl sm:rounded-2xl p-3 sm:p-4 border border-gray-200 dark:border-zinc-700 shadow-sm text-center">
           <p className="text-2xl sm:text-3xl font-bold text-emerald-600 dark:text-emerald-400">₹{todayEarnings.toFixed(0)}</p>
-          <p className="text-[10px] sm:text-xs text-gray-500 dark:text-gray-400 mt-0.5">Today</p>
+          <p className="text-[10px] sm:text-xs text-gray-500 dark:text-gray-400 mt-0.5">Today's Earnings</p>
+          <p className="text-[9px] text-gray-400 dark:text-gray-500 mt-0.5">Backend ledger tracked</p>
+        </div>
+        <div className="bg-white dark:bg-zinc-900 rounded-xl sm:rounded-2xl p-3 sm:p-4 border border-gray-200 dark:border-zinc-700 shadow-sm text-center">
+          <p className="text-2xl sm:text-3xl font-bold text-amber-600 dark:text-amber-400">₹{pendingAmount.toFixed(0)}</p>
+          <p className="text-[10px] sm:text-xs text-gray-500 dark:text-gray-400 mt-0.5">Pending Settlement</p>
+          <p className="text-[9px] text-gray-400 dark:text-gray-500 mt-0.5">Moves to balance after settlement window</p>
         </div>
         <div className="bg-gradient-to-br from-indigo-500 to-purple-600 rounded-xl sm:rounded-2xl p-3 sm:p-4 shadow-md text-center">
           <p className="text-2xl sm:text-3xl font-bold text-white">₹{redeemableAmount.toFixed(0)}</p>
-          <p className="text-[10px] sm:text-xs text-indigo-100 mt-0.5">Redeemable</p>
+          <div className="flex flex-col items-center mt-0.5">
+            <p className="text-[10px] sm:text-xs text-indigo-100">Redeemable Balance</p>
+            <p className="text-[9px] text-indigo-200 mt-0.5">Available to request now</p>
+          </div>
         </div>
       </div>
+
+      {hasRefundOffset && (
+        <div className="dashboard-item rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 shadow-sm dark:border-amber-900/40 dark:bg-amber-900/20 dark:text-amber-200">
+          Your account has an outstanding refund adjustment of ₹{debtAmount.toFixed(2)}. Your next earnings will offset this automatically.
+        </div>
+      )}
+
+      {ledgerError && (
+        <div className="dashboard-item rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800 shadow-sm dark:border-red-900/40 dark:bg-red-900/20 dark:text-red-200">
+          ⚠️ Unable to load earnings data. Your financial information may be out of date. Please try refreshing.
+        </div>
+      )}
 
       {/* 3-Tab Navigation */}
       <div className="flex bg-gray-100 dark:bg-zinc-800/80 rounded-xl p-1 gap-1 dashboard-item">
@@ -309,7 +403,14 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
           </div>
 
           {displayOrders.length > 0 ? (
-            <ShopOrderList orders={displayOrders} onSelectOrder={handleSelectOrder} />
+            <>
+              <ShopOrderList orders={displayOrders} onSelectOrder={handleSelectOrder} />
+              {allShopOrders.length >= ordersLimit && (
+                <div className="flex justify-center mt-6">
+                  <Button variant="secondary" onClick={loadMoreOrders}>Load More Orders</Button>
+                </div>
+              )}
+            </>
           ) : (
             <div className="text-center py-12">
               <div className="w-16 h-16 mx-auto mb-4 rounded-2xl bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center">
@@ -328,93 +429,92 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
         </div>
       )}
 
-      {/* ===== EARNINGS TAB ===== */}
-      {activeTab === 'earnings' && (
-        <div className="space-y-5 dashboard-item animation-fade-in">
-          {/* Earnings grid */}
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-            <div className="bg-white dark:bg-zinc-900 rounded-xl p-4 border border-gray-200 dark:border-zinc-700">
-              <p className="text-xs text-gray-500 dark:text-gray-400 mb-1">Today</p>
-              <p className="text-xl font-bold text-gray-900 dark:text-white">₹{todayEarnings.toFixed(2)}</p>
-            </div>
-            <div className="bg-white dark:bg-zinc-900 rounded-xl p-4 border border-gray-200 dark:border-zinc-700">
-              <p className="text-xs text-gray-500 dark:text-gray-400 mb-1">This Week</p>
-              <p className="text-xl font-bold text-gray-900 dark:text-white">₹{weekEarnings.toFixed(2)}</p>
-            </div>
-            <div className="bg-white dark:bg-zinc-900 rounded-xl p-4 border border-gray-200 dark:border-zinc-700">
-              <p className="text-xs text-gray-500 dark:text-gray-400 mb-1">This Month</p>
-              <p className="text-xl font-bold text-gray-900 dark:text-white">₹{monthEarnings.toFixed(2)}</p>
-            </div>
-            <div className="bg-white dark:bg-zinc-900 rounded-xl p-4 border border-gray-200 dark:border-zinc-700">
-              <p className="text-xs text-gray-500 dark:text-gray-400 mb-1">All Time</p>
-              <p className="text-xl font-bold text-gray-900 dark:text-white">₹{totalEarned.toFixed(2)}</p>
-            </div>
-          </div>
 
-          {/* Summary stats */}
-          <div className="bg-gradient-to-r from-emerald-500 to-green-600 rounded-xl p-4 sm:p-5 shadow-md">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-emerald-50 text-xs mb-0.5">Total Orders Completed</p>
-                <p className="text-3xl font-extrabold text-white">{completedOrders.length}</p>
-              </div>
-              <div className="text-right">
-                <p className="text-emerald-50 text-xs mb-0.5">Avg. Order Value</p>
-                <p className="text-2xl font-bold text-white">
-                  ₹{completedOrders.length > 0 ? (totalEarned / completedOrders.length).toFixed(0) : '0'}
-                </p>
-              </div>
-            </div>
-          </div>
-
-          {/* Recent completed orders */}
-          {recentCompleted.length > 0 && (
-            <div>
-              <h3 className="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-3">Recent Completed</h3>
-              <div className="space-y-2">
-                {recentCompleted.map(order => (
-                  <button
-                    key={order.id}
-                    onClick={() => handleSelectOrder(order.id)}
-                    className="w-full flex items-center justify-between p-3 bg-white dark:bg-zinc-900 rounded-xl border border-gray-200 dark:border-zinc-700 hover:border-brand-primary/50 transition-colors text-left"
-                  >
-                    <div className="min-w-0 flex-1">
-                      <p className="text-sm font-medium text-gray-900 dark:text-white truncate">
-                        Order #{order.id.slice(-6)}
-                      </p>
-                      <p className="text-xs text-gray-500 dark:text-gray-400">
-                        {new Date(order.uploadedAt).toLocaleDateString()} • {order.printOptions.pages} pages
-                      </p>
-                    </div>
-                    <p className="text-sm font-bold text-emerald-600 dark:text-emerald-400 ml-3 flex-shrink-0">
-                      +₹{order.priceDetails.pageCost.toFixed(2)}
-                    </p>
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
 
       {/* ===== PAYOUTS TAB ===== */}
       {activeTab === 'payouts' && (
         <div className="space-y-5 dashboard-item animation-fade-in">
           {/* Balance overview */}
-          <div className="grid grid-cols-3 gap-3">
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
             <div className="bg-white dark:bg-zinc-900 rounded-xl p-3 border border-gray-200 dark:border-zinc-700 text-center">
-              <p className="text-[10px] sm:text-xs text-gray-500 dark:text-gray-400">Earned</p>
-              <p className="text-lg font-bold text-gray-800 dark:text-gray-100">₹{totalEarned.toFixed(0)}</p>
+              <p className="text-[10px] sm:text-xs text-gray-500 dark:text-gray-400">Lifetime Net Earned</p>
+              <p className="text-lg font-bold text-gray-800 dark:text-gray-100">₹{lifetimeNetEarned.toFixed(0)}</p>
             </div>
             <div className="bg-white dark:bg-zinc-900 rounded-xl p-3 border border-gray-200 dark:border-zinc-700 text-center">
               <p className="text-[10px] sm:text-xs text-gray-500 dark:text-gray-400">Paid Out</p>
               <p className="text-lg font-bold text-brand-primary">₹{totalPaidOut.toFixed(0)}</p>
             </div>
-            <div className="bg-gradient-to-br from-emerald-500 to-green-600 rounded-xl p-3 text-center shadow-sm">
-              <p className="text-[10px] sm:text-xs text-emerald-50">Available</p>
+            <div className="bg-white dark:bg-zinc-900 rounded-xl p-3 border border-gray-200 dark:border-zinc-700 text-center">
+              <p className="text-[10px] sm:text-xs text-gray-500 dark:text-gray-400">Completed Orders</p>
+              <p className="text-lg font-bold text-emerald-600 dark:text-emerald-400">{completedOrderCount}</p>
+            </div>
+            <div className="bg-white dark:bg-zinc-900 rounded-xl p-3 border border-gray-200 dark:border-zinc-700 text-center">
+              <p className="text-[10px] sm:text-xs text-gray-500 dark:text-gray-400">Last Settlement</p>
+              <p className="text-sm font-bold text-gray-800 dark:text-gray-100">
+                {lastSettlementAt ? new Date(lastSettlementAt).toLocaleDateString() : 'Not yet'}
+              </p>
+            </div>
+            <div className="bg-gradient-to-br from-emerald-500 to-green-600 rounded-xl p-3 text-center shadow-sm flex flex-col items-center justify-center">
+              <p className="text-[10px] sm:text-xs text-emerald-50">Redeemable Balance</p>
               <p className="text-lg font-extrabold text-white">₹{redeemableAmount.toFixed(0)}</p>
             </div>
           </div>
+
+          <Card title="" className="bg-white dark:bg-zinc-900 shadow-sm border border-gray-200 dark:border-zinc-700">
+            <div className="flex items-start justify-between gap-3 mb-4">
+              <div>
+                <h3 className="text-base font-bold text-gray-900 dark:text-white">Earnings Tracker</h3>
+                <p className="text-xs text-gray-500 dark:text-gray-400">
+                  Money moves here in stages: order earning, pending settlement, then redeemable payout balance.
+                </p>
+              </div>
+              <div className="text-right">
+                <p className="text-[10px] uppercase tracking-wide text-gray-400 dark:text-gray-500">Today</p>
+                <p className="text-lg font-bold text-emerald-600 dark:text-emerald-400">₹{todayEarnings.toFixed(2)}</p>
+              </div>
+            </div>
+
+            {recentLedgerEntries.length > 0 ? (
+              <div className="space-y-2.5">
+                {recentLedgerEntries.map(entry => {
+                  const isDebit = entry.amount < 0 || entry.type === LedgerEntryType.PAYOUT || entry.type === LedgerEntryType.REFUND_DEDUCTION || entry.type === LedgerEntryType.CLAWBACK;
+                  const activityDate = entry.settledAt || entry.createdAt;
+
+                  return (
+                    <div key={entry.id} className={`rounded-xl border p-3 ${getLedgerEntryTone(entry)}`}>
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <p className="text-sm font-semibold text-gray-900 dark:text-white">
+                            {getLedgerEntryLabel(entry)}
+                          </p>
+                          <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                            {entry.description}
+                          </p>
+                          <div className="flex flex-wrap gap-2 mt-2 text-[11px] text-gray-500 dark:text-gray-400">
+                            <span>{new Date(activityDate).toLocaleString()}</span>
+                            <span className="px-2 py-0.5 rounded-full bg-white/70 dark:bg-black/20 border border-white/40 dark:border-white/10">
+                              {entry.status}
+                            </span>
+                            <span className="px-2 py-0.5 rounded-full bg-white/70 dark:bg-black/20 border border-white/40 dark:border-white/10">
+                              {entry.type.replace('_', ' ')}
+                            </span>
+                          </div>
+                        </div>
+                        <div className={`text-right font-bold ${isDebit ? 'text-rose-600 dark:text-rose-400' : 'text-emerald-600 dark:text-emerald-400'}`}>
+                          {isDebit ? '-' : '+'}₹{Math.abs(entry.amount).toFixed(2)}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="rounded-xl border border-dashed border-gray-300 dark:border-zinc-700 p-6 text-center">
+                <p className="text-sm text-gray-500 dark:text-gray-400">No ledger activity yet.</p>
+                <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">Completed orders, refunds, and payouts will appear here.</p>
+              </div>
+            )}
+          </Card>
 
           {/* Request Payout */}
           <Card title="" className="bg-white dark:bg-zinc-900 shadow-md border border-gray-200 dark:border-zinc-700 overflow-hidden !p-0">
@@ -449,9 +549,14 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
 
             <div className="p-4">
               {redeemableAmount <= 0 && !showPayoutRequestForm ? (
-                <p className="text-gray-500 dark:text-gray-400 text-sm text-center py-3">
-                  No redeemable balance. Complete more orders to earn.
-                </p>
+                <div className="text-center py-3 space-y-1">
+                  <p className="text-gray-500 dark:text-gray-400 text-sm">
+                    No redeemable balance yet.
+                  </p>
+                  <p className="text-xs text-gray-400 dark:text-gray-500">
+                    Completed order earnings first enter pending settlement, then move into redeemable balance automatically.
+                  </p>
+                </div>
               ) : showPayoutRequestForm ? (
                 <div className="space-y-3">
                   <div className="bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-200 dark:border-indigo-800/30 rounded-lg p-3">
@@ -527,66 +632,73 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
           </Card>
 
           {/* Payout History */}
-          {shopPayouts.length > 0 && (
-            <div>
-              <h3 className="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-3">Payout History</h3>
-              <div className="space-y-2.5">
-                {shopPayouts.map(payout => (
-                  <div key={payout.id} className={`rounded-xl p-3.5 border ${getPayoutStatusStyle(payout.status)}`}>
-                    <div className="flex items-center justify-between mb-1">
-                      <p className="font-bold text-base">₹{payout.amount.toFixed(2)}</p>
-                      <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-white/30 dark:bg-black/20 uppercase">
-                        {payout.status}
-                      </span>
-                    </div>
-                    <p className="text-[11px] opacity-75">{new Date(payout.createdAt).toLocaleDateString()}</p>
-                    {payout.adminNote && (
-                      <p className="text-xs opacity-80 mt-1.5">Note: {payout.adminNote}</p>
-                    )}
-
-                    {payout.status === PayoutStatus.PAID && (
-                      <div className="flex gap-2 mt-2.5">
-                        <Button
-                          onClick={() => handleConfirmPayout(payout.id)}
-                          variant="primary"
-                          size="sm"
-                          className="!bg-gradient-to-r !from-emerald-500 !to-green-600 hover:!from-emerald-600 hover:!to-green-700 flex-1 !text-xs"
-                        >
-                          ✓ Confirm
-                        </Button>
-                        <Button
-                          onClick={() => setDisputePayoutId(payout.id)}
-                          variant="danger"
-                          size="sm"
-                          className="flex-1 !text-xs"
-                        >
-                          ✕ Dispute
-                        </Button>
-                      </div>
-                    )}
-
-                    {disputePayoutId === payout.id && (
-                      <div className="mt-2.5 space-y-2">
-                        <textarea
-                          value={disputeNote}
-                          onChange={(e) => setDisputeNote(e.target.value)}
-                          placeholder="Explain why you're disputing..."
-                          className="w-full p-2.5 rounded-lg bg-white dark:bg-zinc-800 border border-gray-300 dark:border-zinc-600 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-brand-primary"
-                          rows={2}
-                        />
-                        <div className="flex gap-2">
-                          <Button onClick={handleDisputePayout} variant="danger" size="sm" disabled={!disputeNote.trim()}>
-                            Submit Dispute
-                          </Button>
-                          <Button onClick={() => { setDisputePayoutId(null); setDisputeNote(''); }} variant="ghost" size="sm">
-                            Cancel
-                          </Button>
-                        </div>
-                      </div>
-                    )}
+          {shopPayouts.length > 0 ? (
+            <div className="space-y-2.5">
+              {shopPayouts.map(payout => (
+                <div key={payout.id} className={`rounded-xl p-3.5 border ${getPayoutStatusStyle(payout.status)}`}>
+                  <div className="flex items-center justify-between mb-1">
+                    <p className="font-bold text-base">₹{payout.amount.toFixed(2)}</p>
+                    <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-white/30 dark:bg-black/20 uppercase">
+                      {payout.status}
+                    </span>
                   </div>
-                ))}
-              </div>
+                  <p className="text-[11px] opacity-75">{new Date(payout.createdAt).toLocaleDateString()}</p>
+                  {payout.adminNote && (
+                    <p className="text-xs opacity-80 mt-1.5">Note: {payout.adminNote}</p>
+                  )}
+
+                  {payout.status === PayoutStatus.PAID && (
+                    <div className="flex gap-2 mt-2.5">
+                      <Button
+                        onClick={() => handleConfirmPayout(payout.id)}
+                        variant="primary"
+                        size="sm"
+                        className="!bg-gradient-to-r !from-emerald-500 !to-green-600 hover:!from-emerald-600 hover:!to-green-700 flex-1 !text-xs"
+                      >
+                        ✓ Confirm
+                      </Button>
+                      <Button
+                        onClick={() => setDisputePayoutId(payout.id)}
+                        variant="danger"
+                        size="sm"
+                        className="flex-1 !text-xs"
+                      >
+                        ✕ Dispute
+                      </Button>
+                    </div>
+                  )}
+
+                  {disputePayoutId === payout.id && (
+                    <div className="mt-2.5 space-y-2">
+                      <textarea
+                        value={disputeNote}
+                        onChange={(e) => setDisputeNote(e.target.value)}
+                        placeholder="Explain why you're disputing..."
+                        className="w-full p-2.5 rounded-lg bg-white dark:bg-zinc-800 border border-gray-300 dark:border-zinc-600 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-brand-primary"
+                        rows={2}
+                      />
+                      <div className="flex gap-2">
+                        <Button onClick={handleDisputePayout} variant="danger" size="sm" disabled={!disputeNote.trim()}>
+                          Submit Dispute
+                        </Button>
+                        <Button onClick={() => { setDisputePayoutId(null); setDisputeNote(''); }} variant="ghost" size="sm">
+                          Cancel
+                        </Button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <Card className="bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-700 text-center py-12">
+              <p className="text-gray-500 dark:text-gray-400">No payouts yet.</p>
+            </Card>
+          )}
+
+          {shopPayouts.length >= payoutsLimit && (
+            <div className="flex justify-center mt-6">
+              <Button variant="secondary" onClick={loadMorePayouts}>Load More Payouts</Button>
             </div>
           )}
         </div>
@@ -594,21 +706,58 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
 
       {/* ===== SUPPORT TAB ===== */}
       {activeTab === 'support' && (
-        <div className="space-y-4 dashboard-item animation-fade-in">
-          <div className="flex items-center justify-between">
-            <h3 className="text-lg font-semibold text-gray-900 dark:text-white">Support Tickets</h3>
-            <Button variant="primary" size="sm" onClick={() => setShowTicketForm(true)}>
-              Raise Ticket
-            </Button>
+        <div className="space-y-7 dashboard-item animation-fade-in">
+          
+          {/* Customer Issues */}
+          <div>
+            <div className="mb-4">
+              <h3 className="text-base font-bold text-gray-900 dark:text-white">Customer Issues</h3>
+              <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">Tickets raised by students about your shop</p>
+            </div>
+            {tickets.filter(t => t.shopId === shopId && t.raisedBy !== shopProfile.ownerUserId).length > 0 ? (
+              <TicketList tickets={tickets.filter(t => t.shopId === shopId && t.raisedBy !== shopProfile.ownerUserId)} showRaiserInfo={true} />
+            ) : (
+              <div className="rounded-2xl border border-dashed border-gray-300 dark:border-zinc-600 bg-gray-50/50 dark:bg-zinc-800/30 py-10 text-center">
+                <div className="w-14 h-14 mx-auto mb-3 rounded-2xl bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center">
+                  <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-7 h-7 text-emerald-600 dark:text-emerald-400">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75 11.25 15 15 9.75M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />
+                  </svg>
+                </div>
+                <p className="text-sm font-medium text-gray-600 dark:text-gray-300">All clear — no customer issues!</p>
+                <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">Customer tickets about your orders will appear here.</p>
+              </div>
+            )}
           </div>
-          {tickets.length > 0 ? (
-            <TicketList tickets={tickets} />
-          ) : (
-            <Card className="bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-700 text-center py-8">
-              <p className="text-gray-500 dark:text-gray-400">No tickets yet. Need help? Raise a ticket above.</p>
-            </Card>
-          )}
-          <TicketForm isOpen={showTicketForm} onClose={() => setShowTicketForm(false)} />
+
+          {/* Divider */}
+          <div className="border-t border-gray-200 dark:border-zinc-700/70" />
+
+          {/* My Tickets */}
+          <div>
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <h3 className="text-base font-bold text-gray-900 dark:text-white">Your Support Tickets</h3>
+                <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">Tickets you've raised to the admin</p>
+              </div>
+              <Button variant="primary" size="sm" onClick={() => setShowTicketForm(true)}>
+                + Raise Ticket
+              </Button>
+            </div>
+            {tickets.filter(t => t.raisedBy === shopProfile.ownerUserId).length > 0 ? (
+              <TicketList tickets={tickets.filter(t => t.raisedBy === shopProfile.ownerUserId)} />
+            ) : (
+              <div className="rounded-2xl border border-dashed border-gray-300 dark:border-zinc-600 bg-gray-50/50 dark:bg-zinc-800/30 py-10 text-center">
+                <div className="w-14 h-14 mx-auto mb-3 rounded-2xl bg-indigo-100 dark:bg-indigo-900/20 flex items-center justify-center">
+                  <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-7 h-7 text-indigo-500 dark:text-indigo-400">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M7.5 8.25h9m-9 3H12m-9.75 1.51c0 1.6 1.123 2.994 2.707 3.227 1.129.166 2.27.293 3.423.379.35.026.67.21.865.501L12 21l2.755-4.133a1.14 1.14 0 0 1 .865-.501 48.172 48.172 0 0 0 3.423-.379c1.584-.233 2.707-1.626 2.707-3.228V6.741c0-1.602-1.123-2.995-2.707-3.228A48.394 48.394 0 0 0 12 3c-2.392 0-4.744.175-7.043.513C3.373 3.746 2.25 5.14 2.25 6.741v6.018Z" />
+                  </svg>
+                </div>
+                <p className="text-sm font-medium text-gray-600 dark:text-gray-300">No tickets raised yet</p>
+                <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">Need help from the admin? Tap the button above.</p>
+              </div>
+            )}
+            <TicketForm isOpen={showTicketForm} onClose={() => setShowTicketForm(false)} />
+          </div>
         </div>
       )}
 

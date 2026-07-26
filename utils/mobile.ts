@@ -4,6 +4,11 @@
  */
 import { Capacitor } from '@capacitor/core';
 
+let hasInitializedMobile = false;
+const debugLog = (...args: unknown[]) => {
+  void args;
+};
+
 /** Returns true when running inside a native iOS/Android shell */
 export const isNative = () => Capacitor.isNativePlatform();
 
@@ -15,7 +20,8 @@ export const getPlatform = () => Capacitor.getPlatform();
  * Call once in your app entry point (e.g., App.tsx useEffect).
  */
 export async function initMobile(): Promise<void> {
-  if (!isNative()) return;
+  if (!isNative() || hasInitializedMobile) return;
+  hasInitializedMobile = true;
 
   try {
     const { StatusBar, Style } = await import('@capacitor/status-bar');
@@ -26,7 +32,7 @@ export async function initMobile(): Promise<void> {
       await StatusBar.setOverlaysWebView({ overlay: false });
     }
   } catch (e) {
-    console.warn('[Mobile] StatusBar plugin not available:', e);
+    void e;
   }
 
   try {
@@ -34,7 +40,7 @@ export async function initMobile(): Promise<void> {
     // Hide splash after a short delay (the config auto-hides, but this is a safety net)
     setTimeout(() => SplashScreen.hide(), 2500);
   } catch (e) {
-    console.warn('[Mobile] SplashScreen plugin not available:', e);
+    void e;
   }
 
   try {
@@ -61,7 +67,7 @@ export async function initMobile(): Promise<void> {
       document.body.style.paddingBottom = '0px';
     });
   } catch (e) {
-    console.warn('[Mobile] Keyboard plugin not available:', e);
+    void e;
   }
 }
 
@@ -92,9 +98,9 @@ export async function downloadFileNative(
     });
 
     // Notify user
-    console.log(`[Mobile] File saved: ${fileName}`);
+    debugLog(`[Mobile] File saved: ${fileName}`);
   } catch (e) {
-    console.error('[Mobile] Native download failed, falling back to web:', e);
+    void e;
     downloadFileWeb(blob, fileName);
   }
 }

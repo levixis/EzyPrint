@@ -7,9 +7,14 @@ import { getOrderDisplayName } from '../../utils/orderHelpers';
 import { getFunctions, httpsCallable } from 'firebase/functions';
 import { app } from '../../firebase';
 import { Spinner } from '../common/Spinner';
+import { Button } from '../common/Button';
+import { Modal } from '../common/Modal';
 
 const RAZORPAY_KEY_ID = import.meta.env.VITE_RAZORPAY_KEY_ID;
 const functions = getFunctions(app, 'asia-south1');
+const debugLog = (...args: unknown[]) => {
+  void args;
+};
 
 declare global {
     interface Window {
@@ -26,6 +31,8 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
   const [processingOrderId, setProcessingOrderId] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState('');
   const [showOverlay, setShowOverlay] = useState(false);
+  const [infoDialog, setInfoDialog] = useState<{ title: string; message: string } | null>(null);
+  const [pendingCancelOrder, setPendingCancelOrder] = useState<{ order: DocumentOrder; requiresRefund: boolean } | null>(null);
   const { updateOrderStatus, currentUser } = useAppContext();
 
   // Clear optimistic statuses once Firestore catches up with the real status
@@ -60,13 +67,16 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
 
         if (checkData.paid && checkData.recovered) {
           // Payment was already captured! Order has been recovered.
-          alert('Good news! Your previous payment was successful. The order has been updated.');
+          setInfoDialog({
+            title: 'Payment Recovered',
+            message: 'Good news! Your previous payment was successful. The order has been updated.',
+          });
           setProcessingOrderId(null);
           setStatusMessage('');
           return;
         }
       } catch (checkErr) {
-        console.warn('Payment status check failed, proceeding with new payment:', checkErr);
+        debugLog('Payment status check failed, proceeding with new payment:', checkErr);
         // Continue with new payment if check fails
       }
     }
@@ -125,17 +135,15 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
           const { Checkout } = await import('capacitor-razorpay');
           nativeCheckoutResult = await Checkout.open(baseOptions as { key: string; amount: string });
         } catch (checkoutError: unknown) {
-          console.error('Native Razorpay checkout error:', checkoutError);
+          debugLog('Native Razorpay checkout error:', checkoutError);
           const errMsg = checkoutError instanceof Error ? checkoutError.message : String(checkoutError);
 
           // Plugin not available — fall back to web SDK
           if (errMsg.includes('not implemented') || errMsg.includes('not available') || errMsg.includes('plugin_not_installed')) {
-            console.log('Native Razorpay unavailable, falling back to web SDK...');
             pluginAvailable = false;
             openWebRazorpay(baseOptions, order, onSuccess, onFailure);
           } else {
             // User cancelled or payment actually failed in native checkout
-            console.log('Native checkout cancelled/failed:', errMsg);
             setProcessingOrderId(null);
             setShowOverlay(false);
             setStatusMessage('');
@@ -146,23 +154,23 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
         if (nativeCheckoutResult && pluginAvailable) {
           try {
             const result = nativeCheckoutResult as { response: unknown };
-            console.log('Native Razorpay raw result:', JSON.stringify(result));
 
             const response = typeof result.response === 'string'
               ? JSON.parse(result.response)
               : result.response;
-
-            console.log('Parsed Razorpay response:', JSON.stringify(response));
 
             const paymentId = response.razorpay_payment_id;
             const ordIdFromRzp = response.razorpay_order_id;
             const signature = response.razorpay_signature;
 
             if (!paymentId || !ordIdFromRzp || !signature) {
-              console.error('Missing fields in Razorpay response:', { paymentId, ordIdFromRzp, signature });
+              debugLog('Missing fields in Razorpay response:', { paymentId, ordIdFromRzp, signature });
               // Payment succeeded in Razorpay but response format is unexpected
               // DO NOT mark as failed — the money was already taken
-              alert('Payment received but verification data is incomplete. Please contact support if your order is not updated.');
+              setInfoDialog({
+                title: 'Verification Pending',
+                message: 'Payment received but verification data is incomplete. Please contact support if your order is not updated.',
+              });
               setProcessingOrderId(null);
               setShowOverlay(false);
               setStatusMessage('');
@@ -180,10 +188,13 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
             });
             onSuccess(order.id);
           } catch (verifyError: unknown) {
-            console.error('Payment verification error (payment was taken!):', verifyError);
+            debugLog('Payment verification error (payment was taken!):', verifyError);
             // DO NOT call onFailure — money was already deducted
             // The Firestore trigger will still detect the payment
-            alert('Payment was successful but verification encountered an issue. Your order will be updated shortly.');
+            setInfoDialog({
+              title: 'Verification Pending',
+              message: 'Payment was successful but verification encountered an issue. Your order will be updated shortly.',
+            });
             setProcessingOrderId(null);
             setShowOverlay(false);
             setStatusMessage('');
@@ -196,7 +207,7 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
         openWebRazorpay(baseOptions, order, onSuccess, onFailure);
       }
     } catch (error: unknown) {
-      console.error('Failed to create Razorpay order:', error);
+      debugLog('Failed to create Razorpay order:', error);
       setProcessingOrderId(null);
       setShowOverlay(false);
       setStatusMessage('');
@@ -224,7 +235,7 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
           });
           onSuccess(order.id);
         } catch (verifyError: unknown) {
-          console.error('Payment verification failed:', verifyError);
+          debugLog('Payment verification failed:', verifyError);
           onFailure(order.id);
         }
       },
@@ -252,34 +263,43 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
         const checkData = checkResult.data as { paid: boolean; recovered?: boolean; message: string };
 
         if (checkData.paid && checkData.recovered) {
-          alert('Your previous payment was actually successful! The order has been recovered instead of cancelled.');
+          setInfoDialog({
+            title: 'Order Recovered',
+            message: 'Your previous payment was actually successful. The order has been recovered instead of cancelled.',
+          });
           return;
         }
 
         if (checkData.paid && !checkData.recovered) {
-          // Payment exists but order is already in a paid state
-          if (!window.confirm('A payment was captured for this order. Cancelling will trigger an automatic refund. Continue?')) {
-            return;
-          }
+          setPendingCancelOrder({ order, requiresRefund: true });
+          return;
         }
       } catch (checkErr) {
-        console.warn('Payment check before cancel failed:', checkErr);
+        debugLog('Payment check before cancel failed:', checkErr);
         // Continue with cancel if check fails
       }
-    } else {
-      if (!window.confirm("Are you sure you want to cancel this order?")) return;
     }
 
+    setPendingCancelOrder({ order, requiresRefund: false });
+  };
+
+  const confirmCancelOrder = async (order: DocumentOrder) => {
     try {
       const result = await updateOrderStatus(order.id, OrderStatus.CANCELLED, {
         actingUserType: UserType.STUDENT
       });
       if (!result) {
-        alert('Failed to cancel order. Please try again.');
+        setInfoDialog({
+          title: 'Cancellation Failed',
+          message: 'Failed to cancel order. Please try again.',
+        });
       }
     } catch (err) {
-      console.error('[StudentOrderList] Cancel order failed:', err);
-      alert('Failed to cancel order. Please check your connection and try again.');
+      debugLog('[StudentOrderList] Cancel order failed:', err);
+      setInfoDialog({
+        title: 'Cancellation Failed',
+        message: 'Failed to cancel order. Please check your connection and try again.',
+      });
     }
   };
 
@@ -305,7 +325,7 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
 
   // Recent: only active (non-cancelled, non-completed), max 5
   const activeOrders = ordersWithOptimistic.filter(o =>
-    o.status !== OrderStatus.CANCELLED && o.status !== OrderStatus.COMPLETED
+    o.status !== OrderStatus.CANCELLED && o.status !== OrderStatus.COMPLETED && o.status !== OrderStatus.REFUNDED
   );
   const recentOrders = sortAll(activeOrders).slice(0, 5);
 
@@ -314,8 +334,7 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
     new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime()
   );
 
-  const cancelledCount = ordersWithOptimistic.filter(o => o.status === OrderStatus.CANCELLED).length;
-  const completedCount = ordersWithOptimistic.filter(o => o.status === OrderStatus.COMPLETED).length;
+  const historyCount = ordersWithOptimistic.filter(o => [OrderStatus.CANCELLED, OrderStatus.COMPLETED, OrderStatus.REFUNDED].includes(o.status)).length;
 
   if (orders.length === 0) {
     return <p className="text-brand-lightText text-center py-6">No orders found.</p>;
@@ -351,9 +370,9 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
             }`}
         >
           Order History
-          {(cancelledCount + completedCount) > 0 && (
+          {historyCount > 0 && (
             <span className="ml-1.5 px-1.5 py-0.5 text-[10px] font-medium rounded-full bg-gray-300 dark:bg-zinc-600 text-gray-700 dark:text-gray-300">
-              {cancelledCount + completedCount}
+              {historyCount}
             </span>
           )}
         </button>
@@ -397,6 +416,39 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
           </div>
         </div>
       )}
+
+      <Modal isOpen={!!infoDialog} onClose={() => setInfoDialog(null)} title={infoDialog?.title || 'Notice'} size="md">
+        <div className="space-y-4">
+          <p className="text-sm text-gray-600 dark:text-gray-400">{infoDialog?.message}</p>
+          <div className="flex justify-end">
+            <Button variant="primary" onClick={() => setInfoDialog(null)}>OK</Button>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal isOpen={!!pendingCancelOrder} onClose={() => setPendingCancelOrder(null)} title="Cancel Order" size="md">
+        <div className="space-y-4">
+          <p className="text-sm text-gray-600 dark:text-gray-400">
+            {pendingCancelOrder?.requiresRefund
+              ? 'A payment was captured for this order. Cancelling will trigger an automatic refund. Do you want to continue?'
+              : 'Are you sure you want to cancel this order?'}
+          </p>
+          <div className="flex justify-end gap-3">
+            <Button variant="ghost" onClick={() => setPendingCancelOrder(null)}>Keep Order</Button>
+            <Button
+              variant="danger"
+              onClick={async () => {
+                if (!pendingCancelOrder) return;
+                const { order } = pendingCancelOrder;
+                setPendingCancelOrder(null);
+                await confirmCancelOrder(order);
+              }}
+            >
+              Confirm Cancel
+            </Button>
+          </div>
+        </div>
+      </Modal>
     </div>
   );
 };

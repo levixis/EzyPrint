@@ -6,6 +6,7 @@ import { useAppContext } from '../../contexts/AppContext';
 import { storage, storageRef, getDownloadURL, app } from '../../firebase';
 import { getFunctions, httpsCallable } from 'firebase/functions';
 import { RefundOtpModal } from '../common/RefundOtpModal';
+import { RefundHistoryTracker } from '../common/RefundHistoryTracker';
 
 interface TicketDetailProps {
   ticket: SupportTicket;
@@ -27,6 +28,18 @@ const statusIcons: Record<string, string> = {
   [TicketStatus.CLOSED]: '🔒',
 };
 
+const refundStatusTone: Record<string, string> = {
+  PENDING_SHOP: 'bg-amber-50 dark:bg-amber-900/20 border-amber-200 dark:border-amber-800/30 text-amber-700 dark:text-amber-300',
+  APPROVED_BY_SHOP: 'bg-emerald-50 dark:bg-emerald-900/20 border-emerald-200 dark:border-emerald-800/30 text-emerald-700 dark:text-emerald-300',
+  REJECTED_BY_SHOP: 'bg-rose-50 dark:bg-rose-900/20 border-rose-200 dark:border-rose-800/30 text-rose-700 dark:text-rose-300',
+  ESCALATED_TO_ADMIN: 'bg-violet-50 dark:bg-violet-900/20 border-violet-200 dark:border-violet-800/30 text-violet-700 dark:text-violet-300',
+  AUTO_ESCALATED: 'bg-violet-50 dark:bg-violet-900/20 border-violet-200 dark:border-violet-800/30 text-violet-700 dark:text-violet-300',
+  RESOLVED_REFUNDED: 'bg-emerald-50 dark:bg-emerald-900/20 border-emerald-200 dark:border-emerald-800/30 text-emerald-700 dark:text-emerald-300',
+  RESOLVED_DENIED: 'bg-slate-100 dark:bg-slate-800/50 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300',
+};
+
+const formatRefundRequestStatus = (status: string) => status.replace(/_/g, ' ').toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
+
 // Helper: extract filename from a storage path like "tickets/ticket_123/myfile.pdf"
 const getFileNameFromPath = (path: string): string => {
   const parts = path.split('/');
@@ -44,10 +57,11 @@ const getFileIcon = (fileName: string): string => {
 };
 
 const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) => {
-  const { addTicketMessage, updateTicketStatus, currentUser, tickets, allOrders } = useAppContext();
+  const { addNotification, addTicketMessage, updateTicketStatus, currentUser, tickets, orders, allOrders, shopInitiateRefund, escalateTicketToAdmin, refundRequests } = useAppContext();
   const [replyText, setReplyText] = useState('');
   const [isSending, setIsSending] = useState(false);
   const [isUpdatingStatus, setIsUpdatingStatus] = useState(false);
+  const [isPreApproveModalOpen, setIsPreApproveModalOpen] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   // Attachment download URLs
@@ -59,13 +73,18 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
   const isAdmin = currentUser?.type === UserType.ADMIN;
   const isClosed = liveTicket.status === TicketStatus.CLOSED || liveTicket.status === TicketStatus.RESOLVED;
 
-  const relatedOrder = liveTicket.relatedOrderId ? allOrders.find(o => o.id === liveTicket.relatedOrderId) : null;
+  // Resolve related order: allOrders is only populated for ADMIN; students/shop owners use orders
+  const combinedOrders = isAdmin ? allOrders : orders;
+  const relatedOrder = liveTicket.relatedOrderId ? combinedOrders.find(o => o.id === liveTicket.relatedOrderId) : null;
+  const refundRequest = liveTicket.relatedOrderId ? refundRequests.find(r => r.orderId === liveTicket.relatedOrderId) : null;
   const [isIssuingRefund, setIsIssuingRefund] = useState(false);
   const [refundResult, setRefundResult] = useState<{ success: boolean; message: string } | null>(null);
 
   const [isRequestingOTP, setIsRequestingOTP] = useState(false);
   const [otpSent, setOtpSent] = useState(false);
   const [isRefundModalOpen, setIsRefundModalOpen] = useState(false);
+  const [isEscalateModalOpen, setIsEscalateModalOpen] = useState(false);
+  const [escalationReason, setEscalationReason] = useState('');
 
   const handleRequestOTP = async () => {
     if (!relatedOrder) return;
@@ -77,8 +96,9 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
       await requestRefundOTPFn({ orderId: relatedOrder.id });
       setOtpSent(true);
       setRefundResult({ success: true, message: 'OTP sent to your admin email!' });
-    } catch (err: any) {
-      setRefundResult({ success: false, message: err.message || 'Failed to send OTP.' });
+    } catch (err) {
+      const error = err as Error;
+      setRefundResult({ success: false, message: error.message || 'Failed to send OTP.' });
     }
     setIsRequestingOTP(false);
   };
@@ -98,8 +118,9 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
       const data = result.data as { success: boolean; message: string };
       setRefundResult({ success: true, message: data.message || 'Refund successfully initiated.' });
       setOtpSent(false);
-    } catch (err: any) {
-      setRefundResult({ success: false, message: err.message || 'Refund failed. Invalid OTP?' });
+    } catch (err) {
+      const error = err as Error;
+      setRefundResult({ success: false, message: error.message || 'Refund failed. Invalid OTP?' });
     }
     setIsIssuingRefund(false);
   };
@@ -120,7 +141,7 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
 
     const resolveUrls = async () => {
       const results = await Promise.all(
-        liveTicket.attachmentPaths.map(async (path) => {
+        (liveTicket.attachmentPaths ?? []).map(async (path) => {
           const fileName = getFileNameFromPath(path);
           try {
             const ref = storageRef(storage, path);
@@ -144,8 +165,10 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
   const handleSendReply = async () => {
     if (!replyText.trim()) return;
     setIsSending(true);
-    await addTicketMessage(liveTicket.id, replyText.trim());
-    setReplyText('');
+    const result = await addTicketMessage(liveTicket.id, replyText.trim());
+    if (result.success) {
+      setReplyText('');
+    }
     setIsSending(false);
   };
 
@@ -168,11 +191,6 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
         {/* Header Bar */}
         <div className="flex items-center justify-between gap-3 pb-4 border-b border-gray-200 dark:border-zinc-700">
           <div className="flex items-center gap-3 min-w-0 flex-1">
-            <div className="flex-shrink-0 w-10 h-10 rounded-xl bg-gradient-to-br from-violet-500 to-purple-600 flex items-center justify-center shadow-md shadow-purple-500/20">
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-5 h-5 text-white">
-                <path fillRule="evenodd" d="M4.848 2.771A49.144 49.144 0 0 1 12 2.25c2.43 0 4.817.178 7.152.52a1.834 1.834 0 0 1 1.529 1.657l.293 3.513a1.834 1.834 0 0 1-1.307 1.92l-.416.14a3.118 3.118 0 0 0-1.898 4.084l.108.27a1.835 1.835 0 0 1-.9 2.267l-3.19 1.595a1.835 1.835 0 0 1-2.118-.355L9.69 16.3a3.118 3.118 0 0 0-4.253-.143l-.295.268a1.834 1.834 0 0 1-2.445-.198l-1.06-1.162a1.834 1.834 0 0 1-.286-2.066l.168-.336a3.118 3.118 0 0 0-1.034-3.82l-.35-.247A1.834 1.834 0 0 1 .26 6.62l.592-3.209a1.835 1.835 0 0 1 1.532-1.494l2.464-.146Z" clipRule="evenodd" />
-              </svg>
-            </div>
             <div className="min-w-0 flex-1">
               <h3 className="text-lg sm:text-xl font-bold text-gray-900 dark:text-white line-clamp-2 leading-snug">
                 {liveTicket.subject}
@@ -247,12 +265,12 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
             </div>
 
             {/* Attachments Section */}
-            {liveTicket.attachmentPaths.length > 0 && (
+            {(liveTicket.attachmentPaths?.length ?? 0) > 0 && (
               <div className="bg-white dark:bg-zinc-900 rounded-xl border border-gray-200 dark:border-zinc-700 overflow-hidden">
                 <div className="px-4 py-2.5 border-b border-gray-200 dark:border-zinc-700 flex items-center gap-2">
                   <span className="text-sm">📎</span>
                   <h5 className="text-xs font-bold text-gray-500 dark:text-gray-400 uppercase tracking-wider">
-                    Attachments ({liveTicket.attachmentPaths.length})
+                    Attachments ({liveTicket.attachmentPaths!.length})
                   </h5>
                 </div>
                 <div className="p-3 space-y-2">
@@ -321,18 +339,8 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
                     </p>
                   </div>
                   {relatedOrder.refundId ? (
-                    <div>
-                       <p className="text-[10px] text-gray-400">Refund Status</p>
-                       <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
-                         relatedOrder.refundStatus === 'FAILED'
-                           ? 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400'
-                           : relatedOrder.refundStatus === 'processed'
-                             ? 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400'
-                             : 'bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400'
-                       }`}>
-                         {relatedOrder.refundStatus === 'FAILED' ? '❌ Failed' :
-                          relatedOrder.refundStatus === 'processed' ? '✅ Processed' : '⏳ Pending'}
-                       </span>
+                    <div className="pt-2 border-t border-gray-100 dark:border-zinc-800">
+                       <RefundHistoryTracker orderId={relatedOrder.id} />
                     </div>
                   ) : relatedOrder.razorpayPaymentId && !isClosed ? (
                     <>
@@ -361,13 +369,141 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
                     </>
                   ) : null}
                   {refundResult && !isRefundModalOpen && (
-                    <p className={`text-xs mt-1 p-2 rounded ${refundResult.success ? 'bg-emerald-50 text-emerald-600' : 'bg-red-50 text-red-600'}`}>
+                    <p className={`text-xs mt-1 p-2 rounded ${refundResult.success ? 'bg-emerald-50 dark:bg-emerald-900/20 text-emerald-600 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800/30' : 'bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 border border-red-200 dark:border-red-800/30'}`}>
                       {refundResult.message}
                     </p>
                   )}
                 </div>
               </div>
             )}
+
+            {/* Shop Controls */}
+            {!isAdmin && currentUser?.type === UserType.SHOP_OWNER && liveTicket.shopId === currentUser.shopId && !isClosed && (
+              <div className="bg-white dark:bg-zinc-900 rounded-xl p-4 border border-gray-200 dark:border-zinc-700 space-y-3">
+                <h5 className="text-xs font-bold text-gray-500 dark:text-gray-400 uppercase tracking-wider">Shop Actions</h5>
+                <div className="flex flex-col gap-2">
+                  {liveTicket.relatedOrderId && (
+                    <>
+                      {refundRequest ? (
+                        <div className={`rounded-xl border p-3 ${refundStatusTone[refundRequest.status] || 'bg-gray-50 dark:bg-zinc-800 border-gray-200 dark:border-zinc-700 text-gray-700 dark:text-gray-300'}`}>
+                          <div className="flex items-center justify-between gap-3">
+                            <div>
+                              <p className="text-sm font-semibold">
+                                {refundRequest.status === 'APPROVED_BY_SHOP' ? 'Refund already pre-approved' : 'Refund request already exists'}
+                              </p>
+                              <p className="text-xs mt-1 opacity-90">
+                                {refundRequest.status === 'APPROVED_BY_SHOP'
+                                  ? 'This refund is awaiting admin processing. You can close or resolve this ticket now.'
+                                  : `Current refund status: ${formatRefundRequestStatus(refundRequest.status)}.`}
+                              </p>
+                            </div>
+                            <span className="px-2 py-1 rounded-full text-[10px] font-bold uppercase tracking-wide bg-white/70 dark:bg-black/20 border border-white/40 dark:border-white/10 whitespace-nowrap">
+                              {formatRefundRequestStatus(refundRequest.status)}
+                            </span>
+                          </div>
+                        </div>
+                      ) : (
+                        <>
+                          <Button size="sm" variant="primary" onClick={() => setIsPreApproveModalOpen(true)} disabled={isUpdatingStatus} className="!bg-gradient-to-r !from-indigo-500 !to-purple-600">
+                            💸 Pre-approve Refund
+                          </Button>
+
+                          <Modal
+                            isOpen={isPreApproveModalOpen}
+                            onClose={() => setIsPreApproveModalOpen(false)}
+                            title="Confirm Refund Pre-approval"
+                            size="sm"
+                          >
+                            <div className="space-y-4">
+                              <p className="text-sm text-gray-700 dark:text-gray-300 leading-relaxed">
+                                Are you sure you want to pre-approve a refund for this order? This will authorize the Admin to process the refund for the student.
+                              </p>
+                              <div className="flex gap-3 justify-end pt-2">
+                                <Button
+                                  variant="ghost"
+                                  onClick={() => setIsPreApproveModalOpen(false)}
+                                  disabled={isUpdatingStatus}
+                                >
+                                  Cancel
+                                </Button>
+                                <Button
+                                  variant="primary"
+                                  className="!bg-gradient-to-r !from-indigo-500 !to-purple-600"
+                                  disabled={isUpdatingStatus}
+                                  onClick={async () => {
+                                    setIsUpdatingStatus(true);
+                                    const result = await shopInitiateRefund(liveTicket.id, liveTicket.relatedOrderId!, "Refund pre-approved by shop");
+                                    if (result.success) {
+                                      await handleStatusChange(TicketStatus.CLOSED);
+                                      setIsPreApproveModalOpen(false);
+                                    } else {
+                                      addNotification({ 
+                                        message: result.message || "Could not pre-approve refund. The order might already be refunded or the time window may have expired.", 
+                                        type: 'error' 
+                                      });
+                                    }
+                                    setIsUpdatingStatus(false);
+                                  }}
+                                >
+                                  {isUpdatingStatus ? 'Processing...' : 'Yes, Confirm'}
+                                </Button>
+                              </div>
+                            </div>
+                          </Modal>
+                        </>
+                      )}
+                    </>
+                  )}
+                  <Button size="sm" variant="ghost" onClick={() => handleStatusChange(TicketStatus.CLOSED)} disabled={isUpdatingStatus}>
+                    🔒 Close Issue
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            {/* Student Controls */}
+            {!isAdmin && currentUser?.type === UserType.STUDENT && liveTicket.raisedBy === currentUser.id && isClosed && (
+              <div className="bg-white dark:bg-zinc-900 rounded-xl p-4 border border-red-200 dark:border-red-900/30 space-y-3">
+                <h5 className="text-xs font-bold text-red-500 dark:text-red-400 uppercase tracking-wider">Not Satisfied?</h5>
+                <Button size="sm" variant="danger" onClick={() => setIsEscalateModalOpen(true)} disabled={isUpdatingStatus} className="w-full">
+                  🚨 Escalate to Admin
+                </Button>
+              </div>
+            )}
+
+            <Modal isOpen={isEscalateModalOpen} onClose={() => { setIsEscalateModalOpen(false); setEscalationReason(''); }} title="Escalate to Admin" size="md">
+              <div className="space-y-4">
+                <p className="text-sm text-gray-600 dark:text-gray-400">
+                  Tell the admin why this ticket still needs intervention.
+                </p>
+                <textarea
+                  value={escalationReason}
+                  onChange={(e) => setEscalationReason(e.target.value)}
+                  rows={4}
+                  className="w-full rounded-xl border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-3 py-2 text-sm text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-brand-primary"
+                  placeholder="Describe what is still unresolved..."
+                />
+                <div className="flex justify-end gap-3">
+                  <Button variant="ghost" onClick={() => { setIsEscalateModalOpen(false); setEscalationReason(''); }}>
+                    Cancel
+                  </Button>
+                  <Button
+                    variant="danger"
+                    disabled={isUpdatingStatus || !escalationReason.trim()}
+                    onClick={async () => {
+                      setIsUpdatingStatus(true);
+                      await escalateTicketToAdmin(liveTicket.id, escalationReason.trim());
+                      setIsUpdatingStatus(false);
+                      setIsEscalateModalOpen(false);
+                      setEscalationReason('');
+                      onClose();
+                    }}
+                  >
+                    {isUpdatingStatus ? 'Escalating...' : 'Escalate'}
+                  </Button>
+                </div>
+              </div>
+            </Modal>
 
             {/* Status History */}
             {liveTicket.statusHistory.length > 1 && (
@@ -413,7 +549,7 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
                 <div className="flex flex-col items-center justify-center py-12 text-center">
                   <div className="w-14 h-14 rounded-full bg-gray-100 dark:bg-zinc-800 flex items-center justify-center mb-3">
                     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-7 h-7 text-gray-300 dark:text-gray-600">
-                      <path fillRule="evenodd" d="M4.848 2.771A49.144 49.144 0 0 1 12 2.25c2.43 0 4.817.178 7.152.52a1.834 1.834 0 0 1 1.529 1.657l.293 3.513a1.834 1.834 0 0 1-1.307 1.92l-.416.14a3.118 3.118 0 0 0-1.898 4.084l.108.27a1.835 1.835 0 0 1-.9 2.267l-3.19 1.595a1.835 1.835 0 0 1-2.118-.355L9.69 16.3a3.118 3.118 0 0 0-4.253-.143l-.295.268a1.834 1.834 0 0 1-2.445-.198l-1.06-1.162a1.834 1.834 0 0 1-.286-2.066l.168-.336a3.118 3.118 0 0 0-1.034-3.82l-.35-.247A1.834 1.834 0 0 1 .26 6.62l.592-3.209a1.835 1.835 0 0 1 1.532-1.494l2.464-.146Z" clipRule="evenodd" />
+                      <path fillRule="evenodd" d="M4.804 21.644A6.707 6.707 0 0 0 6 21.75a6.721 6.721 0 0 0 3.583-1.029c.774.182 1.584.279 2.417.279 5.322 0 9.75-3.97 9.75-9 0-5.03-4.428-9-9.75-9s-9.75 3.97-9.75 9c0 2.409 1.025 4.587 2.674 6.192.232.226.277.428.254.543a3.73 3.73 0 0 1-.814 1.686.75.75 0 0 0 .44 1.223ZM8.25 10.875a1.125 1.125 0 1 0 0 2.25 1.125 1.125 0 0 0 0-2.25ZM10.875 12a1.125 1.125 0 1 1 2.25 0 1.125 1.125 0 0 1-2.25 0Zm4.875-1.125a1.125 1.125 0 1 0 0 2.25 1.125 1.125 0 0 0 0-2.25Z" clipRule="evenodd" />
                     </svg>
                   </div>
                   <p className="text-sm text-gray-400 dark:text-gray-500">No messages yet</p>

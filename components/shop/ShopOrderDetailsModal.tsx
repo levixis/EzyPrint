@@ -10,6 +10,10 @@ import { Spinner } from '../common/Spinner';
 import { getOrderFiles } from '../../utils/orderHelpers';
 import { downloadFileNative } from '../../utils/mobile';
 
+const debugLog = (...args: unknown[]) => {
+  void args;
+};
+
 interface ShopOrderDetailsModalProps {
   order: DocumentOrder;
   isOpen: boolean;
@@ -46,7 +50,7 @@ const ShopOrderDetailsModal: React.FC<ShopOrderDetailsModalProps> = ({
         getDownloadURL(fileReference)
           .then(() => setDownloadError(null))
           .catch((error) => {
-            console.error("[ShopOrderDetailsModal] Error checking file:", error);
+            debugLog("[ShopOrderDetailsModal] Error checking file:", error);
             setDownloadError("Some files may be unavailable.");
           })
           .finally(() => setIsCheckingFiles(false));
@@ -62,8 +66,10 @@ const ShopOrderDetailsModal: React.FC<ShopOrderDetailsModalProps> = ({
   }, [order, isOpen]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleStatusUpdate = async () => {
-    await updateOrderStatus(order.id, selectedStatus, { shopNotes, actingUserType: UserType.SHOP_OWNER });
-    onClose();
+    const result = await updateOrderStatus(order.id, selectedStatus, { shopNotes, actingUserType: UserType.SHOP_OWNER });
+    if (result) {
+      onClose();
+    }
   };
 
   const handleDownloadFile = async (file: OrderFile, index: number) => {
@@ -80,14 +86,11 @@ const ShopOrderDetailsModal: React.FC<ShopOrderDetailsModalProps> = ({
       // Re-create blob with correct MIME type
       const mimeTypeMap: Record<string, string> = {
         'PDF': 'application/pdf',
-        'DOCX': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
         'PPTX': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-        'TXT': 'text/plain',
         'JPEG': 'image/jpeg',
         'JPG': 'image/jpeg',
         'PNG': 'image/png',
         'WEBP': 'image/webp',
-        'XLSX': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
       };
       const correctMimeType = mimeTypeMap[file.fileType.toUpperCase()] || rawBlob.type || 'application/octet-stream';
       const blob = new Blob([rawBlob], { type: correctMimeType });
@@ -102,7 +105,7 @@ const ShopOrderDetailsModal: React.FC<ShopOrderDetailsModalProps> = ({
       // Use cross-platform download (native filesystem on mobile, blob URL on web)
       await downloadFileNative(blob, downloadName);
     } catch (error: unknown) {
-      console.error("[ShopOrderDetailsModal] Error downloading file:", error);
+      debugLog("[ShopOrderDetailsModal] Error downloading file:", error);
       setDownloadError(`Download failed for "${file.fileName}": ${error instanceof Error ? error.message : "Unknown error"}`);
     } finally {
       setDownloadingFileIndex(null);
@@ -128,7 +131,7 @@ const ShopOrderDetailsModal: React.FC<ShopOrderDetailsModalProps> = ({
     { value: OrderStatus.COMPLETED, label: 'Order Completed' },
     { value: OrderStatus.CANCELLED, label: 'Cancel Order' },
   ].filter(s => {
-    if (order.status === OrderStatus.COMPLETED || order.status === OrderStatus.CANCELLED) {
+    if (order.status === OrderStatus.COMPLETED || order.status === OrderStatus.CANCELLED || order.status === OrderStatus.REFUNDED) {
       return s.value === order.status;
     }
     if (order.status === OrderStatus.READY_FOR_PICKUP && (s.value === OrderStatus.PRINTING || s.value === OrderStatus.PENDING_APPROVAL)) {
@@ -228,8 +231,10 @@ const ShopOrderDetailsModal: React.FC<ShopOrderDetailsModalProps> = ({
         <div className="bg-brand-secondaryLight/60 p-3 rounded-lg border border-brand-muted/30">
           <h5 className="font-semibold text-brand-primary mb-1">Print Summary:</h5>
           <ul className="list-disc list-inside text-xs space-y-0.5 text-gray-600 dark:text-gray-400">
-            <li>Total Pages: {order.printOptions.pages}</li>
-            <li>Files: {files.length} (settings per file shown above)</li>
+            <li className="font-semibold text-brand-primary bg-brand-primary/10 px-2 py-1 rounded inline-block mb-1">
+              Auto-Detected Pages: {order.printOptions.pages}
+            </li>
+            <li className="col-span-1">Files: {files.length} (settings per file shown above)</li>
           </ul>
         </div>
         <div className="bg-brand-secondaryLight/60 p-3 rounded-lg border border-brand-muted/30">
@@ -270,7 +275,7 @@ const ShopOrderDetailsModal: React.FC<ShopOrderDetailsModalProps> = ({
           placeholder="e.g., Print quality check complete."
           className="mt-2"
           rows={3}
-          disabled={order.status === OrderStatus.COMPLETED || order.status === OrderStatus.CANCELLED}
+          disabled={order.status === OrderStatus.COMPLETED || order.status === OrderStatus.CANCELLED || order.status === OrderStatus.REFUNDED}
         />
 
         <Select
@@ -280,10 +285,10 @@ const ShopOrderDetailsModal: React.FC<ShopOrderDetailsModalProps> = ({
           value={selectedStatus}
           onChange={(e) => setSelectedStatus(e.target.value as OrderStatus)}
           containerClassName="mt-4"
-          disabled={order.status === OrderStatus.COMPLETED || order.status === OrderStatus.CANCELLED}
+          disabled={order.status === OrderStatus.COMPLETED || order.status === OrderStatus.CANCELLED || order.status === OrderStatus.REFUNDED}
         />
-        <Button onClick={handleStatusUpdate} fullWidth className="mt-6" disabled={(selectedStatus === order.status && shopNotes === (order.shopNotes || '')) || order.status === OrderStatus.COMPLETED || order.status === OrderStatus.CANCELLED}>
-          {order.status === OrderStatus.COMPLETED || order.status === OrderStatus.CANCELLED ? 'Order Finalized' : 'Confirm & Update Status'}
+        <Button onClick={handleStatusUpdate} fullWidth className="mt-6" disabled={(selectedStatus === order.status && shopNotes === (order.shopNotes || '')) || order.status === OrderStatus.COMPLETED || order.status === OrderStatus.CANCELLED || order.status === OrderStatus.REFUNDED}>
+          {order.status === OrderStatus.COMPLETED || order.status === OrderStatus.CANCELLED || order.status === OrderStatus.REFUNDED ? 'Order Finalized' : 'Confirm & Update Status'}
         </Button>
       </div>
     </Modal>

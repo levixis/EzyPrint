@@ -17,20 +17,20 @@ export const Card: React.FC<CardProps> = ({ children, className = '', title, act
   useGSAP(() => {
     const card = cardRef.current;
     if (!card) return;
-
-    // Subtle scale and lift on hover
-    card.addEventListener('mouseenter', () => {
-      gsap.to(card, { y: -5, scale: 1.02, duration: 0.3, ease: 'power2.out', boxShadow: '0 10px 30px -5px rgba(79, 70, 229, 0.2)' });
-    });
-
-    card.addEventListener('mouseleave', () => {
-      gsap.to(card, { y: 0, scale: 1, duration: 0.3, ease: 'power2.out', boxShadow: 'none' });
-    });
-
   }, { scope: cardRef });
 
+  const handleMouseEnter = () => {
+    if (!cardRef.current) return;
+    gsap.to(cardRef.current, { y: -5, scale: 1.02, duration: 0.3, ease: 'power2.out', boxShadow: '0 10px 30px -5px rgba(79, 70, 229, 0.2)' });
+  };
+
+  const handleMouseLeave = () => {
+    if (!cardRef.current) return;
+    gsap.to(cardRef.current, { y: 0, scale: 1, duration: 0.3, ease: 'power2.out', boxShadow: 'none' });
+  };
+
   return (
-    <div ref={cardRef} className={`glass-card rounded-2xl overflow-hidden transition-all duration-300 ${className}`}>
+    <div ref={cardRef} onMouseEnter={handleMouseEnter} onMouseLeave={handleMouseLeave} className={`glass-card rounded-2xl overflow-hidden transition-all duration-300 ${className}`}>
       {(title || actions) && (
         <div className={`px-5 py-4 sm:px-6 border-b border-brand-muted/30 dark:border-brand-dark-border flex justify-between items-center ${titleClassName}`}>
           {title && <h3 className={`text-lg leading-6 font-semibold text-brand-primary ${titleClassName}`}>{title}</h3>}

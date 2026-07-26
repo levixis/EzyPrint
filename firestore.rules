@@ -10,126 +10,223 @@ service cloud.firestore {
              get(/databases/$(database)/documents/users/$(request.auth.uid)).data.type == 'ADMIN';
     }
 
+    // Helper functions for paymentConfig validation
+    function isValidMethod(method) {
+      return (method.type == 'UPI' && method.keys().hasAll(['id', 'type', 'upiId']) && method.keys().hasOnly(['id', 'type', 'upiId', 'nickname', 'isPrimary'])) ||
+             (method.type == 'BANK_ACCOUNT' && method.keys().hasAll(['id', 'type', 'accountHolderName', 'accountNumber', 'ifscCode', 'bankName']) && method.keys().hasOnly(['id', 'type', 'accountHolderName', 'accountNumber', 'ifscCode', 'bankName', 'nickname', 'isPrimary']));
+    }
+
+    function checkMethodsArray(methods) {
+      return methods is list && methods.size() <= 3 &&
+             (methods.size() == 0 ||
+               (methods.size() == 1 && isValidMethod(methods[0])) ||
+               (methods.size() == 2 && isValidMethod(methods[0]) && isValidMethod(methods[1])) ||
+               (methods.size() == 3 && isValidMethod(methods[0]) && isValidMethod(methods[1]) && isValidMethod(methods[2]))
+             );
+    }
+    
+    function countPrimary(methods) {
+      return (methods.size() > 0 && methods[0].get('isPrimary', false) == true ? 1 : 0) +
+             (methods.size() > 1 && methods[1].get('isPrimary', false) == true ? 1 : 0) +
+             (methods.size() > 2 && methods[2].get('isPrimary', false) == true ? 1 : 0);
+    }
+
+    function requesterProfileExists() {
+      return request.auth != null &&
+             exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function requesterType() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.type;
+    }
+
+    function requesterName() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.name;
+    }
+
     // Users can read their own profile, admin can read any
     match /users/{userId} {
-      allow read, delete: if request.auth != null && (request.auth.uid == userId || isAdmin());
+      allow read: if request.auth != null && (request.auth.uid == userId || isAdmin());
+      allow delete: if request.auth != null && isAdmin();
       
       allow create: if request.auth != null && (
-        isAdmin() || 
-        (request.auth.uid == userId && request.resource.data.type in ['STUDENT', 'SHOP_OWNER'])
+        isAdmin() || (
+          request.auth.uid == userId &&
+          request.resource.data.id == userId &&
+          (
+            (
+              request.resource.data.type == 'STUDENT' &&
+              // Allowlist: only safe onboarding fields allowed on first write.
+              // Privileged fields (shopId, hasStudentPass, walletBalance, isLocked, etc.)
+              // remain blocked for student account creation.
+              request.resource.data.keys().hasOnly([
+                'id', 'name', 'email', 'phone', 'type',
+                'createdAt', 'profilePhotoUrl', 'fcmTokens', 'preferredLanguage'
+              ])
+            ) ||
+            (
+              request.resource.data.type == 'SHOP_OWNER' &&
+              request.resource.data.shopId is string &&
+              request.resource.data.keys().hasOnly([
+                'id', 'name', 'email', 'phone', 'type', 'shopId',
+                'createdAt', 'profilePhotoUrl', 'fcmTokens', 'preferredLanguage'
+              ]) &&
+              exists(/databases/$(database)/documents/shops/$(request.resource.data.shopId)) &&
+              get(/databases/$(database)/documents/shops/$(request.resource.data.shopId)).data.ownerUserId == request.auth.uid
+            )
+          )
+        )
       );
 
-      // Bug 8: Block client identity escalation and privilege mutation
+      // Bug 8 + V-04: Block client identity escalation, unlocking, and privilege mutation
       allow update: if request.auth != null && (
         isAdmin() || 
         (
           request.auth.uid == userId && 
-          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['type', 'walletBalance', 'hasStudentPass', 'studentPassActivatedAt', 'studentPassPaymentId'])
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['type', 'walletBalance', 'studentPassActivatedAt', 'studentPassPaymentId', 'shopId', 'isLocked', 'isArchived']) &&
+          (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['hasStudentPass']) || request.resource.data.hasStudentPass == false)
         )
       );
     }
 
     // Shops
     match /shops/{shopId} {
-      // Anyone can read shop listings (e.g., for students to browse)
-      allow read: if true;
+      // Authenticated users can read shops.
+      // Students see only approved shops; admins and the shop's own owner can read any shop.
+      allow read: if request.auth != null && (
+        isAdmin() ||
+        (resource.data.ownerUserId == request.auth.uid) ||
+        resource.data.isApproved == true
+      );
 
       // Authenticated users who are shop owners can create their shop
       // Ensure the ownerUserId in the new shop document matches the authenticated user
       // Bug 11: Shop Verification Bypass
-      allow create: if request.auth != null && 
+      allow create: if request.auth != null &&
                     request.auth.uid == request.resource.data.ownerUserId &&
+                    request.resource.data.id == shopId &&
+                    ('createdAt' in request.resource.data) &&
                     request.resource.data.isVerified == false &&
-                    request.resource.data.isApproved == false;
+                    request.resource.data.isApproved == false &&
+                    // Pricing must be non-negative at creation (mirrors the update-path guard)
+                    request.resource.data.customPricing.bwPerPage >= 0 &&
+                    request.resource.data.customPricing.colorPerPage >= 0 &&
+                    // Allowlist: financial/ledger fields may never be seeded by a client.
+                    request.resource.data.keys().hasOnly([
+                      'id', 'ownerUserId', 'name', 'address', 'customPricing',
+                      'isOpen', 'isApproved', 'isVerified', 'isArchived',
+                      'contactPhone', 'contactPhoneAlt', 'contactEmail',
+                      'whatsappNumber', 'createdAt'
+                    ]);
 
       // Only the owner of the shop (or admin) can update it
-      // SECURITY: ownerUserId cannot be mutated by shop owner.
       // PRICING VALIDATION: bwPerPage and colorPerPage must be >= 0 to prevent
       // negative pricing attacks that could crash Razorpay or create free orders
+      // DATA VALIDATION: Enforce regex formats for phone and email
+      // SECURITY V-01 & V-02 & V-05: Freeze financial, verification, and archival fields from client manipulation
       allow update: if request.auth != null &&
         (isAdmin() || (
           request.auth.uid == resource.data.ownerUserId &&
           request.resource.data.ownerUserId == resource.data.ownerUserId &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['ledgerBalance', 'debtAmount', 'isVerified', 'isApproved', 'isArchived']) &&
           request.resource.data.customPricing.bwPerPage >= 0 &&
-          request.resource.data.customPricing.colorPerPage >= 0
+          request.resource.data.customPricing.colorPerPage >= 0 &&
+          ( !('contactPhone' in request.resource.data) || request.resource.data.contactPhone == null || request.resource.data.contactPhone.matches('^\\d{10}$') ) &&
+          ( !('contactPhoneAlt' in request.resource.data) || request.resource.data.contactPhoneAlt == null || request.resource.data.contactPhoneAlt.matches('^\\d{10}$') ) &&
+          ( !('whatsappNumber' in request.resource.data) || request.resource.data.whatsappNumber == null || request.resource.data.whatsappNumber.matches('^\\d{10}$') ) &&
+          ( !('contactEmail' in request.resource.data) || request.resource.data.contactEmail == null || request.resource.data.contactEmail.matches('^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,4}$') )
         ));
 
-      // Only the owner or admin can delete
-      allow delete: if request.auth != null && (request.auth.uid == resource.data.ownerUserId || isAdmin());
+      // Deletions must go through Cloud Functions, except for Admins purging unapproved pending profiles
+      allow delete: if request.auth != null && isAdmin();
     }
 
     // Orders
     match /orders/{orderId} {
-      // Students can create their own orders (Bug 9: Enforce exact starting status)
-      allow create: if request.auth != null && 
-                    request.auth.uid == request.resource.data.userId &&
-                    request.resource.data.status == 'PENDING_PAYMENT';
+      // Orders must be initialized server-side to prevent draft/order spoofing and
+      // storage abuse via self-created placeholder documents.
+      allow create: if false;
 
       // Students can read/update their own orders
       // Shop owners can read/update orders for their shop
       // Admin can read/update any order
-      allow read: if request.auth != null && 
-                          (request.auth.uid == resource.data.userId || 
-                           resource.data.shopId == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.shopId ||
-                           isAdmin());
+      allow read: if request.auth != null &&
+                          (request.auth.uid == resource.data.userId ||
+                           isAdmin() ||
+                           // Canonical ownership check — does NOT trust users.shopId
+                           (resource.data.shopId != null &&
+                            exists(/databases/$(database)/documents/shops/$(resource.data.shopId)) &&
+                            get(/databases/$(database)/documents/shops/$(resource.data.shopId)).data.ownerUserId == request.auth.uid));
 
       // SECURITY: Prevent automated refund theft by restricting status transitions
       // AND prevent Razorpay Order ID and pricing forgery by freezing financial fields
       allow update: if request.auth != null && (
         isAdmin() ||
         (
-          resource.data.shopId == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.shopId &&
-          request.resource.data.status in ['PENDING_PAYMENT', 'PENDING_APPROVAL', 'PRINTING', 'READY_FOR_PICKUP', 'COMPLETED', 'CANCELLED', 'PAYMENT_FAILED']
+          resource.data.shopId != null &&
+          exists(/databases/$(database)/documents/shops/$(resource.data.shopId)) &&
+          get(/databases/$(database)/documents/shops/$(resource.data.shopId)).data.ownerUserId == request.auth.uid &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'shopNotes', 'pickupCode']) &&
+          request.resource.data.status in ['PENDING_PAYMENT', 'PENDING_APPROVAL', 'PRINTING', 'READY_FOR_PICKUP', 'COMPLETED', 'CANCELLED', 'PAYMENT_FAILED'] &&
+          (
+            request.resource.data.status == resource.data.status ||
+            (request.resource.data.status == 'CANCELLED' && resource.data.status in ['PENDING_PAYMENT', 'PENDING_APPROVAL']) ||
+            (
+              request.resource.data.status in ['PENDING_APPROVAL', 'PRINTING', 'READY_FOR_PICKUP', 'COMPLETED'] &&
+              resource.data.status in ['PENDING_APPROVAL', 'PRINTING', 'READY_FOR_PICKUP']
+            )
+          ) &&
+          (
+            !request.resource.data.diff(resource.data).affectedKeys().hasAny(['pickupCode']) ||
+            (
+              request.resource.data.status == 'READY_FOR_PICKUP' &&
+              request.resource.data.pickupCode is string &&
+              request.resource.data.pickupCode.size() >= 4 &&
+              request.resource.data.pickupCode.size() <= 12 &&
+              (!('pickupCode' in resource.data) || resource.data.pickupCode == null)
+            )
+          )
         ) ||
         (
           request.auth.uid == resource.data.userId &&
-          // Students can only cancel if it hasn't been printed or completed yet
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'paymentAttemptedAt']) &&
           (
-            request.resource.data.status == resource.data.status || 
+            request.resource.data.status == resource.data.status ||
             (request.resource.data.status == 'CANCELLED' && resource.data.status in ['PENDING_PAYMENT', 'PENDING_APPROVAL']) ||
             (request.resource.data.status == 'PAYMENT_FAILED' && resource.data.status == 'PENDING_PAYMENT')
+          ) &&
+          (
+            !request.resource.data.diff(resource.data).affectedKeys().hasAny(['paymentAttemptedAt']) ||
+            request.resource.data.paymentAttemptedAt is string
           )
         )
-      ) && (
-        // Bug 7: Completely freeze financial indicators on the client side
-        isAdmin() || 
-        (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['razorpayOrderId', 'priceDetails', 'files', 'shopId', 'userId']))
       );
       
       // Deletion of orders might be restricted or handled by functions
       allow delete: if false;
     }
 
-    // Payouts — admin has full access, shop owners can create requests and manage their own
+    // Payouts — admin and shop owners can read, all writes via Cloud Functions
     match /payouts/{payoutId} {
-      // Admin can do anything with payouts
-      allow read, write: if request.auth != null && isAdmin();
-      
-      // Shop owners can CREATE payout requests for their own shop
-      allow create: if request.auth != null && 
-                    request.resource.data.shopId == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.shopId;
+      // Consolidated read: admin or canonical shop owner
+      allow read: if request.auth != null && (
+        isAdmin() ||
+        (resource.data.shopId != null &&
+         exists(/databases/$(database)/documents/shops/$(resource.data.shopId)) &&
+         get(/databases/$(database)/documents/shops/$(resource.data.shopId)).data.ownerUserId == request.auth.uid)
+      );
 
-      // Shop owners can read payouts for their shop
-      allow read: if request.auth != null && 
-                  resource.data.shopId == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.shopId;
-
-      // Shop owners can update status on their own payouts (confirm/dispute)
-      allow update: if request.auth != null && (
-                      isAdmin() || (
-                        resource.data.shopId == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.shopId &&
-                        request.resource.data.amount == resource.data.amount &&
-                        request.resource.data.shopId == resource.data.shopId &&
-                        request.resource.data.id == resource.data.id &&
-                        request.resource.data.status in ['CONFIRMED', 'DISPUTED']
-                      )
-                    );
+      // All payout writes must go through Cloud Functions
+      allow create: if false;
+      allow update: if false;
+      allow delete: if false;
     }
 
     // Notifications — Firestore-backed cross-user notification system
     match /notifications/{notificationId} {
-      // Bug 12: Users can read/delete their own notifications, admin can delete any
+      // Bug 12: Users can read their own notifications
       allow read: if request.auth != null && resource.data.recipientUserId == request.auth.uid;
-      allow delete: if request.auth != null && (resource.data.recipientUserId == request.auth.uid || isAdmin());
+      allow delete: if false; // Only Cloud Functions can delete/cleanup
       
       // Clients can only update the 'read' status; creation is moved to Cloud Functions
       allow update: if request.auth != null && 
@@ -138,14 +235,37 @@ service cloud.firestore {
       allow create: if false; // Only Cloud Functions can create
     }
 
-    // Bank Details — Private sub-collection for shops
+    // Bank Details & Payment Config — Private sub-collection for shops
     match /shops/{shopId}/private/{docId} {
-      // Only the shop owner and admin can read/write bank details
+      // Only the shop owner and admin can read/write private config
       allow read: if request.auth != null &&
-        (request.auth.uid == get(/databases/$(database)/documents/shops/$(shopId)).data.ownerUserId || isAdmin());
+        (isAdmin() || (
+          exists(/databases/$(database)/documents/shops/$(shopId)) &&
+          request.auth.uid == get(/databases/$(database)/documents/shops/$(shopId)).data.ownerUserId
+        ));
 
       allow write: if request.auth != null &&
-        (request.auth.uid == get(/databases/$(database)/documents/shops/$(shopId)).data.ownerUserId || isAdmin());
+        (
+          isAdmin() || (
+            exists(/databases/$(database)/documents/shops/$(shopId)) &&
+            request.auth.uid == get(/databases/$(database)/documents/shops/$(shopId)).data.ownerUserId
+          )
+        ) &&
+        (
+          (docId == 'bankDetails' && (
+            request.resource.data.accountNumber.matches('^\\d{9,18}$') &&
+            request.resource.data.ifscCode.matches('^[A-Z]{4}0[A-Z0-9]{6}$') &&
+            (isAdmin() || (
+              (resource == null && (!('isVerified' in request.resource.data) || request.resource.data.isVerified == false)) ||
+              (resource != null && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['isVerified', 'verifiedAt', 'verifiedBy']))
+            ))
+          )) ||
+          (docId == 'paymentConfig' && (
+            request.resource.data.keys().hasOnly(['payoutMethods', 'updatedAt']) &&
+            checkMethodsArray(request.resource.data.payoutMethods) &&
+            countPrimary(request.resource.data.payoutMethods) <= 1
+          ))
+        );
     }
 
     // Bank Access Logs
@@ -154,32 +274,99 @@ service cloud.firestore {
       allow read: if request.auth != null && isAdmin();
 
       // Authenticated users can create logs (owner views, admin views/verifies)
-      allow create: if request.auth != null;
+      // Field allowlist prevents forging userId, userRole, or arbitrary extra fields
+      allow create: if request.auth != null && (
+        isAdmin() || (
+          exists(/databases/$(database)/documents/shops/$(shopId)) &&
+          request.auth.uid == get(/databases/$(database)/documents/shops/$(shopId)).data.ownerUserId
+        )
+      ) &&
+        request.resource.data.keys().hasOnly(['userId', 'userRole', 'action', 'timestamp', 'shopId']) &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.action is string &&
+        request.resource.data.timestamp is string;
     }
 
     // Support Tickets
     match /tickets/{ticketId} {
-      // Users can create tickets for themselves
-      allow create: if request.auth != null && request.auth.uid == request.resource.data.raisedBy;
+      // Tickets are created server-side via Cloud Functions so the client cannot spoof identity fields.
+      allow create: if false;
 
-      // Users can read their own tickets, admin can read all
+      // Users can read their own tickets, admin can read all, shopkeepers can read tickets routed to their shop
       allow read: if request.auth != null &&
-        (request.auth.uid == resource.data.raisedBy || isAdmin());
+        (
+          request.auth.uid == resource.data.raisedBy || 
+          isAdmin() ||
+          (resource.data.shopId != null && exists(/databases/$(database)/documents/shops/$(resource.data.shopId)) && get(/databases/$(database)/documents/shops/$(resource.data.shopId)).data.ownerUserId == request.auth.uid)
+        );
 
       // Users can update their own tickets (Bug 13: append-only messages)
       allow update: if request.auth != null && (
         isAdmin() ||
         (
+          // Ticket raiser: append-only messages/statusHistory AND limited status transitions
           request.auth.uid == resource.data.raisedBy &&
-          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['messages', 'raiserLastRepliedAt', 'updatedAt']) &&
-          request.resource.data.messages.hasAll(resource.data.messages) &&
-          request.resource.data.messages.size() == resource.data.messages.size() + 1 &&
-          request.resource.data.messages[request.resource.data.messages.size() - 1].senderId == request.auth.uid
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['messages', 'raiserLastRepliedAt', 'updatedAt', 'status', 'statusHistory', 'resolvedAt']) &&
+          (
+            request.resource.data.messages == resource.data.messages || (
+              request.resource.data.messages.hasAll(resource.data.messages) &&
+              request.resource.data.messages.size() == resource.data.messages.size() + 1 &&
+              requesterProfileExists() &&
+              request.resource.data.messages[request.resource.data.messages.size() - 1].senderId == request.auth.uid &&
+              request.resource.data.messages[request.resource.data.messages.size() - 1].senderType == requesterType() &&
+              request.resource.data.messages[request.resource.data.messages.size() - 1].senderName == requesterName()
+            )
+          ) &&
+          (
+            request.resource.data.statusHistory == resource.data.statusHistory || (
+              request.resource.data.statusHistory.hasAll(resource.data.statusHistory) &&
+              request.resource.data.statusHistory.size() == resource.data.statusHistory.size() + 1 &&
+              requesterProfileExists() &&
+              request.resource.data.statusHistory[request.resource.data.statusHistory.size() - 1].changedBy == request.auth.uid &&
+              request.resource.data.statusHistory[request.resource.data.statusHistory.size() - 1].changedByName == requesterName()
+            )
+          ) &&
+          (request.resource.data.messages.size() > resource.data.messages.size() || request.resource.data.statusHistory.size() > resource.data.statusHistory.size()) &&
+          // Status transition allowlist for ticket raisers:
+          // They may only close an open/in-review ticket, or reply without changing status
+          (resource.data.status == request.resource.data.status ||
+            (request.resource.data.status == 'CLOSED' && resource.data.status in ['OPEN', 'IN_REVIEW']))
+        ) ||
+        (
+          // Append-only updates for shopkeeper managing this ticket
+          resource.data.shopId != null && 
+          exists(/databases/$(database)/documents/shops/$(resource.data.shopId)) && 
+          get(/databases/$(database)/documents/shops/$(resource.data.shopId)).data.ownerUserId == request.auth.uid &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['messages', 'shopLastRepliedAt', 'updatedAt', 'status', 'statusHistory']) &&
+          (
+            request.resource.data.messages == resource.data.messages || (
+              request.resource.data.messages.hasAll(resource.data.messages) &&
+              request.resource.data.messages.size() == resource.data.messages.size() + 1 &&
+              requesterProfileExists() &&
+              request.resource.data.messages[request.resource.data.messages.size() - 1].senderId == request.auth.uid &&
+              request.resource.data.messages[request.resource.data.messages.size() - 1].senderType == requesterType() &&
+              request.resource.data.messages[request.resource.data.messages.size() - 1].senderName == requesterName()
+            )
+          ) &&
+          (
+            request.resource.data.statusHistory == resource.data.statusHistory || (
+              request.resource.data.statusHistory.hasAll(resource.data.statusHistory) &&
+              request.resource.data.statusHistory.size() == resource.data.statusHistory.size() + 1 &&
+              requesterProfileExists() &&
+              request.resource.data.statusHistory[request.resource.data.statusHistory.size() - 1].changedBy == request.auth.uid &&
+              request.resource.data.statusHistory[request.resource.data.statusHistory.size() - 1].changedByName == requesterName()
+            )
+          ) &&
+          (request.resource.data.messages.size() > resource.data.messages.size() || request.resource.data.statusHistory.size() > resource.data.statusHistory.size()) &&
+          // Status transition allowlist for shop owners:
+          // They may only close an open/in-review ticket, or reply without changing status
+          (resource.data.status == request.resource.data.status ||
+            (request.resource.data.status == 'CLOSED' && resource.data.status in ['OPEN', 'IN_REVIEW']))
         )
       );
 
-      // Only admin can delete tickets
-      allow delete: if request.auth != null && isAdmin();
+      // All tickets are soft-deleted or cleaned up by functions
+      allow delete: if false;
     }
 
     // Earnings Reports metadata
@@ -196,6 +383,61 @@ service cloud.firestore {
     match /refundAuditLog/{logId} {
       allow read: if request.auth != null && isAdmin();
       allow write: if false;
+    }
+
+    // Reactivation Requests — shopkeepers request, admins resolve
+    match /reactivationRequests/{requestId} {
+      // Owner and admin can read
+      allow read: if request.auth != null &&
+        (request.auth.uid == resource.data.ownerUid || isAdmin());
+
+      // Creation only via Cloud Functions (submitReactivationRequest)
+      allow create: if false;
+
+      // Only Cloud Functions / admin can update (approve/reject)
+      allow update: if request.auth != null && isAdmin();
+
+      // No direct deletes
+      allow delete: if false;
+    }
+
+    // Backend-only Audit and Action Collections (Explicitly Deny All Clients)
+    match /accountActionAuditLog/{docId} { allow read, write: if false; }
+    match /accountActionOtps/{docId} { allow read, write: if false; }
+    match /reportsArchive/{docId} { allow read, write: if false; }
+    match /auditLogs/{docId} { allow read, write: if false; }
+    match /rateLimits/{docId} { allow read, write: if false; }
+    match /refundIntents/{docId} { allow read, write: if false; }
+
+    // shopAggregates — read-only computed summaries for dashboards
+    match /shopAggregates/{shopId} {
+      allow read: if request.auth != null && (
+        isAdmin() ||
+        (exists(/databases/$(database)/documents/shops/$(shopId)) &&
+         get(/databases/$(database)/documents/shops/$(shopId)).data.ownerUserId == request.auth.uid)
+      );
+      allow write: if false; // Cloud Functions only
+    }
+    
+    // shopLedger — read-only for shops/admin, Cloud Functions write only
+    match /shopLedger/{entryId} {
+      allow read: if isAdmin()
+        || (resource.data.shopId != null 
+            && exists(/databases/$(database)/documents/shops/$(resource.data.shopId))
+            && get(/databases/$(database)/documents/shops/$(resource.data.shopId)).data.ownerUserId == request.auth.uid);
+      allow write: if false; // Cloud Functions only (admin SDK bypasses rules)
+    }
+
+    // refundRequests — role-based access
+    match /refundRequests/{requestId} {
+      allow read: if isAdmin()
+        || resource.data.studentId == request.auth.uid
+        || (resource.data.shopId != null
+            && exists(/databases/$(database)/documents/shops/$(resource.data.shopId))
+            && get(/databases/$(database)/documents/shops/$(resource.data.shopId)).data.ownerUserId == request.auth.uid);
+      allow create: if false; // Cloud Functions only
+      allow update: if false; // Cloud Functions only for state transitions
+      allow delete: if false;
     }
   }
 }

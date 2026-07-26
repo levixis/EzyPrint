@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useAppContext } from '../../contexts/AppContext';
 import { Button } from '../common/Button';
 import { Card } from '../common/Card';
@@ -34,7 +34,7 @@ const MailIcon: React.FC = () => (
 const SESSION_STORAGE_INTENDED_TYPE_KEY = 'ezyprint_intendedUserType';
 const SESSION_STORAGE_AUTH_METHOD_KEY = 'ezyprint_authMethod';
 
-type LoginStep = 'pathSelection' | 'emailAuth' | 'shopOwnerDetails' | 'confirmGoogleUserName' | 'selectRoleForPendingProfile' | 'processing';
+type LoginStep = 'pathSelection' | 'emailAuth' | 'shopOwnerDetails' | 'confirmGoogleUserName' | 'selectRoleForPendingProfile' | 'processing' | 'accountExists' | 'shopArchived';
 type AuthMode = 'google' | 'email';
 type EmailSubMode = 'signin' | 'signup';
 
@@ -45,6 +45,8 @@ const LoginPage: React.FC = () => {
     signInWithEmailAndPassword,
     completeStudentProfileCreation,
     completeShopOwnerProfileCreation,
+    checkReturningShopOwner,
+    submitReactivationRequest,
     isLoadingAuth,
     currentUser,
     pendingFirebaseProfileCreationUser,
@@ -63,9 +65,14 @@ const LoginPage: React.FC = () => {
 
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
+  const [archivedShopName, setArchivedShopName] = useState('');
+  const [archivedShopId, setArchivedShopId] = useState('');
+  const [isSubmittingReactivation, setIsSubmittingReactivation] = useState(false);
+  const [reactivationSubmitted, setReactivationSubmitted] = useState(false);
 
   const [intendedUserTypeForSignup, setIntendedUserTypeForSignup] = useState<UserType | null>(null);
   const [authMethodForSignup, setAuthMethodForSignup] = useState<'google' | 'email' | null>(null);
+  const isCheckingShopOwnerRef = useRef(false);
 
   const clearSessionStorageAuthFlow = () => {
     sessionStorage.removeItem(SESSION_STORAGE_INTENDED_TYPE_KEY);
@@ -120,6 +127,34 @@ const LoginPage: React.FC = () => {
       const currentIntendedType = intendedUserTypeForSignup || restoredIntendedType;
 
 
+      const checkAndHandleShopOwner = () => {
+        if (step !== 'shopOwnerDetails' && step !== 'accountExists' && step !== 'shopArchived' && !isCheckingShopOwnerRef.current) {
+          isCheckingShopOwnerRef.current = true;
+          setStep('processing');
+          checkReturningShopOwner(authUser.email || '')
+            .then(res => {
+              isCheckingShopOwnerRef.current = false;
+              if (res.hasActiveAccount) {
+                // Active account exists — block signup, redirect to sign-in
+                setStep('accountExists');
+              } else if (res.hasArchivedShop && res.shop) {
+                // Archived shop — let user submit reactivation request directly
+                setArchivedShopName(res.shop.name || 'your shop');
+                setArchivedShopId(res.shop.id || '');
+                setStep('shopArchived');
+              } else {
+                // Orphaned or no match — proceed with fresh registration
+                setStep('shopOwnerDetails');
+              }
+            })
+            .catch(err => {
+              isCheckingShopOwnerRef.current = false;
+              void err;
+              setStep('shopOwnerDetails');
+            });
+        }
+      };
+
       if (currentAuthMethod === 'email') {
         if (authMode !== 'email') setAuthMode('email');
         if (currentIntendedType === UserType.STUDENT) {
@@ -128,7 +163,7 @@ const LoginPage: React.FC = () => {
             .then(result => handleProfileCreationResult(result, null, 'emailAuth'))
             .catch(err => handleProfileCreationError(err, 'emailAuth'));
         } else if (currentIntendedType === UserType.SHOP_OWNER) {
-          if (step !== 'shopOwnerDetails') setStep('shopOwnerDetails');
+          checkAndHandleShopOwner();
         } else {
           if (step !== 'selectRoleForPendingProfile') setStep('selectRoleForPendingProfile');
         }
@@ -139,7 +174,7 @@ const LoginPage: React.FC = () => {
         if (currentIntendedType === UserType.STUDENT) {
           if (step !== 'confirmGoogleUserName') setStep('confirmGoogleUserName');
         } else if (currentIntendedType === UserType.SHOP_OWNER) {
-          if (step !== 'shopOwnerDetails') setStep('shopOwnerDetails');
+          checkAndHandleShopOwner();
         } else {
           if (step !== 'selectRoleForPendingProfile') setStep('selectRoleForPendingProfile');
         }
@@ -168,18 +203,20 @@ const LoginPage: React.FC = () => {
         }
       }
     } else if (!pendingFirebaseProfileCreationUser && !currentUser && !isLoadingAuth) {
-      const intermediateSteps: LoginStep[] = ['processing', 'confirmGoogleUserName', 'shopOwnerDetails', 'selectRoleForPendingProfile'];
+      const intermediateSteps: LoginStep[] = ['processing', 'confirmGoogleUserName', 'shopOwnerDetails', 'selectRoleForPendingProfile', 'accountExists', 'shopArchived'];
       if (intermediateSteps.includes(step)) {
         handleCancelAndReset(true);
       }
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     isLoadingAuth, currentUser, pendingFirebaseProfileCreationUser,
     intendedUserTypeForSignup, authMethodForSignup, nameForProfile,
-    completeStudentProfileCreation, completeShopOwnerProfileCreation,
+    completeStudentProfileCreation, completeShopOwnerProfileCreation, checkReturningShopOwner,
     step, authMode
   ]);
 
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const handleAuthError = (error: unknown, _context: string): string => {
     const message = error instanceof Error ? error.message : "An unexpected error occurred.";
     setError(message);
@@ -274,6 +311,7 @@ const LoginPage: React.FC = () => {
 
   const handleCancelAndReset = async (softReset = false) => {
     setError(''); setMessage('');
+    isCheckingShopOwnerRef.current = false;
 
     if (!softReset) { // Hard reset
       clearSessionStorageAuthFlow();
@@ -284,6 +322,7 @@ const LoginPage: React.FC = () => {
       setIntendedUserTypeForSignup(null);
       setAuthMethodForSignup(null);
     } else {
+      // Soft reset logic here (currently empty)
     }
 
     // Common reset for both soft and hard, except for critical flow states on soft.
@@ -473,6 +512,90 @@ const LoginPage: React.FC = () => {
               Back / Cancel
             </Button>
           </form>
+        )}
+
+        {step === 'accountExists' && (
+          <div className="space-y-5 p-4 pt-6 text-center">
+            <div className="w-16 h-16 mx-auto bg-amber-100 dark:bg-amber-900/30 rounded-full flex items-center justify-center mb-2">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-8 h-8 text-amber-600 dark:text-amber-400">
+                <path fillRule="evenodd" d="M9.401 3.003c1.155-2 4.043-2 5.197 0l7.355 12.748c1.154 2-.29 4.5-2.599 4.5H4.645c-2.309 0-3.752-2.5-2.598-4.5L9.4 3.003ZM12 8.25a.75.75 0 0 1 .75.75v3.75a.75.75 0 0 1-1.5 0V9a.75.75 0 0 1 .75-.75Zm0 8.25a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Z" clipRule="evenodd" />
+              </svg>
+            </div>
+            <h2 className="text-xl font-semibold text-gray-900 dark:text-white">Account Already Exists</h2>
+            <p className="text-sm text-gray-600 dark:text-gray-400">
+              An active shop owner account with this email already exists. Please sign out and sign in with your existing credentials.
+            </p>
+            <Button
+              onClick={async () => { await signOut(auth); handleCancelAndReset(false); setEmailSubMode('signin'); }}
+              variant="primary" size="lg" fullWidth
+            >
+              Sign Out & Sign In
+            </Button>
+            <Button
+              type="button" variant="ghost" size="sm"
+              onClick={() => handleCancelAndReset(false)} fullWidth className="!text-xs"
+            >
+              Cancel
+            </Button>
+          </div>
+        )}
+
+        {step === 'shopArchived' && (
+          <div className="space-y-5 p-4 pt-6 text-center">
+            <div className="w-16 h-16 mx-auto bg-blue-100 dark:bg-blue-900/30 rounded-full flex items-center justify-center mb-2">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-8 h-8 text-blue-600 dark:text-blue-400">
+                <path d="M3.375 3C2.339 3 1.5 3.84 1.5 4.875v.75c0 1.036.84 1.875 1.875 1.875h17.25c1.035 0 1.875-.84 1.875-1.875v-.75C22.5 3.839 21.66 3 20.625 3H3.375Z" />
+                <path fillRule="evenodd" d="m3.087 9 .54 9.176A3 3 0 0 0 6.62 21h10.757a3 3 0 0 0 2.995-2.824L20.913 9H3.087Zm6.163 3.75A.75.75 0 0 1 10 12h4a.75.75 0 0 1 0 1.5h-4a.75.75 0 0 1-.75-.75Z" clipRule="evenodd" />
+              </svg>
+            </div>
+            <h2 className="text-xl font-semibold text-gray-900 dark:text-white">Shop Archived</h2>
+            <p className="text-sm text-gray-600 dark:text-gray-400">
+              Your shop <strong>"{archivedShopName}"</strong> has been archived by the admin. You can request reactivation below.
+            </p>
+
+            {error && (
+              <p className="text-sm text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 px-3 py-2 rounded-lg">
+                {error}
+              </p>
+            )}
+
+            {reactivationSubmitted ? (
+              <div className="bg-emerald-50 dark:bg-emerald-900/20 px-4 py-3 rounded-xl border border-emerald-200 dark:border-emerald-800">
+                <p className="text-sm font-medium text-emerald-700 dark:text-emerald-400">
+                  ✅ Reactivation request submitted! The admin will review it shortly.
+                </p>
+              </div>
+            ) : (
+              <Button
+                onClick={async () => {
+                  if (!archivedShopId) { setError('Could not identify the shop.'); return; }
+                  setIsSubmittingReactivation(true); setError('');
+                  const result = await submitReactivationRequest(archivedShopId, archivedShopName);
+                  setIsSubmittingReactivation(false);
+                  if (result.success) {
+                    setReactivationSubmitted(true);
+                  } else {
+                    if (result.message?.includes('already pending')) {
+                      setReactivationSubmitted(true);
+                    } else {
+                      setError(result.message || 'Failed to submit request.');
+                    }
+                  }
+                }}
+                variant="primary" size="lg" fullWidth
+                disabled={isSubmittingReactivation}
+              >
+                {isSubmittingReactivation ? 'Submitting...' : '📨 Request Reactivation'}
+              </Button>
+            )}
+
+            <Button
+              type="button" variant="ghost" size="sm"
+              onClick={async () => { await signOut(auth); handleCancelAndReset(false); }} fullWidth className="!text-xs"
+            >
+              Sign Out
+            </Button>
+          </div>
         )}
       </Card>
       <p className="mt-8 text-xs text-gray-500 dark:text-gray-400 text-center max-w-md px-2">

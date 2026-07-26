@@ -11,6 +11,9 @@ import { app } from '../../firebase';
 
 const RAZORPAY_KEY_ID = import.meta.env.VITE_RAZORPAY_KEY_ID;
 const functions = getFunctions(app, 'asia-south1');
+const debugLog = (...args: unknown[]) => {
+    void args;
+};
 
 interface PaymentModalProps {
     isOpen: boolean;
@@ -57,6 +60,7 @@ const PaymentModal: React.FC<PaymentModalProps> = ({ isOpen, onClose, order, onP
     }, [isOpen, isMobile]);
 
     const openRazorpayCheckout = async () => {
+        if (isProcessing) return;
         setIsProcessing(true);
         setStatusMessage('Creating secure order...');
 
@@ -97,7 +101,7 @@ const PaymentModal: React.FC<PaymentModalProps> = ({ isOpen, onClose, order, onP
                     });
                     onPaymentSuccess(order.id);
                 } catch (nativeError: unknown) {
-                    console.error('Native Razorpay error:', nativeError);
+                    debugLog('Native Razorpay error:', nativeError);
                     onPaymentFailure(order.id);
                 } finally {
                     setIsProcessing(false);
@@ -118,7 +122,7 @@ const PaymentModal: React.FC<PaymentModalProps> = ({ isOpen, onClose, order, onP
                             });
                             onPaymentSuccess(order.id);
                         } catch (verifyError: unknown) {
-                            console.error('Payment verification failed:', verifyError);
+                            debugLog('Payment verification failed:', verifyError);
                             onPaymentFailure(order.id);
                         } finally {
                             setIsProcessing(false);
@@ -141,7 +145,7 @@ const PaymentModal: React.FC<PaymentModalProps> = ({ isOpen, onClose, order, onP
                 rzp.open();
             }
         } catch (error: unknown) {
-            console.error('Failed to create Razorpay order:', error);
+            debugLog('Failed to create Razorpay order:', error);
             setStatusMessage('');
             setIsProcessing(false);
         }

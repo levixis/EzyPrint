@@ -7,11 +7,13 @@ import { app } from '../../firebase';
 
 const RAZORPAY_KEY_ID = import.meta.env.VITE_RAZORPAY_KEY_ID;
 const functions = getFunctions(app, 'asia-south1');
+const debugLog = (...args: unknown[]) => {
+    void args;
+};
 
 const EzyPrintLogo: React.FC<{ className?: string }> = ({ className = '' }) => (
     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className={className}>
-        <path d="M19 8H5c-1.66 0-3 1.34-3 3v6h4v4h12v-4h4v-6c0-1.66-1.34-3-3-3zm-3 11H8v-5h8v5zm3-7H5v-1c0-.55.45-1 1-1h12c.55 0 1 .45 1 1v1zm-1-9H6v4h12V3z" />
-        <path fill="none" d="M0 0h24v24H0z" />
+        <path fillRule="evenodd" d="M1.5 6.375c0-1.036.84-1.875 1.875-1.875h17.25c1.035 0 1.875.84 1.875 1.875v3.026a.75.75 0 0 1-.375.65 2.249 2.249 0 0 0 0 3.898.75.75 0 0 1 .375.65v3.026c0 1.035-.84 1.875-1.875 1.875H3.375A1.875 1.875 0 0 1 1.5 17.625v-3.026a.75.75 0 0 1 .374-.65 2.249 2.249 0 0 0 0-3.898.75.75 0 0 1-.374-.65V6.375Zm15-1.125a.75.75 0 0 1 .75.75v.75a.75.75 0 0 1-1.5 0V6a.75.75 0 0 1 .75-.75Zm.75 4.5a.75.75 0 0 0-1.5 0v.75a.75.75 0 0 0 1.5 0v-.75Zm-.75 3a.75.75 0 0 1 .75.75v.75a.75.75 0 0 1-1.5 0v-.75a.75.75 0 0 1 .75-.75Zm.75 4.5a.75.75 0 0 0-1.5 0V18a.75.75 0 0 0 1.5 0v-.75ZM6 12a.75.75 0 0 1 .75-.75H12a.75.75 0 0 1 0 1.5H6.75A.75.75 0 0 1 6 12Zm.75 2.25a.75.75 0 0 0 0 1.5h3a.75.75 0 0 0 0-1.5h-3Z" clipRule="evenodd" />
     </svg>
 );
 
@@ -96,7 +98,7 @@ const StudentPassPage: React.FC = () => {
                     });
                     await upgradeToStudentPass();
                 } catch (verifyError: unknown) {
-                    console.error('Pass payment verification failed:', verifyError);
+                    debugLog('Pass payment verification failed:', verifyError);
                     setErrorMessage('Payment verification failed. If you were charged, please contact support.');
                 } finally {
                     setIsProcessing(false);
@@ -137,10 +139,9 @@ const StudentPassPage: React.FC = () => {
                     setIsProcessing(true);
                     await verifyAndUpgrade(response as { razorpay_order_id: string; razorpay_payment_id: string; razorpay_signature: string });
                 } catch (nativeError: unknown) {
-                    console.error('Native Razorpay pass error:', nativeError);
+                    debugLog('Native Razorpay pass error:', nativeError);
                     const errMsg = nativeError instanceof Error ? nativeError.message : String(nativeError);
                     if (errMsg.includes('not implemented') || errMsg.includes('not available') || errMsg.includes('plugin_not_installed')) {
-                        console.log('Native Razorpay unavailable, falling back to web SDK...');
                         openWebCheckout();
                     } else {
                         setIsProcessing(false);
@@ -154,7 +155,7 @@ const StudentPassPage: React.FC = () => {
                 openWebCheckout();
             }
         } catch (error: unknown) {
-            console.error('Failed to create pass order:', error);
+            debugLog('Failed to create pass order:', error);
             setIsProcessing(false);
             setStatusMessage('');
             setErrorMessage('Could not create order. Please check your connection and try again.');

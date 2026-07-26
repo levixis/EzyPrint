@@ -1,32 +1,81 @@
 
-import React, { useState } from 'react';
-import FileUploadForm from './FileUploadForm';
-import StudentOrderList from './StudentOrderList';
+import React, { Suspense, lazy, useEffect, useRef, useState } from 'react';
 import { useAppContext, isStudentPassActive, getStudentPassDaysRemaining, getStudentPassExpiryDate } from '../../contexts/AppContext';
 import { Card } from '../common/Card';
 import { Button } from '../common/Button';
 import { Modal } from '../common/Modal';
-import TicketForm from '../tickets/TicketForm';
-import TicketList from '../tickets/TicketList';
+import { AccountOtpModal } from '../common/AccountOtpModal';
+
+const FileUploadForm = lazy(() => import('./FileUploadForm'));
+const StudentOrderList = lazy(() => import('./StudentOrderList'));
+const TicketForm = lazy(() => import('../tickets/TicketForm'));
+const TicketList = lazy(() => import('../tickets/TicketList'));
 
 interface StudentDashboardProps {
   userId: string;
   onNavigateToPass: () => void;
 }
 
+const sectionFallback = (
+  <div className="flex justify-center py-6">
+    <div className="w-6 h-6 border-2 border-brand-primary border-t-transparent rounded-full animate-spin" />
+  </div>
+);
+
 const StudentDashboard: React.FC<StudentDashboardProps> = ({ userId, onNavigateToPass }) => {
-  const { getOrdersForCurrentUser, currentUser, isLoadingShops, deleteOwnStudentAccount, tickets } = useAppContext();
+  const { getOrdersForCurrentUser, currentUser, isLoadingShops, requestAccountActionOTP, executeAccountAction, tickets, loadMoreOrders, ordersLimit } = useAppContext();
   const studentOrders = getOrdersForCurrentUser();
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [showTicketForm, setShowTicketForm] = useState(false);
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+  
+  // OTP State handling
+  const [showOtpModal, setShowOtpModal] = useState(false);
+  const [isRequestingOTP, setIsRequestingOTP] = useState(false);
+  const [otpSent, setOtpSent] = useState(false);
+  const [otpResultMessage, setOtpResultMessage] = useState<{ success: boolean; message: string } | null>(null);
+  const closeOtpTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const handleDeleteAccount = async () => {
+  useEffect(() => () => {
+    if (closeOtpTimerRef.current) {
+      clearTimeout(closeOtpTimerRef.current);
+    }
+  }, []);
+
+  const handleRequestOTP = async () => {
+    setIsRequestingOTP(true);
+    setOtpResultMessage(null);
+    const res = await requestAccountActionOTP("DELETE_OWN_ACCOUNT");
+    setIsRequestingOTP(false);
+    if (res.success) {
+      setOtpSent(true);
+    } else {
+      setOtpResultMessage({ success: false, message: res.message || "Failed to send OTP" });
+    }
+  };
+
+  const handleExecuteDelete = async (otp: string) => {
     setIsDeleting(true);
-    await deleteOwnStudentAccount();
+    setOtpResultMessage(null);
+    const targetUid = currentUser?.id;
+    
+    const res = await executeAccountAction("DELETE_OWN_ACCOUNT", otp, targetUid);
+    
     setIsDeleting(false);
+    if (res.success) {
+      setOtpResultMessage({ success: true, message: "Account deleted successfully." });
+      closeOtpTimerRef.current = setTimeout(() => setShowOtpModal(false), 2000);
+    } else {
+       setOtpResultMessage({ success: false, message: res.message || "Failed to delete account." });
+    }
+  };
+
+  const handleStartDelete = () => {
+    setOtpSent(false);
+    setOtpResultMessage(null);
     setShowDeleteConfirm(false);
+    setShowOtpModal(true);
   };
 
   // Student Pass state
@@ -116,12 +165,23 @@ const StudentDashboard: React.FC<StudentDashboardProps> = ({ userId, onNavigateT
       )}
 
       <Card title="Upload New Document" className="bg-brand-secondary/80 backdrop-blur-sm">
-        <FileUploadForm userId={userId} isLoadingShops={isLoadingShops} onNavigateToPass={onNavigateToPass} />
+        <Suspense fallback={sectionFallback}>
+          <FileUploadForm userId={userId} isLoadingShops={isLoadingShops} onNavigateToPass={onNavigateToPass} />
+        </Suspense>
       </Card>
 
       <Card title="My Print Orders" className="bg-brand-secondary/80 backdrop-blur-sm">
         {studentOrders.length > 0 ? (
-          <StudentOrderList orders={studentOrders} />
+          <>
+            <Suspense fallback={sectionFallback}>
+              <StudentOrderList orders={studentOrders} />
+            </Suspense>
+            {studentOrders.length >= ordersLimit && (
+              <div className="flex justify-center mt-6">
+                <Button variant="secondary" onClick={loadMoreOrders}>Load More Orders</Button>
+              </div>
+            )}
+          </>
         ) : (
           <p className="text-brand-lightText text-center py-4">You haven't placed any orders yet. Start by uploading a document!</p>
         )}
@@ -137,7 +197,9 @@ const StudentDashboard: React.FC<StudentDashboardProps> = ({ userId, onNavigateT
         }
       >
         {tickets.length > 0 ? (
-          <TicketList tickets={tickets} />
+          <Suspense fallback={sectionFallback}>
+            <TicketList tickets={tickets} />
+          </Suspense>
         ) : (
           <p className="text-brand-lightText text-center py-4">No tickets raised yet.</p>
         )}
@@ -169,7 +231,9 @@ const StudentDashboard: React.FC<StudentDashboardProps> = ({ userId, onNavigateT
         </div>
       </Modal>
 
-      <TicketForm isOpen={showTicketForm} onClose={() => setShowTicketForm(false)} />
+      <Suspense fallback={null}>
+        <TicketForm isOpen={showTicketForm} onClose={() => setShowTicketForm(false)} />
+      </Suspense>
 
       {/* Delete Confirmation Modal */}
       <Modal isOpen={showDeleteConfirm} onClose={() => setShowDeleteConfirm(false)} title="Delete Account">
@@ -192,16 +256,31 @@ const StudentDashboard: React.FC<StudentDashboardProps> = ({ userId, onNavigateT
               Cancel
             </Button>
             <Button
-              onClick={handleDeleteAccount}
+              onClick={handleStartDelete}
               disabled={isDeleting}
               fullWidth
               className="!bg-red-600 hover:!bg-red-700 !text-white !border-red-600"
             >
-              {isDeleting ? 'Deleting...' : 'Yes, Delete My Account'}
+              Continue to Deletion
             </Button>
           </div>
         </div>
       </Modal>
+
+      <AccountOtpModal
+        isOpen={showOtpModal}
+        onClose={() => setShowOtpModal(false)}
+        title="Verify Account Deletion"
+        description="You are about to permanently delete your account and profile. This action cannot be undone."
+        confirmText="Yes, Delete My Account"
+        loadingText="Deleting..."
+        onConfirm={handleExecuteDelete}
+        onRequestOTP={handleRequestOTP}
+        isProcessing={isDeleting}
+        isRequestingOTP={isRequestingOTP}
+        otpSent={otpSent}
+        resultMessage={otpResultMessage}
+      />
     </div>
   );
 };

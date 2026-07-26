@@ -27,7 +27,7 @@ const ShopOrderList: React.FC<ShopOrderListProps> = ({ orders, onSelectOrder }) 
       return new Date(a.uploadedAt).getTime() - new Date(b.uploadedAt).getTime();
     });
 
-  const historicalOrders = orders.filter(o => [OrderStatus.COMPLETED, OrderStatus.CANCELLED].includes(o.status))
+  const historicalOrders = orders.filter(o => [OrderStatus.COMPLETED, OrderStatus.CANCELLED, OrderStatus.REFUNDED].includes(o.status))
     .sort((a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
 
   const visibleHistoricalOrders = historicalOrders.slice(0, historyLimit);
@@ -64,7 +64,7 @@ const ShopOrderList: React.FC<ShopOrderListProps> = ({ orders, onSelectOrder }) 
       )}
       {historicalOrders.length > 0 && (
         <div>
-          <h3 className="text-xl font-semibold text-gray-500 dark:text-gray-400 mt-10 mb-4 pb-2 border-b border-gray-300 dark:border-zinc-600">Order History (Completed/Cancelled)</h3>
+          <h3 className="text-xl font-semibold text-gray-500 dark:text-gray-400 mt-10 mb-4 pb-2 border-b border-gray-300 dark:border-zinc-600">Order History (Completed/Cancelled/Refunded)</h3>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
             {visibleHistoricalOrders.map(order => (
               <ShopOrderCard key={order.id} order={order} onSelectOrder={onSelectOrder} />

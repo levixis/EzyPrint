@@ -2,13 +2,12 @@
 
 import React, { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import { useAppContext } from '../../contexts/AppContext';
-import { calculateMultiFileOrderPrice } from '../../utils/pricing';
+import { calculateMultiFileOrderPrice, isStudentPassActive } from '../../utils/pricing';
 import { DocumentOrder, PrintColor } from '../../types';
 import { Select } from '../common/Select';
 import { Button } from '../common/Button';
 import { SUPPORTED_FILE_TYPES, SUPPORTED_MIME_TYPES } from '../../constants';
 import { Card } from '../common/Card';
-import { PDFDocument } from 'pdf-lib';
 import { Spinner } from '../common/Spinner';
 
 interface FileUploadFormProps {
@@ -27,16 +26,21 @@ interface FileEntry {
   doubleSided: boolean;
   isParsing: boolean;
   parseError?: string;
+  isEstimated?: boolean;
+  parseWarning?: string;
 }
 
 const MAX_FILES = 10;
+const debugLog = (...args: unknown[]) => {
+  void args;
+};
 
 const getFileExtension = (filename: string): string => {
   return filename.slice(((filename.lastIndexOf(".") - 1) >>> 0) + 2).toUpperCase();
 };
 
 const FileUploadForm: React.FC<FileUploadFormProps> = ({ userId, isLoadingShops, onNavigateToPass }) => {
-  const { addOrder, approvedShops, getShopById, currentUser } = useAppContext();
+  const { addOrder, approvedShops, getShopById, currentUser, loadMoreShops, shopsLimit } = useAppContext();
 
   const [fileEntries, setFileEntries] = useState<FileEntry[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -78,19 +82,51 @@ const FileUploadForm: React.FC<FileUploadFormProps> = ({ userId, isLoadingShops,
     const newPriceDetails = calculateMultiFileOrderPrice(
       validFiles.map(f => ({ pageCount: f.pageCount, color: f.color, copies: f.copies, doubleSided: f.doubleSided })),
       currentShop.customPricing,
-      currentUser?.hasStudentPass ?? false
+      isStudentPassActive(currentUser?.hasStudentPass, currentUser?.studentPassActivatedAt)
     );
     setPriceDetails(newPriceDetails);
-  }, [fileEntries, selectedShopId, getShopById, isLoadingShops, currentUser?.hasStudentPass]);
+  }, [fileEntries, selectedShopId, getShopById, isLoadingShops, currentUser?.hasStudentPass, currentUser?.studentPassActivatedAt]);
 
   useEffect(() => {
     updateEstimatedPrice();
   }, [updateEstimatedPrice]);
 
-  const parsePdfPages = async (file: File): Promise<number> => {
-    const arrayBuffer = await file.arrayBuffer();
-    const pdfDoc = await PDFDocument.load(arrayBuffer, { ignoreEncryption: true });
-    return pdfDoc.getPageCount();
+  const parseDocument = async (file: File, extension: string): Promise<{ pages: number, warning?: string }> => {
+    try {
+      if (extension === 'PDF') {
+        const [{ PDFDocument }] = await Promise.all([
+          import('pdf-lib'),
+        ]);
+        const arrayBuffer = await file.arrayBuffer();
+        const pdfDoc = await PDFDocument.load(arrayBuffer, { ignoreEncryption: true });
+        return { pages: pdfDoc.getPageCount() };
+      } 
+      
+      if (extension === 'PPTX') {
+        const [{ default: JSZip }] = await Promise.all([
+          import('jszip'),
+        ]);
+        const arrayBuffer = await file.arrayBuffer();
+        const zip = await JSZip.loadAsync(arrayBuffer);
+        
+        let slideCount = 0;
+        // Search the zip archive explicitly for slide XML files in the ppt/slides directory
+        zip.folder("ppt/slides/")?.forEach((relativePath, file) => {
+          if (!file.dir && relativePath.startsWith("slide") && relativePath.endsWith(".xml")) {
+            slideCount++;
+          }
+        });
+        
+        return { pages: Math.max(1, slideCount) };
+      }
+
+      // Fallback for unsupported formats realistically bypassing our filter
+      return { pages: 1 };
+
+    } catch (err: unknown) {
+      debugLog(`[parseDocument] Error parsing ${extension}:`, err);
+      throw new Error(`Failed to read document: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    }
   };
 
   const handleFilesSelected = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -112,8 +148,20 @@ const FileUploadForm: React.FC<FileUploadFormProps> = ({ userId, isLoadingShops,
 
     for (const file of newFiles) {
       const extension = getFileExtension(file.name);
+      if (extension === 'DOC' || extension === 'DOCX') {
+        setError("Word documents are not supported. Please convert your file to PDF first and upload again. You can use free tools like ilovepdf.com or smallpdf.com to convert.");
+        continue;
+      }
+
       if (!SUPPORTED_FILE_TYPES.includes(extension)) {
-        setError(`File "${file.name}" (.${extension.toLowerCase()}) is not supported. Supported: PDF, DOC(X), PPT(X), XLS(X), TXT, JPG, PNG, HEIC, WEBP, GIF.`);
+        setError(`File "${file.name}" (.${extension.toLowerCase()}) is not supported. Supported: PDF, PPTX, JPG, PNG, WEBP.`);
+        continue;
+      }
+
+      // Client-side size guard (matches 50MB Storage rule)
+      const MAX_FILE_SIZE = 50 * 1024 * 1024;
+      if (file.size > MAX_FILE_SIZE) {
+        setError(`File "${file.name}" exceeds 50MB limit. Please use a smaller file.`);
         continue;
       }
 
@@ -133,22 +181,30 @@ const FileUploadForm: React.FC<FileUploadFormProps> = ({ userId, isLoadingShops,
         color: isImage ? PrintColor.COLOR : PrintColor.BLACK_WHITE, // Default images to color
         copies: 1,
         doubleSided: false,
-        isParsing: extension === 'PDF', // Only parse PDFs for page count
+        isParsing: ['PDF', 'PPTX'].includes(extension), // Flag them all for processing/warning
       });
     }
 
     setFileEntries(prev => [...prev, ...newEntries]);
 
     for (const entry of newEntries) {
-      if (entry.fileType === 'PDF') {
+      if (entry.isParsing) {
         try {
-          const pages = await parsePdfPages(entry.file);
+          const result = await parseDocument(entry.file, entry.fileType);
+          setFileEntries(prev => prev.map(e => {
+            if (e.id === entry.id) {
+              return { 
+                ...e,
+                pageCount: result.pages, 
+                parseWarning: result.warning,
+                isParsing: false 
+              };
+            }
+            return e;
+          }));
+        } catch (err) {
           setFileEntries(prev => prev.map(e =>
-            e.id === entry.id ? { ...e, pageCount: pages, isParsing: false } : e
-          ));
-        } catch {
-          setFileEntries(prev => prev.map(e =>
-            e.id === entry.id ? { ...e, isParsing: false, parseError: 'Could not read PDF pages' } : e
+            e.id === entry.id ? { ...e, isParsing: false, parseError: 'Failed to read document pages. Please convert to PDF.' } : e
           ));
         }
       }
@@ -163,10 +219,6 @@ const FileUploadForm: React.FC<FileUploadFormProps> = ({ userId, isLoadingShops,
 
   const updateFileColor = (id: string, color: PrintColor) => {
     setFileEntries(prev => prev.map(e => e.id === id ? { ...e, color } : e));
-  };
-
-  const updateFilePages = (id: string, pages: number) => {
-    setFileEntries(prev => prev.map(e => e.id === id ? { ...e, pageCount: Math.max(1, pages) } : e));
   };
 
   const updateFileCopies = (id: string, copies: number) => {
@@ -222,6 +274,8 @@ const FileUploadForm: React.FC<FileUploadFormProps> = ({ userId, isLoadingShops,
     if (result.success) {
       setFileEntries([]);
       setSpecialInstructions('');
+    } else {
+      setError('Failed to create order. Please try again.');
     }
   };
 
@@ -254,6 +308,13 @@ const FileUploadForm: React.FC<FileUploadFormProps> = ({ userId, isLoadingShops,
         containerClassName="mb-6"
         disabled={isLoadingShops || activeShops.length === 0}
       />
+      {approvedShops.length >= shopsLimit && (
+        <div className="-mt-3 mb-4 flex justify-end">
+          <Button type="button" variant="ghost" size="sm" onClick={loadMoreShops}>
+            Load More Shops
+          </Button>
+        </div>
+      )}
       {currentSelectedShop && (
         <p className="text-xs text-gray-700 dark:text-gray-300 font-medium -mt-4 mb-4">
           Rates for {currentSelectedShop.name}:
@@ -265,7 +326,7 @@ const FileUploadForm: React.FC<FileUploadFormProps> = ({ userId, isLoadingShops,
       {/* File selection area */}
       <div>
         <label className="block text-sm font-medium text-brand-lightText mb-1.5">
-          Select Files — PDFs, Docs, Images ({fileEntries.length}/{MAX_FILES})
+          Select Files — PDFs, PowerPoint, Images ({fileEntries.length}/{MAX_FILES})
         </label>
         <div
           className="mt-1 flex items-center space-x-3 p-4 border-2 border-dashed border-brand-primary/30 bg-brand-primary/5 rounded-lg hover:border-brand-primary hover:bg-brand-primary/10 transition-colors duration-300 cursor-pointer"
@@ -298,6 +359,9 @@ const FileUploadForm: React.FC<FileUploadFormProps> = ({ userId, isLoadingShops,
             <span className="text-sm text-brand-text font-medium">{fileEntries.length} file(s) selected • {totalPages} total pages</span>
           )}
         </div>
+        <p className="mt-2 text-xs text-brand-lightText dark:text-gray-400 italic">
+          <strong className="font-semibold text-brand-primary">Tip:</strong> If you only want to print specific pages, please extract those pages from your PDF before uploading. You will be charged for the entire document length. Use the Special Instructions box to give the shop any additional guidance.
+        </p>
       </div>
 
       {/* File list with per-file settings */}
@@ -319,9 +383,14 @@ const FileUploadForm: React.FC<FileUploadFormProps> = ({ userId, isLoadingShops,
                   </p>
                   <p className="text-xs text-brand-lightText dark:text-gray-400">
                     {entry.fileType} • {(entry.file.size / 1024).toFixed(0)} KB
-                    {entry.isParsing && <span className="ml-1 text-brand-primary"><Spinner size="sm" className="inline mr-1" />Detecting pages...</span>}
+                    {entry.isParsing && <span className="ml-1 text-brand-primary"><Spinner size="sm" className="inline mr-1" />Converting document... (do not close)</span>}
                     {!entry.isParsing && <span className="ml-1">• {entry.pageCount} pg{entry.pageCount !== 1 ? 's' : ''}</span>}
                   </p>
+                  {(entry.parseWarning || entry.parseError) && (
+                    <p className="mt-1 text-[10px] sm:text-xs text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 px-2 py-1 rounded inline-block">
+                      ⚠️ {entry.parseError || entry.parseWarning}
+                    </p>
+                  )}
                 </div>
                 <button
                   type="button"
@@ -337,31 +406,11 @@ const FileUploadForm: React.FC<FileUploadFormProps> = ({ userId, isLoadingShops,
 
               {/* Per-file settings row */}
               <div className="flex flex-wrap items-center gap-3">
-                {/* Pages — always editable with stepper */}
+                {/* Pages — read-only display */}
                 {!entry.isParsing && (
-                  <div className="flex items-center gap-1.5">
-                    <label className="text-xs text-brand-lightText whitespace-nowrap">Pages:</label>
-                    <div className="flex items-center rounded-lg border border-brand-muted dark:border-zinc-600 overflow-hidden">
-                      <button
-                        type="button"
-                        onClick={() => updateFilePages(entry.id, entry.pageCount - 1)}
-                        disabled={entry.pageCount <= 1}
-                        className="px-2 py-1.5 text-xs text-gray-500 hover:bg-gray-100 dark:hover:bg-zinc-700 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-                      >−</button>
-                      <input
-                        type="number"
-                        min="1"
-                        value={entry.pageCount}
-                        onChange={(e) => handleNumberInput(e.target.value, updateFilePages, entry.id)}
-                        onBlur={(e) => { if (!e.target.value || parseInt(e.target.value) < 1) updateFilePages(entry.id, 1); }}
-                        className="w-12 px-1 py-1.5 text-xs text-center bg-white dark:bg-zinc-800 text-brand-text dark:text-white focus:outline-none border-x border-brand-muted dark:border-zinc-600"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => updateFilePages(entry.id, entry.pageCount + 1)}
-                        className="px-2 py-1.5 text-xs text-gray-500 hover:bg-gray-100 dark:hover:bg-zinc-700 transition-colors"
-                      >+</button>
-                    </div>
+                  <div className="flex items-center gap-1.5 px-2 py-1.5 bg-gray-50 dark:bg-zinc-800 rounded-lg border border-gray-100 dark:border-zinc-700">
+                    <span className="text-xs font-semibold text-brand-primary">{entry.pageCount}</span>
+                    <span className="text-xs text-brand-lightText">page{entry.pageCount !== 1 ? 's' : ''}</span>
                   </div>
                 )}
 
@@ -456,7 +505,7 @@ const FileUploadForm: React.FC<FileUploadFormProps> = ({ userId, isLoadingShops,
       </Card>
 
       {/* Student Pass badge/upsell */}
-      {currentUser?.hasStudentPass ? (
+      {isStudentPassActive(currentUser?.hasStudentPass, currentUser?.studentPassActivatedAt) ? (
         <div className="w-full mb-6 p-4 rounded-xl border border-yellow-400/50 bg-gradient-to-r from-yellow-50 to-yellow-100 dark:from-yellow-900/20 dark:to-yellow-800/20">
           <div className="flex items-center justify-between">
             <div className="flex items-center space-x-3">

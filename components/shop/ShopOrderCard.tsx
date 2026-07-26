@@ -18,6 +18,7 @@ const getStatusShopStyles = (status: OrderStatus): { text: string; border: strin
     case OrderStatus.READY_FOR_PICKUP: return { text: 'text-status-success', border: 'border-status-success', bg: 'bg-status-success/20', icon: <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-4 h-4 mr-1.5"><path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75 11.25 15 15 9.75M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" /></svg> };
     case OrderStatus.COMPLETED: return { text: 'text-gray-600 dark:text-gray-400', border: 'border-brand-muted', bg: 'bg-brand-secondaryLight/50' };
     case OrderStatus.CANCELLED: return { text: 'text-status-error', border: 'border-status-error', bg: 'bg-status-error/30' };
+    case OrderStatus.REFUNDED: return { text: 'text-cyan-600 dark:text-cyan-400', border: 'border-cyan-500', bg: 'bg-cyan-500/10' };
     default: return { text: 'text-gray-600 dark:text-gray-400', border: 'border-brand-muted', bg: 'bg-brand-secondary' };
   }
 };
@@ -68,7 +69,10 @@ const ShopOrderCard: React.FC<ShopOrderCardProps> = ({ order, onSelectOrder }) =
         </div>
         <div className="text-xs text-gray-600 dark:text-gray-400 space-y-1">
           <p><strong>Received:</strong> {new Date(uploadedAt).toLocaleString()}</p>
-          <p><strong>Files:</strong> {files.length} • <strong>Total Pages:</strong> {printOptions.pages}</p>
+          <p>
+            <strong>Files:</strong> {files.length} •{' '}
+            <span className="font-bold text-brand-primary">Auto-Detected Pages: {printOptions.pages}</span>
+          </p>
           {files.length === 1 ? (
             <p>{files[0].copies}x • {files[0].color === PrintColor.COLOR ? 'Color' : 'B&W'}{files[0].doubleSided ? ' • 2-sided' : ''}</p>
           ) : (

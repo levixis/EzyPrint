@@ -1,7 +1,8 @@
-import React, { useState } from 'react';
+import React, { Suspense, lazy, useState } from 'react';
 import { SupportTicket, TicketStatus, TicketCategory, UserType } from '../../types';
 import { Card } from '../common/Card';
-import TicketDetail from './TicketDetail';
+
+const TicketDetail = lazy(() => import('./TicketDetail'));
 
 interface TicketListProps {
   tickets: SupportTicket[];
@@ -86,11 +87,13 @@ const TicketList: React.FC<TicketListProps> = ({ tickets, title, showRaiserInfo 
       </div>
 
       {selectedTicket && (
-        <TicketDetail
-          ticket={selectedTicket}
-          isOpen={!!selectedTicket}
-          onClose={() => setSelectedTicket(null)}
-        />
+        <Suspense fallback={null}>
+          <TicketDetail
+            ticket={selectedTicket}
+            isOpen={!!selectedTicket}
+            onClose={() => setSelectedTicket(null)}
+          />
+        </Suspense>
       )}
     </>
   );

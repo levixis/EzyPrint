@@ -1,6 +1,7 @@
+/* eslint-disable react-refresh/only-export-components */
 import React, { createContext, useState, useContext, useCallback, useMemo, ReactNode, useEffect, useRef } from 'react';
-import { DocumentOrder, OrderFile, NotificationMessage, OrderStatus, User, UserType, ShopProfile, ShopPricing, PayoutMethod, AppView, ShopPayout, PayoutStatus, PrintColor, BankDetails, SupportTicket, TicketCategory, TicketStatus, TicketMessage, TicketStatusChange, EarningsReport } from '../types';
-import { DEFAULT_SHOP_PRICING, ADMIN_EMAILS } from '../constants';
+import { DocumentOrder, OrderFile, NotificationMessage, OrderStatus, User, UserType, ShopProfile, ShopPricing, PayoutMethod, AppView, ShopPayout, PrintColor, BankDetails, PaymentConfiguration, SupportTicket, TicketCategory, TicketStatus, TicketMessage, TicketStatusChange, EarningsReport, ReactivationRequest, RefundRequest } from '../types';
+import { DEFAULT_SHOP_PRICING } from '../constants';
 import {
   auth,
   db,
@@ -10,14 +11,19 @@ import {
   signInWithCredential,
   getRedirectResult,
   signOut,
+  functions,
+  httpsCallable,
   onAuthStateChanged,
   createUserWithEmailAndPassword,
   signInWithEmailAndPassword as firebaseSignInWithEmailAndPassword,
   doc,
   setDoc,
   getDoc,
+  getDocs,
   updateDoc,
-  deleteDoc,
+
+  deleteField,
+  writeBatch,
   collection,
   query,
   where,
@@ -32,6 +38,7 @@ import {
 } from '../firebase';
 
 import { Capacitor } from '@capacitor/core';
+import { playNewOrderSound, initAudioContext } from '../utils/notificationSound';
 
 // Helper to safely extract error messages from unknown error types
 const getErrorMessage = (err: unknown): string => {
@@ -40,12 +47,24 @@ const getErrorMessage = (err: unknown): string => {
   return 'An unexpected error occurred.';
 };
 
+const isExpectedPermissionLoss = (err: unknown): boolean => {
+  const error = err as { code?: string; message?: string };
+  return error?.code === 'permission-denied' ||
+    error?.message?.toLowerCase().includes('missing or insufficient permissions') === true;
+};
+
 // Pricing utilities — imported from dedicated module for clean HMR
 import { calculateBaseFee, calculateOrderPrice, calculateMultiFileOrderPrice, isStudentPassActive, getStudentPassDaysRemaining, getStudentPassExpiryDate } from '../utils/pricing';
 export { calculateBaseFee, calculateOrderPrice, calculateMultiFileOrderPrice, isStudentPassActive, getStudentPassDaysRemaining, getStudentPassExpiryDate };
 
 // Push notification registration for native mobile
 import { registerPushNotifications, unregisterPushNotifications } from '../utils/pushNotifications';
+
+const isDevelopment = import.meta.env.DEV;
+const debugLog = (...args: unknown[]) => {
+  void isDevelopment;
+  void args;
+};
 
 interface AppContextType {
   currentUser: User | null;
@@ -58,6 +77,13 @@ interface AppContextType {
   signInWithEmailAndPassword: (email: string, password: string) => Promise<{ success: boolean; message?: string; errorCode?: string }>;
   completeStudentProfileCreation: (authUser: FirebaseUser, displayName?: string) => Promise<{ success: boolean; message?: string }>;
   completeShopOwnerProfileCreation: (authUser: FirebaseUser, shopDetails: { shopName: string; shopAddress: string }, displayName?: string) => Promise<{ success: boolean; message?: string; shopId?: string }>;
+  checkReturningShopOwner: (email: string) => Promise<{ exists: boolean; hasActiveAccount?: boolean; hasArchivedShop?: boolean; isOwnerOrphaned?: boolean; oldUserId?: string; shop?: ShopProfile }>;
+
+  // Reactivation Requests
+  archivedShopForCurrentUser: ShopProfile | null;
+  reactivationRequests: ReactivationRequest[];
+  submitReactivationRequest: (shopId: string, shopName: string) => Promise<{ success: boolean; message?: string }>;
+  resolveReactivationRequest: (requestId: string, action: 'approve' | 'reject', otp: string, rejectionReason?: string) => Promise<{ success: boolean; message?: string }>;
   logoutUser: () => Promise<void>;
   upgradeToStudentPass: () => Promise<{ success: boolean; message?: string }>;
   cancelStudentPass: () => Promise<{ success: boolean; message?: string }>;
@@ -66,7 +92,7 @@ interface AppContextType {
   isLoadingShops: boolean;
   getShopById: (shopId: string) => ShopProfile | undefined;
   registerShop: (shopName: string, shopAddress: string, ownerUserId: string, initialPricing: ShopPricing) => Promise<ShopProfile | null>;
-  updateShopSettings: (shopId: string, newSettings: { pricing: ShopPricing; isOpen: boolean; payoutMethods?: PayoutMethod[] }) => Promise<void>;
+  updateShopSettings: (shopId: string, newSettings: { pricing: ShopPricing; isOpen: boolean; payoutMethods?: PayoutMethod[]; contactPhone?: string; contactPhoneAlt?: string; contactEmail?: string; whatsappNumber?: string }) => Promise<{ success: boolean; message?: string }>;
 
   orders: DocumentOrder[];
   allOrders: DocumentOrder[]; // Admin: all orders across all shops
@@ -94,23 +120,24 @@ interface AppContextType {
 
   // Admin payout functions
   payouts: ShopPayout[];
-  createPayout: (shopId: string, shopName: string, amount: number, adminNote?: string) => Promise<{ success: boolean; message?: string }>;
+  createPayout: (shopId: string, shopName: string, amount: number, adminNote?: string, otp?: string) => Promise<{ success: boolean; message?: string }>;
   requestPayout: (shopId: string, shopName: string, amount: number, shopOwnerNote?: string) => Promise<{ success: boolean; message?: string }>;
-  markPayoutPaid: (payoutId: string) => Promise<{ success: boolean; message?: string }>;
+  approvePayout: (payoutId: string, otp: string, adminNote?: string) => Promise<{ success: boolean; message?: string }>;
+  rejectPayout: (payoutId: string, otp: string, adminNote?: string) => Promise<{ success: boolean; message?: string }>;
+  cancelPayout: (payoutId: string, otp: string) => Promise<{ success: boolean; message?: string }>;
   confirmPayout: (payoutId: string) => Promise<{ success: boolean; message?: string }>;
   disputePayout: (payoutId: string, shopOwnerNote: string) => Promise<{ success: boolean; message?: string }>;
 
   // Admin shop management
   approveShop: (shopId: string) => Promise<{ success: boolean; message?: string }>;
   rejectShop: (shopId: string) => Promise<{ success: boolean; message?: string }>;
-  deleteShopAndOwner: (shopId: string, ownerUserId: string) => Promise<{ success: boolean; message?: string }>;
   archiveShop: (shopId: string) => Promise<{ success: boolean; message?: string }>;
   unarchiveShop: (shopId: string) => Promise<{ success: boolean; message?: string }>;
   approvedShops: ShopProfile[]; // Only approved & non-archived shops (for student view)
 
-  // Shop owner self-delete
-  deleteOwnShopAccount: () => Promise<{ success: boolean; message?: string }>;
-  deleteOwnStudentAccount: () => Promise<{ success: boolean; message?: string }>;
+  // Account Orchestration Flow (OTP protected)
+  requestAccountActionOTP: (actionId: string) => Promise<{ success: boolean; message?: string }>;
+  executeAccountAction: (action: string, otp: string, targetUid?: string, targetShopId?: string) => Promise<{ success: boolean; message?: string }>;
 
   // Bank Details (stored in private sub-collection)
   getBankDetails: (shopId: string) => Promise<BankDetails | null>;
@@ -118,14 +145,37 @@ interface AppContextType {
   verifyBankDetails: (shopId: string) => Promise<{ success: boolean; message?: string }>;
   logBankAccess: (shopId: string, action: 'VIEW' | 'EDIT' | 'VERIFY') => Promise<void>;
 
+  // Payment Configuration
+  getPaymentConfig: (shopId: string) => Promise<PaymentConfiguration | null>;
+
   // Support Tickets
   tickets: SupportTicket[];
   createTicket: (ticketData: { subject: string; category: TicketCategory; description: string; relatedOrderId?: string; attachmentFiles?: File[] }) => Promise<{ success: boolean; ticketId?: string; message?: string }>;
   addTicketMessage: (ticketId: string, message: string) => Promise<{ success: boolean; message?: string }>;
   updateTicketStatus: (ticketId: string, newStatus: TicketStatus, note?: string) => Promise<{ success: boolean; message?: string }>;
+  shopInitiateRefund: (ticketId: string, orderId: string, reason: string) => Promise<{ success: boolean; message?: string }>;
+  escalateTicketToAdmin: (ticketId: string, reason: string) => Promise<{ success: boolean; message?: string }>;
 
   // Earnings Reports
   reports: EarningsReport[];
+
+  // Refund Requests
+  refundRequests: RefundRequest[];
+  createRefundRequest: (orderId: string, reason: string) => Promise<{ success: boolean; message?: string }>;
+  respondToRefundRequest: (requestId: string, approved: boolean, shopResponse?: string) => Promise<{ success: boolean; message?: string }>;
+  escalateRefundRequest: (requestId: string) => Promise<{ success: boolean; message?: string }>;
+  resolveRefundRequest: (requestId: string, action: 'APPROVE' | 'DENY', otp: string, adminNote?: string) => Promise<{ success: boolean; message?: string }>;
+  syncRefundHistory: (orderId: string) => Promise<{ success: boolean; count: number; refunds: import('../types').RazorpayRefund[]; message?: string }>;
+
+  // Pagination Controls
+  ordersLimit: number;
+  payoutsLimit: number;
+  notificationsLimit: number;
+  shopsLimit: number;
+  loadMoreOrders: () => void;
+  loadMorePayouts: () => void;
+  loadMoreNotifications: () => void;
+  loadMoreShops: () => void;
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
@@ -138,6 +188,7 @@ const VALID_STATUS_TRANSITIONS: Record<string, string[]> = {
   [OrderStatus.READY_FOR_PICKUP]: [OrderStatus.COMPLETED, OrderStatus.CANCELLED],
   [OrderStatus.COMPLETED]: [], // Terminal state
   [OrderStatus.CANCELLED]: [], // Terminal state
+  [OrderStatus.REFUNDED]: [], // Terminal state
   [OrderStatus.PAYMENT_FAILED]: [OrderStatus.PENDING_PAYMENT, OrderStatus.CANCELLED], // Can retry or cancel
 };
 
@@ -147,9 +198,46 @@ const cleanPayoutMethods = (methods?: PayoutMethod[]): PayoutMethod[] => {
   return methods.filter(method => method !== null && method !== undefined);
 };
 
+const normalizePayoutMethodsForStorage = (methods?: PayoutMethod[]): PayoutMethod[] => {
+  return cleanPayoutMethods(methods).map((method) => {
+    const common = {
+      id: method.id,
+      type: method.type,
+      ...(method.nickname?.trim() ? { nickname: method.nickname.trim() } : {}),
+      ...(method.isPrimary ? { isPrimary: true } : {}),
+    };
+
+    if (method.type === 'UPI') {
+      return {
+        ...common,
+        upiId: method.upiId?.trim() || '',
+      };
+    }
+
+    return {
+      ...common,
+      accountHolderName: method.accountHolderName?.trim() || '',
+      accountNumber: method.accountNumber?.trim() || '',
+      ifscCode: method.ifscCode?.trim() || '',
+      bankName: method.bankName?.trim() || '',
+    };
+  });
+};
+
 export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const [currentUser, setCurrentUserInternal] = useState<User | null>(null);
   const [isLoadingAuth, setIsLoadingAuth] = useState<boolean>(true);
+
+  // --- Pagination State ---
+  const [ordersLimit, setOrdersLimit] = useState(100);
+  const [payoutsLimit, setPayoutsLimit] = useState(100);
+  const [notificationsLimit, setNotificationsLimit] = useState(100);
+  const [shopsLimit, setShopsLimit] = useState(50);
+
+  const loadMoreOrders = useCallback(() => setOrdersLimit(prev => prev + 100), []);
+  const loadMorePayouts = useCallback(() => setPayoutsLimit(prev => prev + 100), []);
+  const loadMoreNotifications = useCallback(() => setNotificationsLimit(prev => prev + 50), []);
+  const loadMoreShops = useCallback(() => setShopsLimit(prev => prev + 50), []);
   const [pendingFirebaseProfileCreationUser, setPendingFirebaseProfileCreationUser] = useState<FirebaseUser | null>(null);
 
   // Stable refs to break the dependency cycle: shops → addNotification → shops useEffect
@@ -157,7 +245,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const shopsRef = useRef<ShopProfile[]>([]);
   const currentUserRef = useRef<User | null>(null);
 
-  const [shops, setShops] = useState<ShopProfile[]>([]);
+  const [listedShops, setListedShops] = useState<ShopProfile[]>([]);
+  const [supplementalShops, setSupplementalShops] = useState<Record<string, ShopProfile>>({});
   const [isLoadingShops, setIsLoadingShops] = useState<boolean>(true);
   const [orders, setOrders] = useState<DocumentOrder[]>([]);
   const [allOrders, setAllOrders] = useState<DocumentOrder[]>([]); // Admin: all orders
@@ -168,11 +257,35 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [currentView, setCurrentView] = useState<AppView>('landing');
   const viewHistoryRef = useRef<AppView[]>([]);
 
+  const sortShopsForDisplay = useCallback((shopList: ShopProfile[]) =>
+    [...shopList].sort((a, b) => {
+      const bTime = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+      const aTime = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+      if (bTime !== aTime) return bTime - aTime;
+      return a.name.localeCompare(b.name);
+    }), []);
+
+  const shops = useMemo(() => {
+    const mergedMap = new Map<string, ShopProfile>();
+    listedShops.forEach((shop) => mergedMap.set(shop.id, shop));
+    Object.values(supplementalShops).forEach((shop) => {
+      if (!mergedMap.has(shop.id)) {
+        mergedMap.set(shop.id, shop);
+      }
+    });
+    return sortShopsForDisplay([...mergedMap.values()]);
+  }, [listedShops, supplementalShops, sortShopsForDisplay]);
+
   // Merged notifications: Firestore (persistent, cross-user) + local (session-only toasts)
   const notifications = useMemo(() => {
-    return [...localNotifications, ...firestoreNotifications]
-      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-  }, [localNotifications, firestoreNotifications]);
+    const merged = [...localNotifications, ...firestoreNotifications];
+
+    const scoped = currentUser?.type === UserType.SHOP_OWNER && currentUser.shopId
+      ? merged.filter(notification => !notification.targetShopId || notification.targetShopId === currentUser.shopId)
+      : merged;
+
+    return scoped.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+  }, [localNotifications, firestoreNotifications, currentUser]);
 
   const navigateTo = useCallback((view: AppView) => {
     setCurrentView(prev => {
@@ -203,7 +316,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
     // Route 'ADMIN' notifications locally
     if (recipientUserId === 'ADMIN') {
-      recipientUserId = undefined; 
+      recipientUserId = undefined;
       const localNotif: NotificationMessage = {
         ...notificationData,
         id: `local_${Date.now()}_${Math.random().toString(16).slice(2)}`,
@@ -226,6 +339,16 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     // Cloud Functions handle cross-user DB messaging.
     // If recipient is NOT the current user, skip local toast.
     if (recipientUserId && recipientUserId !== currentUserRef.current?.id) {
+      return;
+    }
+
+    // For shop owners, keep local toasts scoped to the active shop context.
+    if (
+      currentUserRef.current?.type === UserType.SHOP_OWNER &&
+      currentUserRef.current.shopId &&
+      notificationData.targetShopId &&
+      notificationData.targetShopId !== currentUserRef.current.shopId
+    ) {
       return;
     }
 
@@ -254,6 +377,13 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     currentUserRef.current = currentUser;
   }, [currentUser]);
 
+  // Clear session-only notifications when the authenticated account or active shop changes.
+  // This prevents stale toasts from a deleted/recovered/previous shop account leaking into
+  // the next session's notification bell.
+  useEffect(() => {
+    setLocalNotifications([]);
+  }, [currentUser?.id, currentUser?.shopId]);
+
   // Register for push notifications when user logs in (native platforms only)
   useEffect(() => {
     if (currentUser?.id) {
@@ -268,7 +398,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
     return () => {
       if (currentUser?.id) {
-        unregisterPushNotifications(currentUser.id);
+        unregisterPushNotifications();
       }
     };
   }, [currentUser?.id]);
@@ -286,62 +416,98 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     let hasReceivedServerData = false;
     let unsubscribeShops: (() => void) | null = null;
     let retryTimeout: ReturnType<typeof setTimeout> | null = null;
+    let loadingTimeout: ReturnType<typeof setTimeout> | null = null;
     let retryCount = 0;
     const MAX_RETRIES = 3;
     let isCleaned = false;
 
     const subscribe = () => {
       if (isCleaned) return;
-      const shopsCollectionRef = collection(db, "shops");
+      const handleShopError = (_error: unknown) => {
+        debugLog('[AppContext] Shops listener error:', _error);
+        setIsLoadingShops(false);
+
+        if (retryCount < MAX_RETRIES && !isCleaned) {
+          retryCount++;
+          const delay = Math.min(retryCount * 3000, 10000);
+          debugLog(`[AppContext] Shops listener will retry in ${delay}ms (attempt ${retryCount}/${MAX_RETRIES})`);
+          retryTimeout = setTimeout(() => {
+            if (isCleaned) return;
+            unsubscribeShops?.();
+            unsubscribeShops = null;
+            subscribe();
+          }, delay);
+        } else {
+          addNotificationRef.current({
+            message: "Unable to load shop data. Please check your connection and refresh.",
+            type: 'error',
+          });
+        }
+      };
+
+      const handleFetchedShops = (fetchedShops: ShopProfile[], isFromCache: boolean) => {
+        setListedShops(sortShopsForDisplay(fetchedShops));
+        retryCount = 0;
+
+        if (!isFromCache) {
+          hasReceivedServerData = true;
+          setIsLoadingShops(false);
+        } else if (fetchedShops.length > 0) {
+          setIsLoadingShops(false);
+        } else if (!hasReceivedServerData) {
+          loadingTimeout = setTimeout(() => {
+            setIsLoadingShops(false);
+          }, 5000);
+        }
+      };
+
+      if (currentUser?.type === UserType.ADMIN) {
+        unsubscribeShops = onSnapshot(
+          query(collection(db, "shops"), limit(shopsLimit)),
+          { includeMetadataChanges: true },
+          (querySnapshot) => {
+            const fetchedShops: ShopProfile[] = [];
+            querySnapshot.forEach((docSnap) => {
+              fetchedShops.push({ id: docSnap.id, ...docSnap.data() } as ShopProfile);
+            });
+            handleFetchedShops(fetchedShops, querySnapshot.metadata.fromCache);
+          },
+          handleShopError
+        );
+        return;
+      }
+
+      if (currentUser?.type === UserType.SHOP_OWNER && currentUser.shopId) {
+        unsubscribeShops = onSnapshot(
+          doc(db, "shops", currentUser.shopId),
+          { includeMetadataChanges: true },
+          (docSnap) => {
+            const fetchedShops = docSnap.exists()
+              ? [{ id: docSnap.id, ...docSnap.data() } as ShopProfile]
+              : [];
+            handleFetchedShops(fetchedShops, docSnap.metadata.fromCache);
+          },
+          handleShopError
+        );
+        return;
+      }
+
       unsubscribeShops = onSnapshot(
-        shopsCollectionRef,
+        query(
+          collection(db, "shops"),
+          where("isApproved", "==", true),
+          orderBy("name"),
+          limit(shopsLimit)
+        ),
         { includeMetadataChanges: true },
         (querySnapshot) => {
-          const isFromCache = querySnapshot.metadata.fromCache;
           const fetchedShops: ShopProfile[] = [];
           querySnapshot.forEach((docSnap) => {
             fetchedShops.push({ id: docSnap.id, ...docSnap.data() } as ShopProfile);
           });
-
-          // Always update shop data (even cached data is useful to display)
-          setShops(fetchedShops);
-          // Reset retry count on success — connection is healthy
-          retryCount = 0;
-
-          if (!isFromCache) {
-            hasReceivedServerData = true;
-            setIsLoadingShops(false);
-          } else if (fetchedShops.length > 0) {
-            setIsLoadingShops(false);
-          } else if (!hasReceivedServerData) {
-            setTimeout(() => {
-              setIsLoadingShops(false);
-            }, 5000);
-          }
+          handleFetchedShops(fetchedShops, querySnapshot.metadata.fromCache);
         },
-        (_error) => {
-          console.error('[AppContext] Shops listener error:', _error);
-          // DON'T wipe shops — keep existing data so dashboards don't break.
-          // The listener is now dead (Firebase auto-closed it). Re-subscribe after delay.
-          setIsLoadingShops(false);
-
-          if (retryCount < MAX_RETRIES && !isCleaned) {
-            retryCount++;
-            const delay = Math.min(retryCount * 3000, 10000); // 3s, 6s, 9s
-            console.log(`[AppContext] Shops listener will retry in ${delay}ms (attempt ${retryCount}/${MAX_RETRIES})`);
-            retryTimeout = setTimeout(() => {
-              if (isCleaned) return;
-              unsubscribeShops?.();
-              unsubscribeShops = null;
-              subscribe();
-            }, delay);
-          } else {
-            addNotificationRef.current({
-              message: "Unable to load shop data. Please check your connection and refresh.",
-              type: 'error',
-            });
-          }
-        }
+        handleShopError
       );
     };
 
@@ -351,10 +517,73 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       isCleaned = true;
       unsubscribeShops?.();
       if (retryTimeout) clearTimeout(retryTimeout);
+      if (loadingTimeout) clearTimeout(loadingTimeout);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [currentUser?.id, currentUser?.shopId, currentUser?.type, shopsLimit, sortShopsForDisplay]);
 
+  useEffect(() => {
+    const candidateShopIds = new Set<string>();
+
+    if (currentUser?.type === UserType.SHOP_OWNER && currentUser.shopId) {
+      candidateShopIds.add(currentUser.shopId);
+    }
+
+    if (currentUser?.type === UserType.STUDENT) {
+      orders.forEach((order) => {
+        if (order.shopId) {
+          candidateShopIds.add(order.shopId);
+        }
+      });
+    }
+
+    const missingShopIds = [...candidateShopIds].filter((shopId) =>
+      !shops.some((shop) => shop.id === shopId) && !supplementalShops[shopId]
+    );
+
+    if (missingShopIds.length === 0) {
+      return;
+    }
+
+    let isCancelled = false;
+
+    Promise.all(missingShopIds.map((shopId) => getDoc(doc(db, "shops", shopId))))
+      .then((shopDocs) => {
+        if (isCancelled) return;
+
+        setSupplementalShops((prev) => {
+          const next = { ...prev };
+          shopDocs.forEach((shopDoc) => {
+            if (shopDoc.exists()) {
+              next[shopDoc.id] = { id: shopDoc.id, ...shopDoc.data() } as ShopProfile;
+            }
+          });
+          return next;
+        });
+      })
+      .catch((error) => {
+        debugLog('[AppContext] Failed to load supplemental shops:', error);
+      });
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [currentUser?.shopId, currentUser?.type, orders, shops, supplementalShops]);
+
+
+  // Track order statuses for paid-order sound detection (shop owners only)
+  const knownOrderStatusesRef = useRef<Map<string, string> | null>(null);
+  const isFirstOrderLoadRef = useRef(true);
+
+  // Initialize audio context on first user interaction (required by mobile browsers)
+  useEffect(() => {
+    const handleInteraction = () => { initAudioContext(); };
+    document.addEventListener('click', handleInteraction, { once: true });
+    document.addEventListener('touchstart', handleInteraction, { once: true });
+    return () => {
+      document.removeEventListener('click', handleInteraction);
+      document.removeEventListener('touchstart', handleInteraction);
+    };
+  }, []);
 
   // Orders listener - dynamically queries based on currentUser
   // Uses addNotificationRef to avoid re-subscribing when addNotification identity changes
@@ -362,12 +591,14 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     if (!currentUser) {
       setOrders([]);
       setAllOrders([]);
+      knownOrderStatusesRef.current = null;
+      isFirstOrderLoadRef.current = true;
       return;
     }
 
     // Admin: listen to ALL orders
     if (currentUser.type === UserType.ADMIN) {
-      const allOrdersQuery = query(collection(db, "orders"), orderBy("uploadedAt", "desc"));
+      const allOrdersQuery = query(collection(db, "orders"), orderBy("uploadedAt", "desc"), limit(ordersLimit));
       const unsubscribeAllOrders = onSnapshot(allOrdersQuery, (querySnapshot) => {
         const fetchedOrders: DocumentOrder[] = [];
         querySnapshot.forEach((doc) => {
@@ -376,18 +607,18 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         setAllOrders(fetchedOrders);
         setOrders(fetchedOrders); // Also set orders for compatibility
       }, (_error) => {
-        // Don't wipe orders or show error — this fires during sign-out when
-        // user's permissions are revoked. Sign-out cleanup handles state.
-        console.warn("[AppContext] All-orders listener error (may be expected during sign-out):", _error.message || _error);
+        if (!isExpectedPermissionLoss(_error)) {
+          debugLog("[AppContext] All-orders listener error:", (_error as { message?: string })?.message || _error);
+        }
       });
       return () => unsubscribeAllOrders();
     }
 
     let ordersQuery;
     if (currentUser.type === UserType.STUDENT) {
-      ordersQuery = query(collection(db, "orders"), where("userId", "==", currentUser.id), orderBy("uploadedAt", "desc"));
+      ordersQuery = query(collection(db, "orders"), where("userId", "==", currentUser.id), orderBy("uploadedAt", "desc"), limit(ordersLimit));
     } else if (currentUser.type === UserType.SHOP_OWNER && currentUser.shopId) {
-      ordersQuery = query(collection(db, "orders"), where("shopId", "==", currentUser.shopId), orderBy("uploadedAt", "desc"));
+      ordersQuery = query(collection(db, "orders"), where("shopId", "==", currentUser.shopId), orderBy("uploadedAt", "desc"), limit(ordersLimit));
     } else {
       setOrders([]);
       return;
@@ -398,19 +629,46 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       querySnapshot.forEach((doc) => {
         fetchedOrders.push({ id: doc.id, ...doc.data() } as DocumentOrder);
       });
+
+      // Paid-order sound for shop owners (web only)
+      // Only plays when an order transitions TO PENDING_APPROVAL (payment completed)
+      if (currentUser.type === UserType.SHOP_OWNER && !Capacitor.isNativePlatform()) {
+        const currentStatuses = new Map(fetchedOrders.map(o => [o.id, o.status]));
+        if (isFirstOrderLoadRef.current) {
+          // First load — just record statuses, don't play sound
+          knownOrderStatusesRef.current = currentStatuses;
+          isFirstOrderLoadRef.current = false;
+        } else if (knownOrderStatusesRef.current) {
+          // Check for orders that just became PENDING_APPROVAL (payment completed)
+          let hasNewPaidOrder = false;
+          for (const order of fetchedOrders) {
+            if (order.status === OrderStatus.PENDING_APPROVAL) {
+              const prevStatus = knownOrderStatusesRef.current.get(order.id);
+              // Sound if: order is new with PENDING_APPROVAL, or transitioned from another status
+              if (prevStatus !== OrderStatus.PENDING_APPROVAL) {
+                hasNewPaidOrder = true;
+                debugLog(`[AppContext] Paid order detected: #${order.id.slice(-6)} (was: ${prevStatus || 'new'})`);
+              }
+            }
+          }
+          if (hasNewPaidOrder) {
+            playNewOrderSound();
+          }
+          knownOrderStatusesRef.current = currentStatuses;
+        }
+      }
+
       setOrders(fetchedOrders);
     }, (_error) => {
-      // Don't wipe orders or show error — this fires during sign-out when
-      // user's permissions are revoked. Sign-out cleanup handles state.
-      console.warn("[AppContext] Orders listener error (may be expected during sign-out):", _error.message || _error);
+      if (!isExpectedPermissionLoss(_error)) {
+        debugLog("[AppContext] Orders listener error:", (_error as { message?: string })?.message || _error);
+      }
     });
 
     return () => {
       unsubscribeOrders();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentUser]);
-
+  }, [currentUser, ordersLimit]);
 
   // Payouts listener - for admin (all payouts) and shop owners (their payouts)
   useEffect(() => {
@@ -421,9 +679,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
     let payoutsQuery;
     if (currentUser.type === UserType.ADMIN) {
-      payoutsQuery = query(collection(db, "payouts"), orderBy("createdAt", "desc"));
+      payoutsQuery = query(collection(db, "payouts"), orderBy("createdAt", "desc"), limit(payoutsLimit));
     } else if (currentUser.type === UserType.SHOP_OWNER && currentUser.shopId) {
-      payoutsQuery = query(collection(db, "payouts"), where("shopId", "==", currentUser.shopId), orderBy("createdAt", "desc"));
+      payoutsQuery = query(collection(db, "payouts"), where("shopId", "==", currentUser.shopId), orderBy("createdAt", "desc"), limit(payoutsLimit));
     } else {
       setPayouts([]);
       return;
@@ -436,13 +694,13 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       });
       setPayouts(fetchedPayouts);
     }, (error) => {
-      // Don't wipe payouts on errors — this fires when user's account is deleted
-      // mid-session (permission denied). The sign-out flow will clear state.
-      console.warn("[AppContext] Payouts listener error (may be expected during sign-out):", error.message || error);
+      if (!isExpectedPermissionLoss(error)) {
+        debugLog("[AppContext] Payouts listener error:", error.message || error);
+      }
     });
 
     return () => unsubscribePayouts();
-  }, [currentUser]);
+  }, [currentUser, payoutsLimit]);
 
 
   // Notifications listener - real-time Firestore notifications for the current user
@@ -456,7 +714,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       collection(db, "notifications"),
       where("recipientUserId", "==", currentUser.id),
       orderBy("timestamp", "desc"),
-      limit(50)
+      limit(notificationsLimit)
     );
 
     const unsubscribeNotifs = onSnapshot(notifQuery, (querySnapshot) => {
@@ -466,11 +724,13 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       });
       setFirestoreNotifications(fetched);
     }, (error) => {
-      console.error("[AppContext] Error listening to notifications:", error);
+      if (!isExpectedPermissionLoss(error)) {
+        debugLog("[AppContext] Error listening to notifications:", error);
+      }
     });
 
     return () => unsubscribeNotifs();
-  }, [currentUser]);
+  }, [currentUser, notificationsLimit]);
 
   // Real-time listener on the current user's Firestore document.
   // Detects admin deletion/rejection: when the doc is deleted, sign the user out immediately.
@@ -491,7 +751,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
       if (!docSnap.exists()) {
         // Document was deleted (admin action) — sign out immediately
-        console.log('[AppContext] User document deleted (admin action). Signing out.');
+        debugLog('[AppContext] User document deleted (admin action). Signing out.');
         addNotificationRef.current({
           message: 'Your account has been removed by the administrator.',
           type: 'warning',
@@ -499,7 +759,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         setCurrentUserInternal(null);
         setPendingFirebaseProfileCreationUser(null);
         signOut(auth).catch((err) => {
-          console.warn('[AppContext] signOut after admin deletion failed:', err);
+          debugLog('[AppContext] signOut after admin deletion failed:', err);
         });
       } else {
         // Document was updated — sync the latest data (e.g., role changes, pass status)
@@ -509,10 +769,10 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         if (updatedData.hasStudentPass && updatedData.studentPassActivatedAt) {
           const passStillActive = isStudentPassActive(updatedData.hasStudentPass, updatedData.studentPassActivatedAt);
           if (!passStillActive) {
-            console.log('[AppContext] Student Pass expired — auto-deactivating.');
+            debugLog('[AppContext] Student Pass expired — auto-deactivating.');
             const userRef = doc(db, "users", updatedData.id);
             updateDoc(userRef, { hasStudentPass: false }).catch(err =>
-              console.warn('[AppContext] Failed to auto-expire pass in Firestore:', err)
+              debugLog('[AppContext] Failed to auto-expire pass in Firestore:', err)
             );
             updatedData.hasStudentPass = false;
           }
@@ -521,7 +781,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         setCurrentUserInternal(updatedData);
       }
     }, (error) => {
-      console.warn('[AppContext] User document listener error:', error);
+      debugLog('[AppContext] User document listener error:', error);
       // Don't sign out on listener errors — could be a transient network issue
     });
 
@@ -537,7 +797,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
     const passQuery = query(
       collection(db, 'users'),
-      where('hasStudentPass', '==', true)
+      where('hasStudentPass', '==', true),
+      limit(1000)
     );
 
     const unsubscribePass = onSnapshot(passQuery, (querySnapshot) => {
@@ -554,7 +815,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       });
       setStudentPassHolders(holders);
     }, (error) => {
-      console.error('[AppContext] Error listening to student pass holders:', error);
+      debugLog('[AppContext] Error listening to student pass holders:', error);
     });
 
     return () => unsubscribePass();
@@ -568,11 +829,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     // This must be called before onAuthStateChanged to catch the redirect return
     getRedirectResult(auth).then((result) => {
       if (result) {
-        console.log('[AppContext] Google redirect sign-in completed successfully');
+        debugLog('[AppContext] Google redirect sign-in completed successfully');
         // onAuthStateChanged will handle the rest
       }
     }).catch((error) => {
-      console.warn('[AppContext] getRedirectResult error:', error);
+      debugLog('[AppContext] getRedirectResult error:', error);
       // Don't show error for "no redirect result" — that's normal on non-redirect flows
       const firebaseError = error as { code?: string };
       if (firebaseError.code && firebaseError.code !== 'auth/popup-closed-by-user') {
@@ -591,7 +852,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
               return await getDoc(userDocRef);
             } catch (fetchErr) {
               if (attempt < retries) {
-                console.warn(`[AppContext] Profile fetch attempt ${attempt + 1} failed, retrying...`, fetchErr);
+                debugLog(`[AppContext] Profile fetch attempt ${attempt + 1} failed, retrying...`, fetchErr);
                 await new Promise(r => setTimeout(r, 1500));
               } else {
                 throw fetchErr;
@@ -602,64 +863,64 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         };
 
         try {
-          // Check if this user's email is in the admin list
-          const isAdmin = authUser.email && ADMIN_EMAILS.includes(authUser.email.toLowerCase());
+          const userDocSnap = await fetchUserDoc(authUser.uid);
 
-          if (isAdmin) {
-            const userDocSnap = await fetchUserDoc(authUser.uid);
-
-            if (userDocSnap.exists()) {
-              const existingData = userDocSnap.data() as User;
-              if (existingData.type !== UserType.ADMIN) {
-                const adminProfile: User = {
-                  id: authUser.uid,
-                  name: authUser.displayName || existingData.name || 'Admin',
-                  type: UserType.ADMIN,
-                  email: authUser.email || existingData.email,
-                };
-                await setDoc(doc(db, "users", authUser.uid), adminProfile);
-                setCurrentUserInternal(adminProfile);
-              } else {
-                setCurrentUserInternal(existingData);
-              }
+          if (userDocSnap.exists()) {
+            const userData = userDocSnap.data() as User & { isDeleted?: boolean };
+            if (userData.isDeleted) {
+              // Ignore soft-deleted accounts — effectively treating them as new
+              setCurrentUserInternal(null);
+              setPendingFirebaseProfileCreationUser(authUser);
             } else {
-              const adminProfile: User = {
-                id: authUser.uid,
-                name: authUser.displayName || 'Admin',
-                type: UserType.ADMIN,
-                email: authUser.email || undefined,
-              };
-              await setDoc(doc(db, "users", authUser.uid), adminProfile);
-              setCurrentUserInternal(adminProfile);
-            }
-            setPendingFirebaseProfileCreationUser(null);
-          } else {
-            // Non-admin user
-            const userDocSnap = await fetchUserDoc(authUser.uid);
-
-            if (userDocSnap.exists()) {
-              const userData = userDocSnap.data() as User;
               setCurrentUserInternal(userData);
               setPendingFirebaseProfileCreationUser(null);
+            }
+          } else {
+            // Profile doesn't exist in Firestore.
+            // First, try to recover a shop owner profile when an earlier partial
+            // signup created the shop document but failed before writing /users/{uid}.
+            const ownedShopsQuery = query(
+              collection(db, "shops"),
+              where("ownerUserId", "==", authUser.uid),
+              limit(1)
+            );
+            const ownedShopsSnap = await getDocs(ownedShopsQuery);
+
+            if (!ownedShopsSnap.empty) {
+              const ownedShopDoc = ownedShopsSnap.docs[0];
+              const ownedShop = ownedShopDoc.data() as ShopProfile;
+              const recoveredShopOwnerProfile: User = {
+                id: authUser.uid,
+                name: authUser.displayName || authUser.email?.split('@')[0] || 'Shop Owner',
+                type: UserType.SHOP_OWNER,
+                shopId: ownedShopDoc.id,
+                ...(authUser.email && { email: authUser.email }),
+              };
+
+              await setDoc(doc(db, "users", authUser.uid), recoveredShopOwnerProfile);
+              setCurrentUserInternal(recoveredShopOwnerProfile);
+              setPendingFirebaseProfileCreationUser(null);
+              addNotificationRef.current({
+                message: `Recovered your shop account for "${ownedShop.name}".`,
+                type: 'success',
+                targetShopId: ownedShopDoc.id,
+              });
+            } else if (currentUserRef.current?.id === authUser.uid) {
+              // Same authenticated user lost their profile doc while signed in:
+              // treat this as an admin deletion and sign them out.
+              debugLog('[AppContext] Profile was deleted (admin action). Signing out user.');
+              addNotificationRef.current({ message: 'Your account has been removed by the administrator.', type: 'warning' });
+              setCurrentUserInternal(null);
+              setPendingFirebaseProfileCreationUser(null);
+              await signOut(auth);
             } else {
-              // Profile doesn't exist in Firestore.
-              // If the user was previously logged in (currentUserRef has data),
-              // this means admin deleted their account → sign them out.
-              if (currentUserRef.current) {
-                console.log('[AppContext] Profile was deleted (admin action). Signing out user.');
-                addNotificationRef.current({ message: 'Your account has been removed by the administrator.', type: 'warning' });
-                setCurrentUserInternal(null);
-                setPendingFirebaseProfileCreationUser(null);
-                await signOut(auth);
-              } else {
-                // Genuinely new user — show profile creation form
-                setCurrentUserInternal(null);
-                setPendingFirebaseProfileCreationUser(authUser);
-              }
+              // Genuinely new user — show profile creation form.
+              setCurrentUserInternal(null);
+              setPendingFirebaseProfileCreationUser(authUser);
             }
           }
         } catch (error) {
-          console.error('[AppContext] Failed to load profile after retries:', error);
+          debugLog('[AppContext] Failed to load profile after retries:', error);
           // DON'T clear currentUser on network errors — the user may have signed in
           // successfully via signInWithGoogle which already set the user state.
           // Only show error if we don't already have a valid user.
@@ -678,8 +939,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       }
     });
     return () => unsubscribe();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [currentUserRef]);
 
 
   const handleAuthError = (error: unknown): { message: string; errorCode?: string } => {
@@ -717,24 +977,24 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       if (isNative) {
         // Native Android/iOS: use native Google Sign-In via Credential Manager.
         // Google blocks signInWithPopup/Redirect in WebViews with "disallowed_useragent".
-        console.log('[AppContext] Attempting native Google Sign-In...');
+        debugLog('[AppContext] Attempting native Google Sign-In...');
         const success = await attemptNativeGoogleSignIn();
         if (!success) {
           throw new Error('Native Google Sign-In returned no result. Please ensure Google Play Services is up to date.');
         }
-        console.log('[AppContext] Native Google Sign-In + Firebase credential completed');
+        debugLog('[AppContext] Native Google Sign-In + Firebase credential completed');
       } else {
         // Web browser: use signInWithPopup
-        console.log('[AppContext] Using signInWithPopup for web...');
+        debugLog('[AppContext] Using signInWithPopup for web...');
         try {
           await signInWithPopup(auth, provider);
-          console.log('[AppContext] signInWithPopup resolved normally');
+          debugLog('[AppContext] signInWithPopup resolved normally');
         } catch (popupErr: unknown) {
           // COOP (Cross-Origin-Opener-Policy) can cause signInWithPopup to throw
           // even when the auth actually succeeded via onAuthStateChanged.
           // Check if Firebase already has a valid user before treating it as failure.
           if (auth.currentUser) {
-            console.log('[AppContext] signInWithPopup threw but auth.currentUser exists — sign-in succeeded despite COOP');
+            debugLog('[AppContext] signInWithPopup threw but auth.currentUser exists — sign-in succeeded despite COOP');
           } else {
             throw popupErr; // Re-throw — it's a real failure
           }
@@ -749,11 +1009,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       // onAuthStateChanged fires automatically after signInWithPopup/signInWithCredential
       // completes, and its handler already has retry logic.
       if (auth.currentUser) {
-        console.log('[AppContext] Auth succeeded for:', auth.currentUser.email, '— onAuthStateChanged will handle profile loading');
+        debugLog('[AppContext] Auth succeeded for:', auth.currentUser.email, '— onAuthStateChanged will handle profile loading');
       }
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : String(err);
-      console.error('[AppContext] Google Sign-In error:', errorMessage);
+      debugLog('[AppContext] Google Sign-In error:', errorMessage);
 
       // Don't show error if user just cancelled the sign-in
       const lower = errorMessage.toLowerCase();
@@ -795,13 +1055,13 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
     const loginResponse = result?.result;
     if (!loginResponse || loginResponse.responseType !== 'online') {
-      console.warn('[AppContext] Native sign-in returned non-online response:', loginResponse);
+      debugLog('[AppContext] Native sign-in returned non-online response:', loginResponse);
       return false;
     }
 
     const idToken = loginResponse.idToken;
     if (!idToken) {
-      console.warn('[AppContext] Native sign-in returned no idToken');
+      debugLog('[AppContext] Native sign-in returned no idToken');
       return false;
     }
 
@@ -865,7 +1125,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       try {
         if (auth.currentUser) await signOut(auth);
       } catch (signOutErr) {
-        console.warn('[AppContext] Failed to sign out after profile creation error:', getErrorMessage(signOutErr));
+        debugLog('[AppContext] Failed to sign out after profile creation error:', getErrorMessage(signOutErr));
       }
       return { success: false, message };
     } finally {
@@ -878,14 +1138,76 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     const newShopId = shopDocRef.id;
 
     const newShopData: ShopProfile = {
-      id: newShopId, ownerUserId, name: shopName, address: shopAddress, customPricing: initialPricing, isOpen: true, isApproved: false, payoutMethods: []
+      id: newShopId,
+      ownerUserId,
+      name: shopName,
+      address: shopAddress,
+      createdAt: new Date().toISOString(),
+      customPricing: initialPricing,
+      isOpen: true,
+      isApproved: false,
+      isVerified: false
     };
     try {
       await setDoc(shopDocRef, newShopData);
       return newShopData;
-    } catch (err: unknown) {
-      addNotification({ message: `Failed to register shop: ${getErrorMessage(err)}`, type: 'error' });
+    } catch (err) {
+      const error = err as Error;
+      addNotification({ message: `Failed to register shop: ${error.message}`, type: 'error' });
       return null;
+    }
+  }, [addNotification]);
+
+  const checkReturningShopOwner = useCallback(async (email: string) => {
+    try {
+      const func = httpsCallable<{ email: string }, unknown>(functions, 'checkReturningShopOwner');
+      const result = await func({ email });
+      return result.data as { exists: boolean; hasActiveAccount?: boolean; hasArchivedShop?: boolean; isOwnerOrphaned?: boolean; oldUserId?: string; shop?: ShopProfile };
+    } catch (err) {
+      debugLog("Error checking returning shopowner:", err);
+      return { exists: false };
+    }
+  }, []);
+
+  // --- Reactivation Requests ---
+  const [archivedShopForCurrentUser, setArchivedShopForCurrentUser] = useState<ShopProfile | null>(null);
+  const [reactivationRequests, setReactivationRequests] = useState<ReactivationRequest[]>([]);
+
+  const submitReactivationRequest = useCallback(async (shopId: string, shopName: string): Promise<{ success: boolean; message?: string }> => {
+    try {
+      const func = httpsCallable(functions, 'submitReactivationRequest');
+      const result = await func({ shopId, shopName });
+      const data = result.data as { success: boolean; message?: string };
+      if (data.success) {
+        addNotification({ message: data.message || 'Reactivation request submitted.', type: 'success' });
+        return { success: true, message: data.message };
+      } else {
+        addNotification({ message: data.message || 'Failed to submit reactivation request.', type: 'error' });
+        return { success: false, message: data.message };
+      }
+    } catch (err: unknown) {
+      const message = getErrorMessage(err);
+      addNotification({ message: `Failed to submit reactivation request: ${message}`, type: 'error' });
+      return { success: false, message };
+    }
+  }, [addNotification]);
+
+  const resolveReactivationRequestFn = useCallback(async (requestId: string, action: 'approve' | 'reject', otp: string, rejectionReason?: string): Promise<{ success: boolean; message?: string }> => {
+    try {
+      const func = httpsCallable(functions, 'resolveReactivationRequest');
+      const result = await func({ requestId, action, otp, rejectionReason });
+      const data = result.data as { success: boolean; message?: string };
+      if (data.success) {
+        addNotification({ message: data.message || `Request ${action}ed.`, type: 'success' });
+        return { success: true, message: data.message };
+      } else {
+        addNotification({ message: data.message || `Failed to ${action} request.`, type: 'error' });
+        return { success: false, message: data.message };
+      }
+    } catch (err: unknown) {
+      const message = getErrorMessage(err);
+      addNotification({ message: `Failed to ${action} request: ${message}`, type: 'error' });
+      return { success: false, message };
     }
   }, [addNotification]);
 
@@ -904,11 +1226,21 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       return { success: false, message };
     }
 
-    if (shops.some(s => s.name.trim().toLowerCase() === trimmedShopName.toLowerCase())) {
-      setIsLoadingAuth(false);
-      const message = `A shop with the name "${trimmedShopName}" already exists. Please choose a different name.`;
-      addNotification({ message, type: 'error' });
-      return { success: false, message };
+    const existingShop = shops.find(s => s.name.trim().toLowerCase() === trimmedShopName.toLowerCase());
+
+    if (existingShop) {
+      const ownerDocRef = doc(db, 'users', existingShop.ownerUserId);
+      try {
+        const ownerDocSnap = await getDoc(ownerDocRef);
+        if (!existingShop.isArchived && ownerDocSnap.exists()) {
+          setIsLoadingAuth(false);
+          const message = `A shop with the name "${trimmedShopName}" already exists. Please choose a different name.`;
+          addNotification({ message, type: 'error' });
+          return { success: false, message };
+        }
+      } catch (err) {
+        debugLog("Error checking existing shop owner:", err);
+      }
     }
 
     let newShop: ShopProfile | null = null;
@@ -942,7 +1274,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       try {
         if (auth.currentUser) await signOut(auth);
       } catch (signOutErr) {
-        console.warn('[AppContext] Failed to sign out after shop registration error:', getErrorMessage(signOutErr));
+        debugLog('[AppContext] Failed to sign out after shop registration error:', getErrorMessage(signOutErr));
       }
       return { success: false, message };
     } finally {
@@ -1019,13 +1351,32 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       const updateData: Partial<ShopProfile> = {
         customPricing: newSettings.pricing,
         isOpen: newSettings.isOpen,
-        payoutMethods: cleanPayoutMethods(newSettings.payoutMethods),
-        contactPhone: newSettings.contactPhone || '',
-        contactPhoneAlt: newSettings.contactPhoneAlt || '',
-        contactEmail: newSettings.contactEmail || '',
-        whatsappNumber: newSettings.whatsappNumber || '',
       };
-      await updateDoc(shopRef, updateData);
+
+      const normalizedContactFields = {
+        contactPhone: newSettings.contactPhone?.trim(),
+        contactPhoneAlt: newSettings.contactPhoneAlt?.trim(),
+        contactEmail: newSettings.contactEmail?.trim(),
+        whatsappNumber: newSettings.whatsappNumber?.trim(),
+      };
+
+      const contactFieldUpdates = Object.fromEntries(
+        Object.entries(normalizedContactFields).map(([key, value]) => [key, value ? value : deleteField()])
+      );
+
+      const batch = writeBatch(db);
+      batch.update(shopRef, { ...updateData, ...contactFieldUpdates });
+
+      if (newSettings.payoutMethods) {
+        const configDocRef = doc(db, 'shops', shopId, 'private', 'paymentConfig');
+        batch.set(configDocRef, {
+          payoutMethods: normalizePayoutMethodsForStorage(newSettings.payoutMethods),
+          updatedAt: new Date().toISOString()
+        });
+      }
+
+      await batch.commit();
+
       const shopFromState = shops.find(s => s.id === shopId);
       addNotification({
         message: `Settings updated for shop ${shopFromState?.name || shopId}.`,
@@ -1033,8 +1384,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         targetShopId: shopId,
         ...(shopFromState?.ownerUserId && { targetUserId: shopFromState.ownerUserId })
       });
+      return { success: true };
     } catch (err: unknown) {
-      addNotification({ message: `Failed to update shop settings: ${getErrorMessage(err)}`, type: 'error', targetShopId: shopId });
+      const message = getErrorMessage(err);
+      addNotification({ message: `Failed to update shop settings: ${message}`, type: 'error', targetShopId: shopId });
+      return { success: false, message };
     }
   }, [addNotification, shops]);
 
@@ -1077,19 +1431,57 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       userPassActive
     );
 
-    const orderDocRef = doc(collection(db, "orders"));
-    const orderId = orderDocRef.id;
-    const uploadedAtTimestamp = new Date().toISOString();
-
-    // Upload files with progress tracking and parallel uploads (up to 3 concurrent)
-    const uploadedFiles: OrderFile[] = [];
     const totalFiles = fileInputs.length;
     const fileProgressMap = new Map<number, number>(); // index -> progress (0-1)
+
+    // 1. Initialize the order draft on the backend first so clients cannot forge
+    // arbitrary order documents just to satisfy Storage rules.
+    let orderId = '';
+    let verifiedPrice = calculatedPriceDetails;
+    try {
+      const initializeOrderDraftFn = httpsCallable(functions, "initializeOrderDraft");
+      const draftResult = await initializeOrderDraftFn({
+        shopId,
+        specialInstructions,
+        files: fileInputs.map((fi) => ({
+          fileName: fi.file.name,
+          fileType: fi.fileType,
+          fileSizeBytes: fi.file.size,
+          pageCount: fi.pageCount,
+          color: fi.color,
+          copies: fi.copies,
+          doubleSided: fi.doubleSided,
+        })),
+      });
+      const draftData = draftResult.data as { orderId?: string; verifiedPrice?: DocumentOrder['priceDetails'] };
+      if (!draftData.orderId) {
+        throw new Error("Order draft creation did not return an order ID.");
+      }
+      orderId = draftData.orderId;
+      if (draftData.verifiedPrice) {
+        verifiedPrice = draftData.verifiedPrice;
+      }
+    } catch (firestoreError: unknown) {
+      addNotification({ message: `Failed to initialize order details: ${getErrorMessage(firestoreError)}. Please try again.`, type: 'error', targetUserId: userId });
+      return { success: false };
+    }
+
+    const uploadedFiles: OrderFile[] = fileInputs.map(fi => ({
+      fileName: fi.file.name,
+      fileType: fi.fileType,
+      fileStoragePath: `orders/${userId}/${orderId}/${fi.file.name}`,
+      fileSizeBytes: fi.file.size,
+      isFileDeleted: false,
+      pageCount: fi.pageCount,
+      color: fi.color,
+      copies: fi.copies,
+      doubleSided: fi.doubleSided,
+    }));
+
     addNotification({ message: `Uploading ${totalFiles} file(s)...`, type: 'info', targetUserId: userId });
 
     const reportProgress = (fileIndex: number, fileProgress: number) => {
       fileProgressMap.set(fileIndex, fileProgress);
-      // Calculate overall progress: average of all file progresses
       let totalProgress = 0;
       for (let i = 0; i < totalFiles; i++) {
         totalProgress += fileProgressMap.get(i) ?? 0;
@@ -1104,108 +1496,44 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       });
     };
 
-    // Upload a single file and return its OrderFile data
-    const uploadSingleFile = async (fi: typeof fileInputs[0], index: number): Promise<OrderFile> => {
+    // 2. Upload files in parallel batches of 3
+    const uploadSingleFile = async (fi: typeof fileInputs[0], index: number): Promise<void> => {
       const filePath = `orders/${userId}/${orderId}/${fi.file.name}`;
       const fileRef = storageRef(storage, filePath);
-
       const uploadTask = uploadBytesResumable(fileRef, fi.file, {
         contentType: fi.file.type || 'application/octet-stream',
         customMetadata: { originalFileName: fi.file.name },
       });
 
       await new Promise<void>((resolve, reject) => {
-        uploadTask.on(
-          'state_changed',
-          (snapshot) => {
-            const progress = snapshot.bytesTransferred / snapshot.totalBytes;
-            reportProgress(index, progress);
-          },
+        uploadTask.on('state_changed',
+          (snapshot) => reportProgress(index, snapshot.bytesTransferred / snapshot.totalBytes),
           reject,
-          () => {
-            reportProgress(index, 1);
-            resolve();
-          }
+          () => { reportProgress(index, 1); resolve(); }
         );
       });
-
-      return {
-        fileName: fi.file.name,
-        fileType: fi.fileType,
-        fileStoragePath: filePath,
-        fileSizeBytes: fi.file.size,
-        isFileDeleted: false,
-        pageCount: fi.pageCount,
-        color: fi.color,
-        copies: fi.copies,
-        doubleSided: fi.doubleSided,
-      };
     };
 
-    // Upload files in parallel batches of 3 for speed
     const CONCURRENCY = 3;
     try {
       for (let batchStart = 0; batchStart < totalFiles; batchStart += CONCURRENCY) {
         const batchEnd = Math.min(batchStart + CONCURRENCY, totalFiles);
-        const batch = fileInputs.slice(batchStart, batchEnd).map((fi, i) =>
-          uploadSingleFile(fi, batchStart + i)
-        );
-        const batchResults = await Promise.all(batch);
-        uploadedFiles.push(...batchResults);
+        const batch = fileInputs.slice(batchStart, batchEnd).map((fi, i) => uploadSingleFile(fi, batchStart + i));
+        await Promise.all(batch);
       }
     } catch (uploadError: unknown) {
-      addNotification({ message: `Upload failed: ${getErrorMessage(uploadError)}`, type: 'error', targetUserId: userId });
+      addNotification({
+        message: `Upload failed: ${getErrorMessage(uploadError)}. Your draft order will expire automatically if payment is not completed.`,
+        type: 'error',
+        targetUserId: userId
+      });
       return { success: false };
     }
 
-    if (uploadedFiles.length === 0) {
-      addNotification({ message: "No files were uploaded successfully.", type: 'error', targetUserId: userId });
-      return { success: false };
-    }
-
-    // Aggregate values for legacy printOptions
-    const totalPages = uploadedFiles.reduce((sum, f) => sum + f.pageCount, 0);
-    // Use max copies per file (not sum) — the sum is misleading in UI display
-    // e.g., 3 files × 2 copies each → show "2" not "6"
-    const maxCopies = Math.max(...uploadedFiles.map(f => f.copies), 1);
-    const primaryColor = uploadedFiles[0].color;
-    const anyDoubleSided = uploadedFiles.some(f => f.doubleSided);
-
-    const newOrder: DocumentOrder = {
-      id: orderId,
-      userId,
-      shopId,
-      // Legacy fields from first file
-      fileName: uploadedFiles[0].fileName,
-      fileType: uploadedFiles[0].fileType,
-      fileStoragePath: uploadedFiles[0].fileStoragePath,
-      fileSizeBytes: uploadedFiles[0].fileSizeBytes,
-      isFileDeleted: false,
-      // New multi-file array
-      files: uploadedFiles,
-      uploadedAt: uploadedAtTimestamp,
-      status: OrderStatus.PENDING_PAYMENT,
-      priceDetails: calculatedPriceDetails,
-      printOptions: {
-        copies: maxCopies,
-        color: primaryColor,
-        pages: totalPages,
-        doubleSided: anyDoubleSided,
-      },
-      isPremiumOrder: userPassActive,
-      userName: currentUserRef.current?.name || 'Student',
-      ...(specialInstructions ? { specialInstructions } : {}),
-    };
-
-    try {
-      await setDoc(orderDocRef, newOrder);
-      const fileLabel = uploadedFiles.length === 1 ? uploadedFiles[0].fileName : `${uploadedFiles.length} files`;
-      addNotification({ message: `Order #${orderId.slice(-6)} for ${fileLabel} (₹${calculatedPriceDetails.totalPrice}) placed at ${targetShop.name}. Proceed to payment.`, orderId, type: 'info', targetUserId: userId });
-      return { success: true, orderId };
-    } catch (firestoreError: unknown) {
-      addNotification({ message: `Failed to save order details: ${getErrorMessage(firestoreError)}. Please try again.`, type: 'error', targetUserId: userId });
-      return { success: false };
-    }
+    // 3. Success notification
+    const fileLabel = uploadedFiles.length === 1 ? uploadedFiles[0].fileName : `${uploadedFiles.length} files`;
+    addNotification({ message: `Order #${orderId.slice(-6)} for ${fileLabel} (₹${verifiedPrice.totalPrice}) placed at ${targetShop.name}. Proceed to payment.`, orderId, type: 'info', targetUserId: userId });
+    return { success: true, orderId };
 
   }, [addNotification, getShopById]);
 
@@ -1266,7 +1594,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         const targetShop = getShopById(updatedOrderInstance.shopId);
         // Use userName from the order document instead of fetching the user's profile.
         // Shopkeepers don't have Firestore permission to read other users' documents.
-        let studentUserName = updatedOrderInstance.userName || 'Student';
+        const studentUserName = updatedOrderInstance.userName || 'Student';
 
         let studentMessage = `Order #${orderId.slice(-6)} (${updatedOrderInstance.fileName}) at ${targetShop?.name || 'shop'} is now ${status.replace(/_/g, ' ').toLowerCase()}.`;
         const shopMessage = `Order #${orderId.slice(-6)} (${updatedOrderInstance.fileName}) by ${studentUserName} is now ${status.replace(/_/g, ' ').toLowerCase()}.`;
@@ -1299,33 +1627,63 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
   }, [addNotification, getShopById]);
 
-  // --- Admin Payout Functions ---
-  const createPayout = useCallback(async (shopId: string, shopName: string, amount: number, adminNote?: string): Promise<{ success: boolean; message?: string }> => {
+  const createPayout = useCallback(async (shopId: string, shopName: string, amount: number, adminNote?: string, otp?: string): Promise<{ success: boolean; message?: string }> => {
     if (!currentUser || currentUser.type !== UserType.ADMIN) {
-      return { success: false, message: "Only admins can create payouts." };
-    }
-    if (amount <= 0) {
-      return { success: false, message: "Amount must be greater than 0." };
+      return { success: false, message: "Only admins can manually create payouts." };
     }
     try {
-      const payoutDocRef = doc(collection(db, "payouts"));
-      const newPayout: ShopPayout = {
-        id: payoutDocRef.id,
-        shopId,
-        shopName,
-        amount,
-        adminNote: adminNote || '',
-        status: PayoutStatus.PAID,
-        createdAt: new Date().toISOString(),
-        paidAt: new Date().toISOString(),
-      };
-      await setDoc(payoutDocRef, newPayout);
-      addNotification({ message: `Payout of ₹${amount.toFixed(2)} created for ${shopName}.`, type: 'success' });
-      return { success: true };
+      if (!otp) throw new Error("OTP is required to process manual payouts.");
+      const idempotencyKey = `manual_${Date.now()}`;
+      const adminCreatePayoutFunc = httpsCallable(functions, "adminCreatePayout");
+      const result = await adminCreatePayoutFunc({ shopId, shopName, amount, adminNote, idempotencyKey, otp });
+      addNotification({ message: `Manual payout processed for ${shopName}.`, type: 'success', targetShopId: shopId });
+      return { success: true, message: (result.data as { message?: string }).message };
     } catch (err: unknown) {
       const message = getErrorMessage(err);
-      addNotification({ message: `Failed to create payout: ${message}`, type: 'error' });
+      addNotification({ message: `Failed to create payout: ${message}`, type: 'error', targetShopId: shopId });
       return { success: false, message };
+    }
+  }, [currentUser, addNotification]);
+
+  const approvePayout = useCallback(async (payoutId: string, otp: string, adminNote?: string): Promise<{ success: boolean; message?: string }> => {
+    if (!currentUser || currentUser.type !== UserType.ADMIN) {
+      return { success: false, message: "Only admins can approve payouts." };
+    }
+    try {
+      const func = httpsCallable(functions, "approvePayoutRequest");
+      await func({ payoutId, otp, adminNote });
+      addNotification({ message: `Payout marked as paid.`, type: 'success' });
+      return { success: true };
+    } catch (err: unknown) {
+      return { success: false, message: getErrorMessage(err) };
+    }
+  }, [currentUser, addNotification]);
+
+  const rejectPayout = useCallback(async (payoutId: string, otp: string, adminNote?: string): Promise<{ success: boolean; message?: string }> => {
+    if (!currentUser || currentUser.type !== UserType.ADMIN) {
+      return { success: false, message: "Only admins can reject payouts." };
+    }
+    try {
+      const func = httpsCallable(functions, "rejectPayoutRequest");
+      await func({ payoutId, otp, adminNote });
+      addNotification({ message: `Payout request rejected and reversed safely.`, type: 'success' });
+      return { success: true };
+    } catch (err: unknown) {
+      return { success: false, message: getErrorMessage(err) };
+    }
+  }, [currentUser, addNotification]);
+
+  const cancelPayout = useCallback(async (payoutId: string, otp: string): Promise<{ success: boolean; message?: string }> => {
+    if (!currentUser || currentUser.type !== UserType.ADMIN) {
+      return { success: false, message: "Only admins can cancel payouts." };
+    }
+    try {
+      const func = httpsCallable(functions, "cancelPayout");
+      await func({ payoutId, otp });
+      addNotification({ message: `Payout cancelled and reversed safely.`, type: 'success' });
+      return { success: true };
+    } catch (err: unknown) {
+      return { success: false, message: getErrorMessage(err) };
     }
   }, [currentUser, addNotification]);
 
@@ -1337,20 +1695,12 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       return { success: false, message: "Amount must be greater than 0." };
     }
     try {
-      const payoutDocRef = doc(collection(db, "payouts"));
-      const newPayout: ShopPayout = {
-        id: payoutDocRef.id,
-        shopId,
-        shopName,
-        amount,
-        shopOwnerNote: shopOwnerNote || '',
-        status: PayoutStatus.PENDING,
-        createdAt: new Date().toISOString(),
-      };
-      await setDoc(payoutDocRef, newPayout);
+      addNotification({ message: `Submitting payout request...`, type: 'info' });
+      const requestPayoutFunc = httpsCallable(functions, "requestPayout");
+      // V-03: Provide client-side idempotency key to prevent double-spending
+      const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      await requestPayoutFunc({ shopId, shopName, amount, shopOwnerNote, requestId });
       addNotification({ message: `Payout request of ₹${amount.toFixed(2)} submitted. Admin will review and process it.`, type: 'success', targetShopId: shopId });
-      // Notify admin about the request
-      addNotification({ message: `${shopName} has requested a payout of ₹${amount.toFixed(2)}.`, type: 'info', targetUserId: 'ADMIN' });
       return { success: true };
     } catch (err: unknown) {
       const message = getErrorMessage(err);
@@ -1359,33 +1709,13 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
   }, [currentUser, addNotification]);
 
-  const markPayoutPaid = useCallback(async (payoutId: string): Promise<{ success: boolean; message?: string }> => {
-    if (!currentUser || currentUser.type !== UserType.ADMIN) {
-      return { success: false, message: "Only admins can mark payouts as paid." };
-    }
-    try {
-      const payoutRef = doc(db, "payouts", payoutId);
-      await updateDoc(payoutRef, {
-        status: PayoutStatus.PAID,
-        paidAt: new Date().toISOString(),
-      });
-      addNotification({ message: `Payout marked as paid.`, type: 'success' });
-      return { success: true };
-    } catch (err: unknown) {
-      return { success: false, message: getErrorMessage(err) };
-    }
-  }, [currentUser, addNotification]);
-
   const confirmPayout = useCallback(async (payoutId: string): Promise<{ success: boolean; message?: string }> => {
     if (!currentUser || currentUser.type !== UserType.SHOP_OWNER) {
       return { success: false, message: "Only shop owners can confirm payouts." };
     }
     try {
-      const payoutRef = doc(db, "payouts", payoutId);
-      await updateDoc(payoutRef, {
-        status: PayoutStatus.CONFIRMED,
-        confirmedAt: new Date().toISOString(),
-      });
+      const func = httpsCallable(functions, "confirmShopPayout");
+      await func({ payoutId });
       addNotification({ message: `Payout confirmed! Thank you.`, type: 'success', targetUserId: currentUser.id });
       return { success: true };
     } catch (err: unknown) {
@@ -1398,11 +1728,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       return { success: false, message: "Only shop owners can dispute payouts." };
     }
     try {
-      const payoutRef = doc(db, "payouts", payoutId);
-      await updateDoc(payoutRef, {
-        status: PayoutStatus.DISPUTED,
-        shopOwnerNote,
-      });
+      if (!shopOwnerNote || !shopOwnerNote.trim()) {
+        return { success: false, message: "Dispute note cannot be empty." };
+      }
+      const func = httpsCallable(functions, "disputeShopPayout");
+      await func({ payoutId, disputeNote: shopOwnerNote });
       addNotification({ message: `Payout disputed. Admin has been notified.`, type: 'warning', targetUserId: currentUser.id });
       return { success: true };
     } catch (err: unknown) {
@@ -1417,7 +1747,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     } else {
       // Firestore notification — update in database (onSnapshot will propagate the change)
       updateDoc(doc(db, "notifications", notificationId), { read: true }).catch(err => {
-        console.error("[AppContext] Failed to mark notification as read:", err);
+        debugLog("[AppContext] Failed to mark notification as read:", err);
       });
     }
   }, []);
@@ -1439,18 +1769,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       return { success: false, message: "Only admins can approve shops." };
     }
     try {
-      const shopRef = doc(db, "shops", shopId);
-      await updateDoc(shopRef, { isApproved: true });
-      addNotification({ message: `Shop approved successfully.`, type: 'success' });
-      // Notify shop owner
-      const shop = shops.find(s => s.id === shopId);
-      if (shop) {
-        addNotification({
-          message: `Your shop "${shop.name}" has been approved by the admin! You can now accept orders.`,
-          type: 'success',
-          targetUserId: shop.ownerUserId,
-          targetShopId: shopId,
-        });
+      const approveShopFn = httpsCallable(functions, 'approveShopRegistration');
+      const result = await approveShopFn({ shopId });
+      const data = result.data as { success?: boolean; message?: string };
+      if (data.success) {
+        addNotification({ message: `Shop approved successfully.`, type: 'success' });
       }
       return { success: true };
     } catch (err: unknown) {
@@ -1458,53 +1781,25 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       addNotification({ message: `Failed to approve shop: ${message}`, type: 'error' });
       return { success: false, message };
     }
-  }, [currentUser, addNotification, shops]);
+  }, [currentUser, addNotification]);
 
   const rejectShop = useCallback(async (shopId: string): Promise<{ success: boolean; message?: string }> => {
     if (!currentUser || currentUser.type !== UserType.ADMIN) {
       return { success: false, message: "Only admins can reject shops." };
     }
     try {
-      const shop = shops.find(s => s.id === shopId);
-      // Delete the shop document
-      await deleteDoc(doc(db, "shops", shopId));
-      // Also delete the owner's user profile so they can re-register
-      if (shop) {
-        await deleteDoc(doc(db, "users", shop.ownerUserId));
-        addNotification({
-          message: `Shop "${shop.name}" registration was rejected.`,
-          type: 'warning',
-          targetUserId: shop.ownerUserId,
-        });
-      }
-      addNotification({ message: `Shop rejected and removed.`, type: 'info' });
+      const rejectShopFn = httpsCallable(functions, 'rejectShopRegistration');
+      const result = await rejectShopFn({ shopId });
+      const data = result.data as { success?: boolean; message?: string };
+      addNotification({ message: data.message || `Shop rejected and removed.`, type: 'info' });
       return { success: true };
     } catch (err: unknown) {
       const message = getErrorMessage(err);
       addNotification({ message: `Failed to reject shop: ${message}`, type: 'error' });
       return { success: false, message };
     }
-  }, [currentUser, addNotification, shops]);
-
-  const deleteShopAndOwner = useCallback(async (shopId: string, ownerUserId: string): Promise<{ success: boolean; message?: string }> => {
-    if (!currentUser || currentUser.type !== UserType.ADMIN) {
-      return { success: false, message: "Only admins can delete shops." };
-    }
-    try {
-      // Delete the shop
-      await deleteDoc(doc(db, "shops", shopId));
-      // Delete the owner's user profile
-      await deleteDoc(doc(db, "users", ownerUserId));
-      addNotification({ message: `Shop and owner account deleted.`, type: 'success' });
-      return { success: true };
-    } catch (err: unknown) {
-      const message = getErrorMessage(err);
-      addNotification({ message: `Failed to delete shop: ${message}`, type: 'error' });
-      return { success: false, message };
-    }
   }, [currentUser, addNotification]);
 
-  // Archive / Unarchive shop (admin)
   const archiveShop = useCallback(async (shopId: string): Promise<{ success: boolean; message?: string }> => {
     if (!currentUser || currentUser.type !== UserType.ADMIN) {
       return { success: false, message: "Only admins can archive shops." };
@@ -1514,14 +1809,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       await updateDoc(shopRef, { isArchived: true, isOpen: false });
       const shop = shops.find(s => s.id === shopId);
       addNotification({ message: `Shop "${shop?.name || shopId}" has been archived.`, type: 'info' });
-      if (shop) {
-        addNotification({
-          message: `Your shop "${shop.name}" has been archived by the admin. It is no longer visible to students.`,
-          type: 'warning',
-          targetUserId: shop.ownerUserId,
-          targetShopId: shopId,
-        });
-      }
       return { success: true };
     } catch (err: unknown) {
       const message = getErrorMessage(err);
@@ -1539,14 +1826,6 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       await updateDoc(shopRef, { isArchived: false });
       const shop = shops.find(s => s.id === shopId);
       addNotification({ message: `Shop "${shop?.name || shopId}" has been unarchived.`, type: 'success' });
-      if (shop) {
-        addNotification({
-          message: `Your shop "${shop.name}" has been restored by the admin. You can now accept orders again.`,
-          type: 'success',
-          targetUserId: shop.ownerUserId,
-          targetShopId: shopId,
-        });
-      }
       return { success: true };
     } catch (err: unknown) {
       const message = getErrorMessage(err);
@@ -1555,90 +1834,236 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
   }, [currentUser, addNotification, shops]);
 
-  // Shop owner self-delete account
-  const deleteOwnShopAccount = useCallback(async (): Promise<{ success: boolean; message?: string }> => {
-    if (!currentUser || currentUser.type !== UserType.SHOP_OWNER || !currentUser.shopId) {
-      return { success: false, message: "Only shop owners can delete their own account." };
-    }
+  const shopInitiateRefund = useCallback(async (ticketId: string, orderId: string, reason: string): Promise<{ success: boolean; message?: string }> => {
     try {
-      // Delete the shop document
-      await deleteDoc(doc(db, "shops", currentUser.shopId));
-      // Delete the user profile document
-      await deleteDoc(doc(db, "users", currentUser.id));
-      // Sign out
-      await signOut(auth);
-      addNotification({ message: "Your shop account has been deleted.", type: 'info' });
+      if (!currentUser || currentUser.type !== UserType.SHOP_OWNER) throw new Error('Unauthorized');
+
+      const shopInitiateRefundFn = httpsCallable(functions, 'shopInitiateRefund');
+      await shopInitiateRefundFn({ ticketId, orderId, reason });
+
+      addNotification({ message: `Refund request initiated successfully.`, type: 'success' });
       return { success: true };
     } catch (err: unknown) {
       const message = getErrorMessage(err);
-      addNotification({ message: `Failed to delete account: ${message}`, type: 'error' });
+      addNotification({ message: `Failed to initiate refund: ${message}`, type: 'error' });
       return { success: false, message };
     }
   }, [currentUser, addNotification]);
 
-  // Student self-delete account
-  const deleteOwnStudentAccount = useCallback(async (): Promise<{ success: boolean; message?: string }> => {
-    if (!currentUser || currentUser.type !== UserType.STUDENT) {
-      return { success: false, message: "Only students can delete their own account." };
-    }
+  const escalateTicketToAdmin = useCallback(async (ticketId: string, reason: string): Promise<{ success: boolean; message?: string }> => {
     try {
-      // Delete the user profile document
-      await deleteDoc(doc(db, "users", currentUser.id));
-      // Sign out
-      await signOut(auth);
-      addNotification({ message: "Your account has been deleted.", type: 'info' });
+      if (!currentUser || currentUser.type !== UserType.STUDENT) throw new Error('Unauthorized');
+
+      const escalateTicketToAdminFn = httpsCallable(functions, 'escalateTicketToAdmin');
+      await escalateTicketToAdminFn({ ticketId, reason });
+
+      addNotification({ message: `Ticket escalated to Admin successfully.`, type: 'success' });
       return { success: true };
     } catch (err: unknown) {
       const message = getErrorMessage(err);
-      addNotification({ message: `Failed to delete account: ${message}`, type: 'error' });
+      addNotification({ message: `Failed to escalate ticket: ${message}`, type: 'error' });
       return { success: false, message };
     }
   }, [currentUser, addNotification]);
+
+  // Account Orchestration Flow (OTP protected actions)
+  const requestAccountActionOTP = useCallback(async (actionId: string): Promise<{ success: boolean; message?: string }> => {
+    try {
+      const func = httpsCallable(functions, "requestAccountActionOTP");
+      await func({ actionId });
+      return { success: true };
+    } catch (err: unknown) {
+      return { success: false, message: getErrorMessage(err) };
+    }
+  }, []);
+
+  const executeAccountAction = useCallback(async (action: string, otp: string, targetUid?: string, targetShopId?: string): Promise<{ success: boolean; message?: string }> => {
+    try {
+      const executeFunc = httpsCallable(functions, "executeAccountAction");
+      await executeFunc({ action, otp, targetUid, targetShopId });
+      // If deleting own account, log out
+      if (action === "DELETE_OWN_ACCOUNT") {
+        await signOut(auth);
+      }
+      addNotification({ message: 'Action completed successfully.', type: 'success' });
+      return { success: true };
+    } catch (err: unknown) {
+      const message = getErrorMessage(err);
+      addNotification({ message: `Failed to complete action: ${message}`, type: 'error' });
+      return { success: false, message };
+    }
+  }, [addNotification]);
 
   // Approved shops — only approved and non-archived shops visible to students
   const approvedShops = useMemo(() => shops.filter(s => s.isApproved && !s.isArchived), [shops]);
 
+  // ---- ARCHIVED SHOP DETECTION (in onAuthStateChanged handler) ----
+  // Detect if current signed-in shop owner has an archived shop.
+  // This runs whenever currentUser or shops change.
+  useEffect(() => {
+    if (!currentUser || currentUser.type !== UserType.SHOP_OWNER || !currentUser.shopId) {
+      setArchivedShopForCurrentUser(null);
+      return;
+    }
+    const shop = shops.find(s => s.id === currentUser.shopId);
+    if (shop && shop.isArchived) {
+      setArchivedShopForCurrentUser(shop);
+    } else {
+      setArchivedShopForCurrentUser(null);
+    }
+  }, [currentUser, shops]);
+
+  // ---- REACTIVATION REQUESTS LISTENER (admin-only) ----
+  useEffect(() => {
+    if (!currentUser || currentUser.type !== UserType.ADMIN) {
+      setReactivationRequests([]);
+      return;
+    }
+
+    let fallbackUnsub: (() => void) | null = null;
+
+    const reactivationQuery = query(
+      collection(db, 'reactivationRequests'),
+      orderBy('requestedAt', 'desc'),
+      limit(100)
+    );
+
+    const unsub = onSnapshot(reactivationQuery, (snap) => {
+      const requests: ReactivationRequest[] = snap.docs.map(d => ({ id: d.id, ...d.data() } as ReactivationRequest));
+      setReactivationRequests(requests);
+    }, (err) => {
+      if (isExpectedPermissionLoss(err)) return;
+      debugLog('[AppContext] Reactivation requests listener error:', err);
+      // Fallback: try without orderBy in case index isn't ready
+      const fallbackQuery = query(collection(db, 'reactivationRequests'), limit(100));
+      fallbackUnsub?.();
+      fallbackUnsub = onSnapshot(fallbackQuery, (snap) => {
+        const requests: ReactivationRequest[] = snap.docs.map(d => ({ id: d.id, ...d.data() } as ReactivationRequest));
+        requests.sort((a, b) => new Date(b.requestedAt).getTime() - new Date(a.requestedAt).getTime());
+        setReactivationRequests(requests);
+      }, (error) => {
+        debugLog('[AppContext] Reactivation fallback listener error:', error);
+      });
+    });
+
+    return () => {
+      unsub();
+      fallbackUnsub?.();
+    };
+  }, [currentUser]);
+
   // ---- TICKETS STATE + LISTENER ----
   const [tickets, setTickets] = useState<SupportTicket[]>([]);
   const [reports, setReports] = useState<EarningsReport[]>([]);
+  const [refundRequests, setRefundRequests] = useState<RefundRequest[]>([]);
+
+  // ---- REFUND REQUESTS LISTENER ----
+  useEffect(() => {
+    if (!currentUser) { setRefundRequests([]); return; }
+
+    let q;
+    if (currentUser.type === UserType.ADMIN) {
+      q = query(collection(db, 'refundRequests'), where('status', 'in', ['ESCALATED_TO_ADMIN', 'AUTO_ESCALATED', 'PENDING_SHOP', 'APPROVED_BY_SHOP']), limit(200));
+    } else if (currentUser.type === UserType.SHOP_OWNER) {
+      q = query(collection(db, 'refundRequests'), where('shopId', '==', currentUser.shopId), limit(100));
+    } else {
+      q = query(collection(db, 'refundRequests'), where('studentId', '==', currentUser.id), limit(100));
+    }
+
+    const unsub = onSnapshot(q, (snap) => {
+      const requests = snap.docs.map(doc => ({ id: doc.id, ...doc.data() } as RefundRequest));
+      setRefundRequests(requests.sort((a, b) => b.studentRequestedAt.localeCompare(a.studentRequestedAt)));
+    }, err => {
+      if (!isExpectedPermissionLoss(err)) {
+        debugLog('Refund Requests listener fallback:', err);
+      }
+    });
+
+    return () => unsub();
+  }, [currentUser]);
 
   useEffect(() => {
     if (!currentUser) { setTickets([]); return; }
 
     let unsubTickets: (() => void) | null = null;
+    let unsubTicketsAssigned: (() => void) | null = null;
     let isCleaned = false;
 
     const subscribeTickets = (useFallback: boolean) => {
       if (isCleaned) return;
 
-      let ticketsQuery;
-      if (currentUser.type === UserType.ADMIN) {
-        // Admin: all tickets — single-field orderBy doesn't need composite index
-        ticketsQuery = useFallback
-          ? query(collection(db, 'tickets'))
-          : query(collection(db, 'tickets'), orderBy('updatedAt', 'desc'));
-      } else {
-        // Non-admin: own tickets only
-        ticketsQuery = useFallback
-          ? query(collection(db, 'tickets'), where('raisedBy', '==', currentUser.id))
-          : query(collection(db, 'tickets'), where('raisedBy', '==', currentUser.id), orderBy('updatedAt', 'desc'));
-      }
+      if (currentUser.type === UserType.SHOP_OWNER && currentUser.shopId) {
+        // Break OR query to prevent Firestore static analysis crash
+        const qRaised = useFallback
+          ? query(collection(db, 'tickets'), where('raisedBy', '==', currentUser.id), limit(100))
+          : query(collection(db, 'tickets'), where('raisedBy', '==', currentUser.id), orderBy('updatedAt', 'desc'), limit(100));
 
-      unsubTickets = onSnapshot(ticketsQuery, (snap) => {
-        const ticketList: SupportTicket[] = snap.docs.map(d => ({ id: d.id, ...d.data() } as SupportTicket));
-        // Sort client-side to guarantee order (especially for fallback queries without orderBy)
-        ticketList.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
-        setTickets(ticketList);
-      }, (err) => {
-        console.error('[AppContext] Tickets listener error:', err);
-        // If the error is about a missing/building index we haven't already fallen back, retry with fallback
-        if (!useFallback && err?.message?.includes('index')) {
-          console.log('[AppContext] Falling back to simple tickets query (index not ready)');
-          unsubTickets?.();
-          unsubTickets = null;
-          subscribeTickets(true);
+        const qAssigned = useFallback
+          ? query(collection(db, 'tickets'), where('shopId', '==', currentUser.shopId), limit(100))
+          : query(collection(db, 'tickets'), where('shopId', '==', currentUser.shopId), orderBy('updatedAt', 'desc'), limit(100));
+
+        let raisedList: SupportTicket[] = [];
+        let assignedList: SupportTicket[] = [];
+
+        const updateMerged = () => {
+          const merged = [...raisedList, ...assignedList];
+          const unique = Array.from(new Map(merged.map(item => [item.id, item])).values());
+          unique.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+          setTickets(unique);
+        };
+
+        const handleFallback = (err: unknown) => {
+          if (isExpectedPermissionLoss(err)) return;
+          debugLog('[AppContext] Tickets listener error:', err);
+          const errorMessage = typeof err === 'object' && err && 'message' in err
+            ? String((err as { message?: unknown }).message ?? '')
+            : '';
+          if (!useFallback && errorMessage.includes('index')) {
+            unsubTickets?.();
+            unsubTicketsAssigned?.();
+            unsubTickets = null;
+            unsubTicketsAssigned = null;
+            subscribeTickets(true);
+          }
+        };
+
+        unsubTickets = onSnapshot(qRaised, (snap) => {
+          raisedList = snap.docs.map(d => ({ id: d.id, ...d.data() } as SupportTicket));
+          updateMerged();
+        }, handleFallback);
+
+        unsubTicketsAssigned = onSnapshot(qAssigned, (snap) => {
+          assignedList = snap.docs.map(d => ({ id: d.id, ...d.data() } as SupportTicket));
+          updateMerged();
+        }, handleFallback);
+
+      } else {
+        let ticketsQuery;
+        if (currentUser.type === UserType.ADMIN) {
+          ticketsQuery = useFallback
+            ? query(collection(db, 'tickets'), limit(100))
+            : query(collection(db, 'tickets'), orderBy('updatedAt', 'desc'), limit(100));
+        } else {
+          ticketsQuery = useFallback
+            ? query(collection(db, 'tickets'), where('raisedBy', '==', currentUser.id), limit(100))
+            : query(collection(db, 'tickets'), where('raisedBy', '==', currentUser.id), orderBy('updatedAt', 'desc'), limit(100));
         }
-      });
+
+        unsubTickets = onSnapshot(ticketsQuery, (snap) => {
+          const ticketList: SupportTicket[] = snap.docs.map(d => ({ id: d.id, ...d.data() } as SupportTicket));
+          ticketList.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+          setTickets(ticketList);
+        }, (err) => {
+          if (isExpectedPermissionLoss(err)) return;
+          debugLog('[AppContext] Tickets listener error:', err);
+          if (!useFallback && err?.message?.includes('index')) {
+            debugLog('[AppContext] Falling back to simple tickets query (index not ready)');
+            unsubTickets?.();
+            unsubTickets = null;
+            subscribeTickets(true);
+          }
+        });
+      }
     };
 
     subscribeTickets(false);
@@ -1646,7 +2071,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     // Reports listener (admin only)
     let unsubReports: (() => void) | undefined;
     if (currentUser.type === UserType.ADMIN) {
-      const reportsQuery = query(collection(db, 'reports'), orderBy('generatedAt', 'desc'));
+      const reportsQuery = query(collection(db, 'reports'), orderBy('generatedAt', 'desc'), limit(50));
       unsubReports = onSnapshot(reportsQuery, (snap) => {
         const reportList: EarningsReport[] = snap.docs.map(d => ({ id: d.id, ...d.data() } as EarningsReport));
         setReports(reportList);
@@ -1656,6 +2081,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     return () => {
       isCleaned = true;
       unsubTickets?.();
+      unsubTicketsAssigned?.();
       unsubReports?.();
     };
   }, [currentUser]);
@@ -1668,7 +2094,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       if (snap.exists()) return snap.data() as BankDetails;
       return null;
     } catch (err) {
-      console.error('[AppContext] getBankDetails error:', err);
+      debugLog('[AppContext] getBankDetails error:', err);
       return null;
     }
   }, []);
@@ -1676,7 +2102,29 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const saveBankDetails = useCallback(async (shopId: string, details: BankDetails): Promise<{ success: boolean; message?: string }> => {
     try {
       const bankDocRef = doc(db, 'shops', shopId, 'private', 'bankDetails');
-      await setDoc(bankDocRef, { ...details, updatedAt: new Date().toISOString() });
+      const existingSnap = await getDoc(bankDocRef);
+      const existingDetails = existingSnap.exists() ? existingSnap.data() as BankDetails : null;
+
+      const cleanDetails: BankDetails = { ...details };
+      if (currentUser?.type !== UserType.ADMIN) {
+        delete cleanDetails.isVerified;
+        delete cleanDetails.verifiedAt;
+
+        // Preserve verification metadata on owner edits so the rules don't reject
+        // the write for touching admin-managed fields.
+        if (existingDetails?.isVerified !== undefined) {
+          cleanDetails.isVerified = existingDetails.isVerified;
+        }
+        if (existingDetails?.verifiedAt) {
+          cleanDetails.verifiedAt = existingDetails.verifiedAt;
+        }
+      }
+
+      // Merge owner edits so admin-managed verification fields are preserved.
+      // A full replace can implicitly delete fields like `verifiedBy`, which the
+      // private-doc rules correctly block shop owners from mutating.
+      await setDoc(bankDocRef, { ...cleanDetails, updatedAt: new Date().toISOString() }, { merge: true });
+
       // Log the edit
       await addDoc(collection(db, 'shops', shopId, 'bankAccessLogs'), {
         userId: currentUser?.id || 'unknown',
@@ -1686,12 +2134,23 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       });
       addNotification({ message: 'Bank details saved securely.', type: 'success', targetShopId: shopId });
       return { success: true };
-    } catch (err: unknown) {
-      const message = getErrorMessage(err);
-      addNotification({ message: `Failed to save bank details: ${message}`, type: 'error' });
-      return { success: false, message };
+    } catch (err) {
+      debugLog('[AppContext] saveBankDetails error:', err);
+      return { success: false, message: getErrorMessage(err) };
     }
   }, [currentUser, addNotification]);
+
+  const getPaymentConfig = useCallback(async (shopId: string): Promise<PaymentConfiguration | null> => {
+    try {
+      const configDocRef = doc(db, 'shops', shopId, 'private', 'paymentConfig');
+      const snap = await getDoc(configDocRef);
+      if (snap.exists()) return snap.data() as PaymentConfiguration;
+      return null;
+    } catch (err) {
+      debugLog('[AppContext] getPaymentConfig error:', err);
+      return null;
+    }
+  }, []);
 
   const verifyBankDetails = useCallback(async (shopId: string): Promise<{ success: boolean; message?: string }> => {
     try {
@@ -1719,7 +2178,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         timestamp: new Date().toISOString(),
       });
     } catch (err) {
-      console.error('[AppContext] logBankAccess error:', err);
+      debugLog('[AppContext] logBankAccess error:', err);
     }
   }, [currentUser]);
 
@@ -1733,54 +2192,49 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
 
     try {
-      const now = new Date().toISOString();
-      const ticketId = `ticket_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+      const createTicketFn = httpsCallable(functions, 'createSupportTicket');
+      const callableResult = await createTicketFn({
+        subject: ticketData.subject.trim(),
+        category: ticketData.category,
+        description: ticketData.description.trim(),
+        relatedOrderId: ticketData.relatedOrderId || undefined,
+      });
+      const callableData = callableResult.data as { success?: boolean; ticketId?: string };
+      const ticketId = callableData.ticketId;
 
-      // Upload attachment files if any
+      if (!ticketId) {
+        throw new Error('Ticket creation did not return a ticket ID.');
+      }
+
+      // 2. Upload attachment files if any
       const attachmentPaths: string[] = [];
       if (ticketData.attachmentFiles && ticketData.attachmentFiles.length > 0) {
         for (const file of ticketData.attachmentFiles.slice(0, 3)) { // max 3 files
           if (file.size > 5 * 1024 * 1024) continue; // skip files > 5MB
-          const path = `tickets/${ticketId}/${file.name}`;
+          // Prefix with unique ID to prevent filename collisions
+          const uniquePrefix = `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+          const path = `tickets/${ticketId}/${uniquePrefix}_${file.name}`;
           const fileRef = storageRef(storage, path);
           await uploadBytesResumable(fileRef, file);
           attachmentPaths.push(path);
         }
       }
 
-      // Build ticket object — only include optional fields when they have actual values
-      // to prevent Firestore's "Unsupported field value: undefined" error
-      const newTicket: Record<string, unknown> = {
-        id: ticketId,
-        raisedBy: currentUser.id,
-        raisedByType: currentUser.type,
-        raisedByName: currentUser.name || 'Unknown',
-        raisedByEmail: currentUser.email || '',
-        subject: ticketData.subject,
-        category: ticketData.category,
-        description: ticketData.description,
-        status: TicketStatus.OPEN,
-        attachmentPaths,
-        messages: [],
-        statusHistory: [{ from: TicketStatus.OPEN, to: TicketStatus.OPEN, changedBy: currentUser.id, changedByName: currentUser.name || 'Unknown', timestamp: now, note: 'Ticket created' }],
-        createdAt: now,
-        updatedAt: now,
-        raiserLastRepliedAt: now,
-      };
-
-      // Conditionally add optional fields only when they have real values
-      if (currentUser.type === UserType.SHOP_OWNER && currentUser.shopId) {
-        newTicket.shopId = currentUser.shopId;
+      // 3. Finalize the attachment paths server-side so the client cannot forge them.
+      if (attachmentPaths.length > 0) {
+        const attachTicketFilesFn = httpsCallable(functions, 'attachTicketFiles');
+        await attachTicketFilesFn({ ticketId, attachmentPaths });
       }
-      if (ticketData.relatedOrderId) {
-        newTicket.relatedOrderId = ticketData.relatedOrderId;
-      }
-
-      await setDoc(doc(db, 'tickets', ticketId), newTicket);
       addNotification({ message: `Ticket "${ticketData.subject}" submitted. We'll respond within 24 hours.`, type: 'success', targetUserId: currentUser.id });
       return { success: true, ticketId };
     } catch (err: unknown) {
       const message = getErrorMessage(err);
+      // Check if the ticket doc was already created before the failure
+      // (e.g., attachment upload or finalization failed)
+      if (message.includes('attach') || message.includes('upload')) {
+        addNotification({ message: `Ticket created but attachment upload failed. You can re-attach files later.`, type: 'warning' });
+        return { success: true, message: 'Ticket created without attachments.' };
+      }
       addNotification({ message: `Failed to create ticket: ${message}`, type: 'error' });
       return { success: false, message };
     }
@@ -1821,11 +2275,15 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           const existingHistory = Array.isArray(ticketData.statusHistory) ? ticketData.statusHistory : [];
           updateData.statusHistory = [...existingHistory, statusChange];
         }
+      } else if (currentUser.type === UserType.SHOP_OWNER) {
+        // Shop owner replies must use shopLastRepliedAt — matching the Firestore rules allowlist
+        updateData.shopLastRepliedAt = now;
       } else {
+        // STUDENT
         updateData.raiserLastRepliedAt = now;
       }
 
-      await updateDoc(ticketRef, updateData as { [x: string]: any });
+      await updateDoc(ticketRef, updateData);
       return { success: true };
     } catch (err: unknown) {
       const errorMessage = getErrorMessage(err);
@@ -1842,6 +2300,24 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       const ticketSnap = await getDoc(ticketRef);
       if (!ticketSnap.exists()) return { success: false, message: 'Ticket not found' };
       const ticketData = ticketSnap.data() as SupportTicket;
+
+      // Client-side state-machine guard (mirrors Firestore rules)
+      const validStatuses = Object.values(TicketStatus);
+      if (!validStatuses.includes(newStatus)) {
+        return { success: false, message: `Invalid target status: ${newStatus}` };
+      }
+      if (currentUser.type !== UserType.ADMIN) {
+        // Only ADMIN can set RESOLVED or IN_REVIEW
+        if (newStatus === TicketStatus.RESOLVED || newStatus === TicketStatus.IN_REVIEW) {
+          return { success: false, message: 'Only admins can set this status.' };
+        }
+        // Non-admin may only close an open or in-review ticket
+        if (newStatus === TicketStatus.CLOSED &&
+            ticketData.status !== TicketStatus.OPEN &&
+            ticketData.status !== TicketStatus.IN_REVIEW) {
+          return { success: false, message: 'Ticket cannot be closed from its current state.' };
+        }
+      }
 
       const now = new Date().toISOString();
       const statusChange: Record<string, unknown> = {
@@ -1876,26 +2352,79 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const contextValue = useMemo(() => ({
     currentUser, isLoadingAuth, pendingFirebaseProfileCreationUser, setPendingFirebaseProfileCreationUser,
     signInWithGoogle, signUpWithEmailPassword, signInWithEmailAndPassword: signInWithEmailAndPasswordInternal,
-    completeStudentProfileCreation, completeShopOwnerProfileCreation, logoutUser,
+    completeStudentProfileCreation, completeShopOwnerProfileCreation, checkReturningShopOwner, logoutUser,
     shops, isLoadingShops, getShopById, registerShop, updateShopSettings,
     orders, allOrders, getOrdersForCurrentUser,
     notifications,
     addOrder, updateOrderStatus,
     addNotification, markNotificationAsRead, getNotificationsForCurrentUser,
     currentView, navigateTo, goBack, upgradeToStudentPass, cancelStudentPass,
-    payouts, createPayout, requestPayout, markPayoutPaid, confirmPayout, disputePayout,
-    approveShop, rejectShop, deleteShopAndOwner, archiveShop, unarchiveShop, approvedShops,
-    deleteOwnShopAccount,
-    deleteOwnStudentAccount,
+    payouts, createPayout, approvePayout, rejectPayout, cancelPayout, requestPayout, confirmPayout, disputePayout,
+    approveShop, rejectShop, archiveShop, unarchiveShop, approvedShops,
+    requestAccountActionOTP,
+    executeAccountAction,
+
     studentPassHolders,
     getBankDetails, saveBankDetails, verifyBankDetails, logBankAccess,
+    getPaymentConfig,
     tickets, createTicket, addTicketMessage, updateTicketStatus,
     reports,
+    archivedShopForCurrentUser,
+    reactivationRequests,
+    submitReactivationRequest,
+    resolveReactivationRequest: resolveReactivationRequestFn,
+    refundRequests,
+    shopInitiateRefund,
+    escalateTicketToAdmin,
+    createRefundRequest: async (orderId: string, reason: string) => {
+      try {
+        await httpsCallable(functions, 'createRefundRequest')({ orderId, reason });
+        return { success: true };
+      } catch (err) {
+        return { success: false, message: getErrorMessage(err) };
+      }
+    },
+    respondToRefundRequest: async (requestId: string, approved: boolean, shopResponse?: string) => {
+      try {
+        await httpsCallable(functions, 'respondToRefundRequest')({ requestId, approved, shopResponse });
+        return { success: true };
+      } catch (err) {
+        return { success: false, message: getErrorMessage(err) };
+      }
+    },
+    escalateRefundRequest: async (requestId: string) => {
+      try {
+        await httpsCallable(functions, 'escalateRefundRequest')({ requestId });
+        return { success: true };
+      } catch (err) {
+        return { success: false, message: getErrorMessage(err) };
+      }
+    },
+    resolveRefundRequest: async (requestId: string, action: 'APPROVE' | 'DENY', otp: string, adminNote?: string) => {
+      try {
+        await httpsCallable(functions, 'resolveRefundRequest')({ requestId, action, otp, adminNote });
+        return { success: true };
+      } catch (err) {
+        return { success: false, message: getErrorMessage(err) };
+      }
+    },
+    syncRefundHistory: async (orderId: string) => {
+      try {
+        const res = await httpsCallable(functions, 'syncRefundHistory')({ orderId });
+        const data = res.data as { success: boolean; count: number; refunds: import('../types').RazorpayRefund[]; message?: string };
+        return data;
+      } catch (err) {
+        return { success: false, count: 0, refunds: [], message: getErrorMessage(err) };
+      }
+    },
+    ordersLimit, payoutsLimit, notificationsLimit, shopsLimit,
+    loadMoreOrders, loadMorePayouts, loadMoreNotifications, loadMoreShops
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }), [
     currentUser, isLoadingAuth, pendingFirebaseProfileCreationUser,
     shops, isLoadingShops, orders, allOrders, notifications, currentView, payouts, approvedShops, studentPassHolders,
-    tickets, reports
+    tickets, reports, archivedShopForCurrentUser, reactivationRequests, refundRequests,
+    ordersLimit, payoutsLimit, notificationsLimit, shopsLimit, loadMoreOrders, loadMorePayouts, loadMoreNotifications, loadMoreShops
   ]);
 
   return (

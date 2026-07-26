@@ -1,9 +1,11 @@
-import React from 'react';
+import React, { Suspense, lazy } from 'react';
 import { DocumentOrder, OrderStatus, PrintColor } from '../../types';
 import { Card } from '../common/Card';
 import { Button } from '../common/Button';
 import { useAppContext } from '../../contexts/AppContext';
 import { getOrderFiles, getOrderDisplayName } from '../../utils/orderHelpers';
+
+const TicketForm = lazy(() => import('../tickets/TicketForm'));
 
 interface StudentOrderCardProps {
   order: DocumentOrder;
@@ -21,6 +23,7 @@ const getStatusStyles = (status: OrderStatus): { text: string; border: string; b
     case OrderStatus.READY_FOR_PICKUP: return { text: 'text-status-success', border: 'border-status-success', bg: 'bg-status-success/20', icon: <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-4 h-4 mr-1.5"><path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75 11.25 15 15 9.75M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" /></svg> };
     case OrderStatus.COMPLETED: return { text: 'text-green-500', border: 'border-green-500', bg: 'bg-green-500/10', icon: <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-4 h-4 mr-1.5"><path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" /></svg> };
     case OrderStatus.CANCELLED: return { text: 'text-status-error', border: 'border-status-error', bg: 'bg-status-error/30', icon: <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-4 h-4 mr-1.5"><path strokeLinecap="round" strokeLinejoin="round" d="M6 18 18 6M6 6l12 12" /></svg> };
+    case OrderStatus.REFUNDED: return { text: 'text-cyan-600 dark:text-cyan-400', border: 'border-cyan-500', bg: 'bg-cyan-500/10', icon: <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-4 h-4 mr-1.5"><path strokeLinecap="round" strokeLinejoin="round" d="M9 15 3 9m0 0 6-6M3 9h12a6 6 0 0 1 0 12h-3" /></svg> };
     default: return { text: 'text-brand-lightText', border: 'border-brand-muted', bg: 'bg-brand-secondary' };
   }
 };
@@ -44,16 +47,19 @@ const FileIcon: React.FC<{ fileType: string }> = ({ fileType }) => {
 
 
 const StudentOrderCard: React.FC<StudentOrderCardProps> = ({ order, onPayNow, onCancelOrder, isProcessingPayment }) => {
-  const { getShopById } = useAppContext();
+  const { getShopById, refundRequests } = useAppContext();
   const { printOptions, status, priceDetails, uploadedAt, id, pickupCode, shopNotes, shopId } = order;
   const [showInvoice, setShowInvoice] = React.useState(false);
   const [showFiles, setShowFiles] = React.useState(false);
+  const [isTicketFormOpen, setIsTicketFormOpen] = React.useState(false);
 
   const files = getOrderFiles(order);
   const displayName = getOrderDisplayName(order);
   const shop = getShopById(shopId);
   const formattedStatus = status.replace(/_/g, ' ');
   const statusStyle = getStatusStyles(status);
+
+  const existingRefundRequest = refundRequests?.find(r => r.orderId === id);
 
   return (
     <Card className={`border-l-4 ${statusStyle.border} transition-all hover:shadow-2xl bg-opacity-80 backdrop-blur-sm ${status === OrderStatus.PENDING_PAYMENT || status === OrderStatus.PAYMENT_FAILED ? 'ring-2 ring-brand-primaryDark' : ''}`}>
@@ -162,6 +168,33 @@ const StudentOrderCard: React.FC<StudentOrderCardProps> = ({ order, onPayNow, on
         </div>
       )}
 
+      {/* Raise Issue / Support Button */}
+      <div className="mt-4 pt-4 border-t border-brand-muted/30 text-right">
+        <Button variant="ghost" size="sm" onClick={() => setIsTicketFormOpen(true)}>
+          Raise Issue
+        </Button>
+      </div>
+
+      {/* Existing Refund Request Status Display */}
+      {existingRefundRequest && !order.refundId && (
+        <div className="mt-4 p-3 rounded-lg border bg-yellow-50 dark:bg-yellow-900/20 border-yellow-200 dark:border-yellow-800/50">
+          <div className="flex items-center gap-2 mb-1">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4 text-yellow-600">
+              <path fillRule="evenodd" d="M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Zm-7-4a1 1 0 1 1-2 0 1 1 0 0 1 2 0ZM9 9a.75.75 0 0 0 0 1.5h.253a.25.25 0 0 1 .244.304l-.459 2.066A1.75 1.75 0 0 0 10.747 15H11a.75.75 0 0 0 0-1.5h-.253a.25.25 0 0 1-.244-.304l.459-2.066A1.75 1.75 0 0 0 9.253 9H9Z" clipRule="evenodd" />
+            </svg>
+            <span className="text-sm font-semibold text-yellow-800 dark:text-yellow-500">
+              Refund Request: {existingRefundRequest.status.replace(/_/g, ' ')}
+            </span>
+          </div>
+          <p className="text-xs text-yellow-700 dark:text-yellow-600 mt-1">
+            {existingRefundRequest.status === 'PENDING_SHOP' ? 'The shop has 24 hours to respond.' :
+             existingRefundRequest.status === 'REJECTED_BY_SHOP' ? 'The shop rejected this request. You can escalate it to Admin.' :
+             existingRefundRequest.status === 'ESCALATED_TO_ADMIN' ? 'Admin is reviewing your request.' :
+             'Processing refund request.'}
+          </p>
+        </div>
+      )}
+
       {/* Refund Status Display */}
       {order.refundId && (
         <div className={`mt-4 p-3 rounded-lg border ${
@@ -204,6 +237,14 @@ const StudentOrderCard: React.FC<StudentOrderCardProps> = ({ order, onPayNow, on
           )}
         </div>
       )}
+
+      <Suspense fallback={null}>
+        <TicketForm
+          isOpen={isTicketFormOpen}
+          onClose={() => setIsTicketFormOpen(false)}
+          prefilledOrderId={order.id}
+        />
+      </Suspense>
     </Card>
   );
 };

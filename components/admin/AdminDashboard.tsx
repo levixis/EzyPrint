@@ -1,27 +1,27 @@
-import React, { useState, useMemo, useRef } from 'react';
+import React, { useState, useMemo, useRef, useCallback, useEffect } from 'react';
 import { useAppContext } from '../../contexts/AppContext';
-import { ShopProfile, OrderStatus, PayoutStatus, DocumentOrder } from '../../types';
+import { ShopAggregate, ShopProfile, OrderStatus, PayoutStatus, DocumentOrder, ReactivationRequest, RefundRequest, ShopPayout } from '../../types';
 import AdminShopCard from './AdminShopCard';
 import AdminPayoutModal from './AdminPayoutModal';
 import { Card } from '../common/Card';
 import { RefundOtpModal } from '../common/RefundOtpModal';
+import { AccountOtpModal } from '../common/AccountOtpModal';
 import { useGSAP } from '@gsap/react';
 import gsap from 'gsap';
 import TicketList from '../tickets/TicketList';
 import { getFunctions, httpsCallable } from 'firebase/functions';
-import { app } from '../../firebase';
+import { app, collection, db, limit, onSnapshot, query } from '../../firebase';
 import { Button } from '../common/Button';
 
-type AdminTab = 'overview' | 'shops' | 'payouts' | 'orders' | 'tickets';
+type AdminTab = 'overview' | 'shops' | 'reactivations' | 'payouts' | 'orders' | 'tickets' | 'refunds';
 
 const AdminDashboard: React.FC = () => {
-  const { shops, allOrders, payouts, studentPassHolders, tickets, reports } = useAppContext();
+  const { shops, allOrders, payouts, studentPassHolders, tickets, reports, reactivationRequests, resolveReactivationRequest, requestAccountActionOTP, loadMoreOrders, ordersLimit, loadMorePayouts, payoutsLimit, refundRequests, resolveRefundRequest, approvePayout, rejectPayout, cancelPayout } = useAppContext();
   const [activeTab, setActiveTab] = useState<AdminTab>('overview');
   const [selectedShopForPayout, setSelectedShopForPayout] = useState<ShopProfile | null>(null);
   const [ordersSearch, setOrdersSearch] = useState('');
   const [selectedOrdersShop, setSelectedOrdersShop] = useState<string | null>(null);
   const [payoutsShopFilter, setPayoutsShopFilter] = useState<string>('all');
-  const [ordersLimit, setOrdersLimit] = useState(50);
   const dashboardRef = useRef<HTMLDivElement>(null);
 
   // Expandable order detail & refund
@@ -43,6 +43,114 @@ const AdminDashboard: React.FC = () => {
   const [isGeneratingReport, setIsGeneratingReport] = useState(false);
   const [reportError, setReportError] = useState('');
 
+  // Reactivation request state
+  const [reactivationModalRequest, setReactivationModalRequest] = useState<ReactivationRequest | null>(null);
+  const [reactivationAction, setReactivationAction] = useState<'approve' | 'reject'>('approve');
+  const [reactivationRejectionReason, setReactivationRejectionReason] = useState('');
+  const [isReactivationProcessing, setIsReactivationProcessing] = useState(false);
+  const [isReactivationOTPRequesting, setIsReactivationOTPRequesting] = useState(false);
+  const [reactivationOTPSent, setReactivationOTPSent] = useState(false);
+  const [reactivationResult, setReactivationResult] = useState<{ success: boolean; message: string } | null>(null);
+
+  // Admin Refund Request State
+  const [adminRefundModalReq, setAdminRefundModalReq] = useState<RefundRequest | null>(null);
+  const [adminRefundAction, setAdminRefundAction] = useState<'APPROVE' | 'DENY'>('APPROVE');
+  const [adminRefundNote, setAdminRefundNote] = useState('');
+  const [isAdminRefundProcessing, setIsAdminRefundProcessing] = useState(false);
+  const [isAdminRefundOTPRequesting, setIsAdminRefundOTPRequesting] = useState(false);
+  const [adminRefundOTPSent, setAdminRefundOTPSent] = useState(false);
+  const [adminRefundResult, setAdminRefundResult] = useState<{ success: boolean; message: string } | null>(null);
+
+  // Admin Payout Request State
+  const [adminPayoutModalReq, setAdminPayoutModalReq] = useState<ShopPayout | null>(null);
+  const [adminPayoutAction, setAdminPayoutAction] = useState<'APPROVE_PAYOUT' | 'REJECT_PAYOUT' | 'CANCEL_PAYOUT'>('APPROVE_PAYOUT');
+  const [adminPayoutNote, setAdminPayoutNote] = useState('');
+  const [isAdminPayoutProcessing, setIsAdminPayoutProcessing] = useState(false);
+  const [isAdminPayoutOTPRequesting, setIsAdminPayoutOTPRequesting] = useState(false);
+  const [adminPayoutOTPSent, setAdminPayoutOTPSent] = useState(false);
+  const [adminPayoutResult, setAdminPayoutResult] = useState<{ success: boolean; message: string } | null>(null);
+  const [shopAggregatesMap, setShopAggregatesMap] = useState<Record<string, ShopAggregate>>({});
+  const adminPayoutCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const adminRefundCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reactivationCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const aggregateBackfillKeyRef = useRef('');
+
+  useEffect(() => {
+    const aggregatesQuery = query(collection(db, 'shopAggregates'), limit(200));
+    const unsubscribe = onSnapshot(aggregatesQuery, (querySnapshot) => {
+      const next: Record<string, ShopAggregate> = {};
+      querySnapshot.forEach((docSnap) => {
+        next[docSnap.id] = { shopId: docSnap.id, ...docSnap.data() } as ShopAggregate;
+      });
+      setShopAggregatesMap(next);
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    const missingShopIds = shops
+      .filter((shop) => !shopAggregatesMap[shop.id])
+      .map((shop) => shop.id)
+      .sort();
+
+    if (missingShopIds.length === 0) {
+      aggregateBackfillKeyRef.current = '';
+      return;
+    }
+
+    const nextKey = missingShopIds.join('|');
+    if (aggregateBackfillKeyRef.current === nextKey) return;
+    aggregateBackfillKeyRef.current = nextKey;
+
+    // Debounce: wait 3s before triggering rebuild to avoid firing on rapid state changes
+    const timer = setTimeout(() => {
+      const rebuildFn = httpsCallable(getFunctions(app, 'asia-south1'), 'rebuildShopAggregates');
+      void rebuildFn().catch(() => {
+        aggregateBackfillKeyRef.current = '';
+      });
+    }, 3000);
+
+    return () => clearTimeout(timer);
+  }, [shopAggregatesMap, shops]);
+
+  useEffect(() => () => {
+    if (adminPayoutCloseTimerRef.current) clearTimeout(adminPayoutCloseTimerRef.current);
+    if (adminRefundCloseTimerRef.current) clearTimeout(adminRefundCloseTimerRef.current);
+    if (reactivationCloseTimerRef.current) clearTimeout(reactivationCloseTimerRef.current);
+  }, []);
+
+  const getRefundImpact = useCallback((order: DocumentOrder | null) => {
+    if (!order) return null;
+    const shop = shops.find((entry) => entry.id === order.shopId);
+    const deductionAmount = order.priceDetails?.pageCost || 0;
+    const ledgerBalance = shop?.ledgerBalance || 0;
+    const pendingBalance = shop?.pendingBalance || 0;
+    const willGoNegative = ledgerBalance - deductionAmount < 0;
+    const alreadyPaidOut = payouts.some((payout) =>
+      payout.shopId === order.shopId &&
+      ![PayoutStatus.REJECTED, PayoutStatus.CANCELLED].includes(payout.status) &&
+      Array.isArray(payout.payoutOrderIds) &&
+      payout.payoutOrderIds.includes(order.id)
+    );
+
+    return {
+      shopName: shop?.name || order.shopId,
+      ledgerBalance,
+      pendingBalance,
+      deductionAmount,
+      willGoNegative,
+      alreadyPaidOut,
+    };
+  }, [shops, payouts]);
+
+  const refundModalImpact = useMemo(() => getRefundImpact(refundModalOrder), [refundModalOrder, getRefundImpact]);
+  const refundRequestOrder = useMemo(
+    () => allOrders.find((order) => order.id === adminRefundModalReq?.orderId) || null,
+    [allOrders, adminRefundModalReq]
+  );
+  const adminRefundImpact = useMemo(() => getRefundImpact(refundRequestOrder), [refundRequestOrder, getRefundImpact]);
+  const shopAggregates = useMemo(() => Object.values(shopAggregatesMap), [shopAggregatesMap]);
   useGSAP(() => {
     gsap.from(".admin-card", {
       y: 20,
@@ -53,31 +161,34 @@ const AdminDashboard: React.FC = () => {
     });
   }, { scope: dashboardRef, dependencies: [activeTab, shops.length] });
 
-  // Helper: check if an order has been paid (post-payment-verification)
-  const isPaidStatus = (status: OrderStatus) =>
-    status === OrderStatus.PENDING_APPROVAL ||
-    status === OrderStatus.PRINTING ||
-    status === OrderStatus.READY_FOR_PICKUP ||
-    status === OrderStatus.COMPLETED;
-
   // Computed stats
   const stats = useMemo(() => {
-    const totalOrders = allOrders.length;
-    const paidOrders = allOrders.filter(o => isPaidStatus(o.status));
-    const totalRevenue = paidOrders.reduce((sum, o) => sum + o.priceDetails.totalPrice, 0);
-    const shopEarnings = paidOrders.reduce((sum, o) => sum + o.priceDetails.pageCost, 0);
-    const platformFees = paidOrders.reduce((sum, o) => sum + o.priceDetails.baseFee, 0);
-    const activeOrders = allOrders.filter(o =>
-      o.status !== OrderStatus.COMPLETED &&
-      o.status !== OrderStatus.CANCELLED &&
-      o.status !== OrderStatus.PAYMENT_FAILED &&
-      o.status !== OrderStatus.PENDING_PAYMENT
-    ).length;
-    const pendingPayouts = payouts.filter(p => p.status === PayoutStatus.PENDING).length;
+    const aggregateShopIds = new Set(Object.keys(shopAggregatesMap));
+    const fallbackOrders = allOrders.filter((order) => !aggregateShopIds.has(order.shopId));
+    const fallbackCompletedOrders = fallbackOrders.filter((order) => order.status === OrderStatus.COMPLETED);
+    const fallbackActiveOrders = fallbackOrders.filter((order) =>
+      order.status !== OrderStatus.COMPLETED &&
+      order.status !== OrderStatus.CANCELLED &&
+      order.status !== OrderStatus.REFUNDED &&
+      order.status !== OrderStatus.PAYMENT_FAILED &&
+      order.status !== OrderStatus.PENDING_PAYMENT
+    );
+    const fallbackPayouts = payouts.filter((payout) => !aggregateShopIds.has(payout.shopId));
+    const fallbackPaidOut = fallbackPayouts
+      .filter((payout) => payout.status === PayoutStatus.PAID || payout.status === PayoutStatus.CONFIRMED)
+      .reduce((sum, payout) => sum + payout.amount, 0);
+    const fallbackPendingPayouts = fallbackPayouts.filter((payout) => payout.status === PayoutStatus.PENDING).length;
+
+    const totalOrders = shopAggregates.reduce((sum, aggregate) => sum + aggregate.totalOrders, 0) + fallbackOrders.length;
+    const shopEarnings = shopAggregates.reduce((sum, aggregate) => sum + aggregate.totalRevenue, 0) +
+      fallbackCompletedOrders.reduce((sum, order) => sum + (order.priceDetails?.pageCost || 0), 0);
+    const platformFees = shopAggregates.reduce((sum, aggregate) => sum + aggregate.totalBaseFees, 0) +
+      fallbackCompletedOrders.reduce((sum, order) => sum + (order.priceDetails?.baseFee || 0), 0);
+    const totalRevenue = shopEarnings + platformFees;
+    const activeOrders = shopAggregates.reduce((sum, aggregate) => sum + aggregate.activeOrders, 0) + fallbackActiveOrders.length;
+    const pendingPayouts = shopAggregates.reduce((sum, aggregate) => sum + aggregate.pendingPayoutCount, 0) + fallbackPendingPayouts;
     const disputedPayouts = payouts.filter(p => p.status === PayoutStatus.DISPUTED).length;
-    const totalPaidOut = payouts
-      .filter(p => p.status === PayoutStatus.CONFIRMED || p.status === PayoutStatus.PAID)
-      .reduce((sum, p) => sum + p.amount, 0);
+    const totalPaidOut = shopAggregates.reduce((sum, aggregate) => sum + aggregate.totalPaidOut, 0) + fallbackPaidOut;
 
     const pendingApprovals = shops.filter(s => !s.isApproved).length;
 
@@ -86,7 +197,7 @@ const AdminDashboard: React.FC = () => {
     const subscriptionRevenue = totalPassHolders * 49; // ₹49 per pass
 
     return { totalOrders, totalRevenue, shopEarnings, platformFees, activeOrders, pendingPayouts, disputedPayouts, totalPaidOut, activeShops: shops.filter(s => s.isOpen).length, pendingApprovals, totalPassHolders, subscriptionRevenue };
-  }, [allOrders, payouts, shops, studentPassHolders]);
+  }, [allOrders, payouts, shopAggregates, shopAggregatesMap, shops, studentPassHolders]);
 
   // Filtered orders for search
   const filteredOrders = useMemo(() => {
@@ -113,6 +224,7 @@ const AdminDashboard: React.FC = () => {
     switch (status) {
       case OrderStatus.COMPLETED: return 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400';
       case OrderStatus.CANCELLED: return 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400';
+      case OrderStatus.REFUNDED: return 'bg-cyan-100 dark:bg-cyan-900/30 text-cyan-700 dark:text-cyan-400';
       case OrderStatus.PENDING_PAYMENT: return 'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400';
       case OrderStatus.PENDING_APPROVAL: return 'bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400';
       case OrderStatus.PRINTING: return 'bg-indigo-100 dark:bg-indigo-900/30 text-indigo-700 dark:text-indigo-400';
@@ -128,6 +240,8 @@ const AdminDashboard: React.FC = () => {
       case PayoutStatus.PAID: return 'bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400';
       case PayoutStatus.CONFIRMED: return 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400';
       case PayoutStatus.DISPUTED: return 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400';
+      case PayoutStatus.CANCELLED: return 'bg-slate-100 dark:bg-slate-800/50 text-slate-500 dark:text-slate-400 line-through opacity-75';
+      case PayoutStatus.REJECTED: return 'bg-rose-100 dark:bg-rose-900/30 text-rose-700 dark:text-rose-400 line-through opacity-75';
       default: return 'bg-gray-100 dark:bg-zinc-800 text-gray-600 dark:text-gray-400';
     }
   };
@@ -194,8 +308,9 @@ const AdminDashboard: React.FC = () => {
       await requestRefundOTPFn({ orderId: refundModalOrder.id });
       setOtpSent(true);
       setRefundResult({ success: true, message: 'OTP sent! Please check your admin mailbox.' });
-    } catch (err: any) {
-      setRefundResult({ success: false, message: err.message || 'Failed to send OTP.' });
+    } catch (err) {
+      const error = err as Error;
+      setRefundResult({ success: false, message: error.message || 'Failed to send OTP.' });
     }
     setIsRequestingOTP(false);
   };
@@ -216,8 +331,9 @@ const AdminDashboard: React.FC = () => {
       const data = result.data as { success: boolean; message: string };
       setRefundResult({ success: true, message: data.message || 'Refund initiated successfully.' });
       setOtpSent(false); // Reset
-    } catch (err: any) {
-      setRefundResult({ success: false, message: err.message || 'Refund failed. Invalid OTP?' });
+    } catch (err) {
+      const error = err as Error;
+      setRefundResult({ success: false, message: error.message || 'Refund failed. Invalid OTP?' });
     }
     setIsIssuingRefund(false);
   };
@@ -228,6 +344,8 @@ const AdminDashboard: React.FC = () => {
     { key: 'payouts', label: 'Payouts', icon: <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4"><path d="M2.273 5.625A4.483 4.483 0 0 1 5.25 4.5h13.5c1.141 0 2.183.425 2.977 1.125A3 3 0 0 0 18.75 3H5.25a3 3 0 0 0-2.977 2.625ZM2.273 8.625A4.483 4.483 0 0 1 5.25 7.5h13.5c1.141 0 2.183.425 2.977 1.125A3 3 0 0 0 18.75 6H5.25a3 3 0 0 0-2.977 2.625ZM5.25 9a3 3 0 0 0-3 3v6a3 3 0 0 0 3 3h13.5a3 3 0 0 0 3-3v-6a3 3 0 0 0-3-3H15a.75.75 0 0 0-.75.75 2.25 2.25 0 0 1-4.5 0A.75.75 0 0 0 9 9H5.25Z" /></svg> },
     { key: 'orders', label: 'All Orders', icon: <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4"><path fillRule="evenodd" d="M7.502 6h7.128A3.375 3.375 0 0 1 18 9.375v9.375a3 3 0 0 0 3-3V6.108c0-1.505-1.125-2.811-2.664-2.94a48.972 48.972 0 0 0-.673-.05A3 3 0 0 0 15 1.5h-1.5a3 3 0 0 0-2.663 1.618c-.225.015-.45.032-.673.05C8.662 3.295 7.554 4.542 7.502 6ZM13.5 3A1.5 1.5 0 0 0 12 4.5h4.5A1.5 1.5 0 0 0 15 3h-1.5Z" clipRule="evenodd" /><path fillRule="evenodd" d="M3 9.375C3 8.339 3.84 7.5 4.875 7.5h9.75c1.036 0 1.875.84 1.875 1.875v11.25c0 1.035-.84 1.875-1.875 1.875h-9.75A1.875 1.875 0 0 1 3 20.625V9.375Zm9.586 4.594a.75.75 0 0 0-1.172-.938l-2.476 3.096-.908-.907a.75.75 0 0 0-1.06 1.06l1.5 1.5a.75.75 0 0 0 1.116-.062l3-3.75Z" clipRule="evenodd" /></svg> },
     { key: 'tickets', label: 'Tickets', icon: <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4"><path fillRule="evenodd" d="M4.848 2.771A49.144 49.144 0 0 1 12 2.25c2.43 0 4.817.178 7.152.52a1.834 1.834 0 0 1 1.529 1.657l.293 3.513a1.834 1.834 0 0 1-1.307 1.92l-.416.14a3.118 3.118 0 0 0-1.898 4.084l.108.27a1.835 1.835 0 0 1-.9 2.267l-3.19 1.595a1.835 1.835 0 0 1-2.118-.355L9.69 16.3a3.118 3.118 0 0 0-4.253-.143l-.295.268a1.834 1.834 0 0 1-2.445-.198l-1.06-1.162a1.834 1.834 0 0 1-.286-2.066l.168-.336a3.118 3.118 0 0 0-1.034-3.82l-.35-.247A1.834 1.834 0 0 1 .26 6.62l.592-3.209a1.835 1.835 0 0 1 1.532-1.494l2.464-.146Z" clipRule="evenodd" /></svg> },
+    { key: 'reactivations', label: 'Reactivations', icon: <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4"><path fillRule="evenodd" d="M4.755 10.059a7.5 7.5 0 0 1 12.548-3.364l1.903 1.903h-3.183a.75.75 0 1 0 0 1.5h4.992a.75.75 0 0 0 .75-.75V4.356a.75.75 0 0 0-1.5 0v3.18l-1.9-1.9A9 9 0 0 0 3.306 9.67a.75.75 0 1 0 1.45.388Zm14.49 3.882a7.5 7.5 0 0 1-12.548 3.364l-1.902-1.903h3.183a.75.75 0 0 0 0-1.5H2.984a.75.75 0 0 0-.75.75v4.992a.75.75 0 0 0 1.5 0v-3.18l1.9 1.9a9 9 0 0 0 15.059-4.035.75.75 0 0 0-1.45-.388Z" clipRule="evenodd" /></svg> },
+    { key: 'refunds', label: 'Refunds', icon: <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4"><path fillRule="evenodd" d="M12 2.25c-5.385 0-9.75 4.365-9.75 9.75s4.365 9.75 9.75 9.75 9.75-4.365 9.75-9.75S17.385 2.25 12 2.25ZM9.204 10.97a.75.75 0 0 1 .157-1.049 4.496 4.496 0 0 1 5.278 0 .75.75 0 0 1-.92 1.157 2.997 2.997 0 0 0-3.518 0 .75.75 0 0 1-1.049-.158H9.204ZM12 7.125a1.125 1.125 0 1 0 0 2.25 1.125 1.125 0 0 0 0-2.25Z" clipRule="evenodd" /></svg> },
   ];
 
   return (
@@ -450,8 +568,9 @@ const AdminDashboard: React.FC = () => {
                       if (data.downloadUrl) {
                         window.open(data.downloadUrl, '_blank');
                       }
-                    } catch (err: any) {
-                      setReportError(err.message || 'Failed to generate report.');
+                    } catch (err) {
+                      const error = err as Error;
+                      setReportError(error.message || 'Failed to generate report.');
                     }
                     setIsGeneratingReport(false);
                   }}
@@ -556,6 +675,55 @@ const AdminDashboard: React.FC = () => {
                         <td className="p-4 text-gray-500 dark:text-gray-400 max-w-[200px] truncate">
                           {payout.adminNote || '—'}
                           {payout.shopOwnerNote && <span className="block text-xs text-red-500 mt-1">Shop: {payout.shopOwnerNote}</span>}
+                          
+                          {payout.status === 'PENDING' && (
+                            <div className="flex gap-2 mt-2">
+                              <Button
+                                size="sm"
+                                variant="primary"
+                                className="!py-1"
+                                onClick={() => {
+                                  setAdminPayoutModalReq(payout);
+                                  setAdminPayoutAction('APPROVE_PAYOUT');
+                                  setAdminPayoutNote('');
+                                  setAdminPayoutResult(null);
+                                }}
+                              >
+                                Approve
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="danger"
+                                className="!py-1"
+                                onClick={() => {
+                                  setAdminPayoutModalReq(payout);
+                                  setAdminPayoutAction('REJECT_PAYOUT');
+                                  setAdminPayoutNote('');
+                                  setAdminPayoutResult(null);
+                                }}
+                              >
+                                Reject
+                              </Button>
+                            </div>
+                          )}
+
+                          {payout.status === 'DISPUTED' && (
+                            <div className="flex gap-2 mt-2">
+                              <Button
+                                size="sm"
+                                variant="danger"
+                                className="!py-1"
+                                onClick={() => {
+                                  setAdminPayoutModalReq(payout);
+                                  setAdminPayoutAction('CANCEL_PAYOUT');
+                                  setAdminPayoutNote('');
+                                  setAdminPayoutResult(null);
+                                }}
+                              >
+                                Cancel &amp; Refund
+                              </Button>
+                            </div>
+                          )}
                         </td>
                         <td className="p-4 text-gray-500 dark:text-gray-400 text-xs">{new Date(payout.createdAt).toLocaleDateString()}</td>
                       </tr>
@@ -569,6 +737,79 @@ const AdminDashboard: React.FC = () => {
               <p className="text-gray-500 dark:text-gray-400">No payouts yet. Go to Shops tab to send your first payout.</p>
             </Card>
           )}
+          {payouts.length >= payoutsLimit && (
+            <div className="flex justify-center mt-4 mb-8">
+              <Button variant="secondary" onClick={loadMorePayouts}>Load More Payouts</Button>
+            </div>
+          )}
+
+          {/* Admin Payout Server-Side Action Modal */}
+          {adminPayoutModalReq && (
+            <AccountOtpModal
+              isOpen={!!adminPayoutModalReq}
+              onClose={() => setAdminPayoutModalReq(null)}
+              title={adminPayoutAction === 'APPROVE_PAYOUT' ? 'Approve Payout' : adminPayoutAction === 'REJECT_PAYOUT' ? 'Reject Payout' : 'Cancel Payout'}
+              description={
+                <div>
+                  <p>You are about to <strong>{adminPayoutAction === 'APPROVE_PAYOUT' ? 'APPROVE' : adminPayoutAction === 'REJECT_PAYOUT' ? 'REJECT' : 'CANCEL'}</strong> a payout for <span className="font-bold">{adminPayoutModalReq.shopName}</span>.</p>
+                  <p className="mt-1">Amount: <strong>₹{adminPayoutModalReq.amount.toFixed(2)}</strong></p>
+                  {adminPayoutAction === 'REJECT_PAYOUT' || adminPayoutAction === 'CANCEL_PAYOUT' ? (
+                    <p className="text-red-600 mt-1 text-xs">This will heavily reverse operations and refund the shop's ledger balance.</p>
+                  ) : (
+                    <p className="text-emerald-600 mt-1 text-xs">This will finalize the execution. The shop ledger balance has already been deducted.</p>
+                  )}
+                  <div className="mt-3">
+                    <label className="block text-xs font-semibold text-gray-600 dark:text-gray-400 mb-1">Admin Note (optional)</label>
+                    <input
+                      type="text"
+                      className="w-full px-3 py-2 text-sm border rounded-lg focus:ring-2 focus:ring-brand-primary outline-none"
+                      placeholder="Reason or reference..."
+                      value={adminPayoutNote}
+                      onChange={(e) => setAdminPayoutNote(e.target.value)}
+                    />
+                  </div>
+                </div>
+              }
+              confirmText={`Confirm ${adminPayoutAction === 'APPROVE_PAYOUT' ? 'Approval' : adminPayoutAction === 'REJECT_PAYOUT' ? 'Rejection' : 'Cancellation'}`}
+              loadingText="Processing..."
+              isProcessing={isAdminPayoutProcessing}
+              isRequestingOTP={isAdminPayoutOTPRequesting}
+              otpSent={adminPayoutOTPSent}
+              resultMessage={adminPayoutResult}
+              onRequestOTP={async () => {
+                setIsAdminPayoutOTPRequesting(true);
+                setAdminPayoutResult(null);
+                const res = await requestAccountActionOTP(adminPayoutAction);
+                setIsAdminPayoutOTPRequesting(false);
+                if (res.success) {
+                  setAdminPayoutOTPSent(true);
+                } else {
+                  setAdminPayoutResult({ success: false, message: res.message || "Failed to send OTP" });
+                }
+              }}
+              onConfirm={async (otp) => {
+                setIsAdminPayoutProcessing(true);
+                setAdminPayoutResult(null);
+                
+                let res;
+                if (adminPayoutAction === 'APPROVE_PAYOUT') {
+                  res = await approvePayout(adminPayoutModalReq.id, otp, adminPayoutNote);
+                } else if (adminPayoutAction === 'REJECT_PAYOUT') {
+                  res = await rejectPayout(adminPayoutModalReq.id, otp, adminPayoutNote);
+                } else {
+                  res = await cancelPayout(adminPayoutModalReq.id, otp);
+                }
+                
+                setIsAdminPayoutProcessing(false);
+                if (res.success) {
+                  setAdminPayoutResult({ success: true, message: res.message || "Resolved successfully." });
+                  adminPayoutCloseTimerRef.current = setTimeout(() => setAdminPayoutModalReq(null), 2000);
+                } else {
+                  setAdminPayoutResult({ success: false, message: res.message || "Failed to resolve." });
+                }
+              }}
+            />
+          )}
         </div>
       )}
 
@@ -580,8 +821,9 @@ const AdminDashboard: React.FC = () => {
               <h3 className="text-lg font-semibold text-gray-900 dark:text-white">Select a shop to view orders</h3>
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                 {shops.map(shop => {
-                  const shopOrderCount = allOrders.filter(o => o.shopId === shop.id).length;
-                  const activeCount = allOrders.filter(o => o.shopId === shop.id && o.status !== OrderStatus.COMPLETED && o.status !== OrderStatus.CANCELLED && o.status !== OrderStatus.PAYMENT_FAILED && o.status !== OrderStatus.PENDING_PAYMENT).length;
+                  const aggregate = shopAggregatesMap[shop.id];
+                  const shopOrderCount = aggregate?.totalOrders ?? allOrders.filter(o => o.shopId === shop.id).length;
+                  const activeCount = aggregate?.activeOrders ?? allOrders.filter(o => o.shopId === shop.id && o.status !== OrderStatus.COMPLETED && o.status !== OrderStatus.CANCELLED && o.status !== OrderStatus.REFUNDED && o.status !== OrderStatus.PAYMENT_FAILED && o.status !== OrderStatus.PENDING_PAYMENT).length;
                   return (
                     <button
                       key={shop.id}
@@ -849,13 +1091,13 @@ const AdminDashboard: React.FC = () => {
                       </tbody>
                     </table>
                   </div>
-                  {filteredOrders.filter(o => o.shopId === selectedOrdersShop).length > ordersLimit && (
+                  {allOrders.length >= ordersLimit && (
                     <div className="p-4 flex justify-center border-t border-gray-200 dark:border-zinc-700">
                       <button
-                        onClick={() => setOrdersLimit(prev => prev + 50)}
+                        onClick={loadMoreOrders}
                         className="px-5 py-2 text-sm font-medium text-brand-primary bg-brand-primary/10 hover:bg-brand-primary/20 rounded-lg transition-colors"
                       >
-                        Load More
+                        Load More Orders From Server
                       </button>
                     </div>
                   )}
@@ -869,6 +1111,167 @@ const AdminDashboard: React.FC = () => {
               )}
             </>
           )}
+        </div>
+      )}
+
+      {/* ===== REACTIVATIONS TAB ===== */}
+      {activeTab === 'reactivations' && (
+        <div className="space-y-4">
+          <h3 className="text-lg font-semibold text-gray-900 dark:text-white">Reactivation Requests ({reactivationRequests.length})</h3>
+          
+          {/* Pending Requests */}
+          {(() => {
+            const pending = reactivationRequests.filter(r => r.status === 'pending');
+            const resolved = reactivationRequests.filter(r => r.status !== 'pending');
+            return (
+              <>
+                {pending.length > 0 ? (
+                  <div className="space-y-3">
+                    <h4 className="text-sm font-semibold text-amber-600 dark:text-amber-400 uppercase tracking-wider">Pending ({pending.length})</h4>
+                    {pending.map(req => (
+                      <Card key={req.id} className="bg-white dark:bg-zinc-900 border border-amber-200 dark:border-amber-800/50 p-4">
+                        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                          <div className="flex-1 min-w-0">
+                            <h4 className="font-semibold text-gray-900 dark:text-white truncate">🏪 {req.shopName}</h4>
+                            <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                              {req.ownerName} • {req.ownerEmail}
+                            </p>
+                            <p className="text-xs text-gray-400 dark:text-gray-500 mt-0.5">
+                              Requested: {new Date(req.requestedAt).toLocaleString()}
+                            </p>
+                          </div>
+                          <div className="flex gap-2 shrink-0">
+                            <Button
+                              size="sm"
+                              variant="primary"
+                              onClick={() => {
+                                setReactivationModalRequest(req);
+                                setReactivationAction('approve');
+                                setReactivationRejectionReason('');
+                                setReactivationResult(null);
+                                setReactivationOTPSent(false);
+                              }}
+                              className="!bg-gradient-to-r !from-emerald-500 !to-green-600"
+                            >
+                              ✅ Approve
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="secondary"
+                              onClick={() => {
+                                setReactivationModalRequest(req);
+                                setReactivationAction('reject');
+                                setReactivationRejectionReason('');
+                                setReactivationResult(null);
+                                setReactivationOTPSent(false);
+                              }}
+                              className="!text-red-600 !border-red-300 dark:!text-red-400 dark:!border-red-800"
+                            >
+                              ❌ Reject
+                            </Button>
+                          </div>
+                        </div>
+                      </Card>
+                    ))}
+                  </div>
+                ) : (
+                  <Card className="bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-700 text-center py-8">
+                    <p className="text-gray-500 dark:text-gray-400">No pending reactivation requests.</p>
+                  </Card>
+                )}
+
+                {/* Resolved History */}
+                {resolved.length > 0 && (
+                  <details className="mt-6">
+                    <summary className="text-sm font-semibold text-gray-500 dark:text-gray-400 cursor-pointer hover:text-gray-700 dark:hover:text-gray-300">
+                      📜 Resolved History ({resolved.length})
+                    </summary>
+                    <div className="space-y-2 mt-3">
+                      {resolved.map(req => (
+                        <Card key={req.id} className={`bg-white dark:bg-zinc-900 border p-3 ${
+                          req.status === 'approved' ? 'border-emerald-200 dark:border-emerald-800/40' : 'border-red-200 dark:border-red-800/40'
+                        }`}>
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <h4 className="text-sm font-medium text-gray-900 dark:text-white">{req.shopName}</h4>
+                              <p className="text-xs text-gray-500 dark:text-gray-400">{req.ownerEmail}</p>
+                              {req.rejectionReason && (
+                                <p className="text-xs text-red-500 mt-0.5">Reason: {req.rejectionReason}</p>
+                              )}
+                            </div>
+                            <span className={`text-xs font-semibold px-2 py-1 rounded-full ${
+                              req.status === 'approved'
+                                ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400'
+                                : 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400'
+                            }`}>
+                              {req.status === 'approved' ? '✅ Approved' : '❌ Rejected'}
+                            </span>
+                          </div>
+                          {req.resolvedAt && (
+                            <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-1">
+                              Resolved: {new Date(req.resolvedAt).toLocaleString()}
+                            </p>
+                          )}
+                        </Card>
+                      ))}
+                    </div>
+                  </details>
+                )}
+              </>
+            );
+          })()}
+        </div>
+      )}
+
+      {/* ===== REFUNDS TAB ===== */}
+      {activeTab === 'refunds' && (
+        <div className="space-y-4">
+          <h3 className="text-lg font-semibold text-gray-900 dark:text-white">Escalated Refund Requests</h3>
+          <div className="space-y-3">
+            {refundRequests.filter(req => ['ESCALATED_TO_ADMIN', 'AUTO_ESCALATED', 'APPROVED_BY_SHOP'].includes(req.status)).length > 0 ? (
+              refundRequests.filter(req => ['ESCALATED_TO_ADMIN', 'AUTO_ESCALATED', 'APPROVED_BY_SHOP'].includes(req.status)).map(req => {
+                return (
+                  <Card key={req.id} className="bg-white dark:bg-zinc-900 border border-red-200 dark:border-red-800/50 p-4">
+                    <div className="flex justify-between items-start mb-2">
+                       <div>
+                         <h4 className="font-semibold text-gray-900 dark:text-white truncate">Order #{req.orderId.slice(-6)}</h4>
+                         <p className="text-xs text-gray-500">Student: {req.studentId.slice(-6)} • Shop: {req.shopId.slice(-6)}</p>
+                       </div>
+                       <span className="text-[10px] font-bold px-2 py-0.5 rounded-full uppercase bg-red-100 text-red-800">
+                         {req.status.replace(/_/g, ' ')}
+                       </span>
+                    </div>
+                    <p className="text-sm text-gray-600 dark:text-gray-400 mb-2"><strong className="text-gray-900 dark:text-gray-200">Reason:</strong> {req.reason}</p>
+                    {req.shopResponse && (
+                      <div className="bg-gray-50 dark:bg-zinc-800 p-2 rounded text-xs text-gray-600 dark:text-gray-400 mb-3 border border-gray-100 dark:border-zinc-700">
+                        <strong>Shop Response:</strong> {req.shopResponse}
+                      </div>
+                    )}
+                    <div className="flex gap-2">
+                      <Button variant="primary" size="sm" onClick={() => {
+                        setAdminRefundModalReq(req);
+                        setAdminRefundAction('APPROVE');
+                        setAdminRefundNote('');
+                        setAdminRefundResult(null);
+                        setAdminRefundOTPSent(false);
+                      }}>Issue Refund</Button>
+                      <Button variant="danger" size="sm" onClick={() => {
+                        setAdminRefundModalReq(req);
+                        setAdminRefundAction('DENY');
+                        setAdminRefundNote('');
+                        setAdminRefundResult(null);
+                        setAdminRefundOTPSent(false);
+                      }}>Reject Request</Button>
+                    </div>
+                  </Card>
+                );
+              })
+            ) : (
+               <Card className="bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-700 text-center py-8">
+                 <p className="text-gray-500 dark:text-gray-400">No escalated refund requests right now.</p>
+               </Card>
+            )}
+          </div>
         </div>
       )}
 
@@ -923,6 +1326,26 @@ const AdminDashboard: React.FC = () => {
             </div>
           </div>
 
+          {refundModalImpact && (
+            <div className={`mb-4 rounded-xl border p-4 ${refundModalImpact.willGoNegative ? 'border-red-200 bg-red-50 dark:border-red-900/40 dark:bg-red-900/20' : 'border-amber-200 bg-amber-50 dark:border-amber-900/40 dark:bg-amber-900/20'}`}>
+              <p className="text-sm font-semibold text-gray-900 dark:text-white mb-2">Shop Financial Impact</p>
+              <div className="space-y-1 text-xs text-gray-700 dark:text-gray-300">
+                <p>Shop: <strong>{refundModalImpact.shopName}</strong></p>
+                <p>Current ledger balance: <strong>₹{refundModalImpact.ledgerBalance.toFixed(2)}</strong></p>
+                <p>Current pending balance: <strong>₹{refundModalImpact.pendingBalance.toFixed(2)}</strong></p>
+                <p>Shop earning reversal for this refund: <strong>₹{refundModalImpact.deductionAmount.toFixed(2)}</strong></p>
+                <p className={refundModalImpact.willGoNegative ? 'text-red-700 dark:text-red-300 font-semibold' : ''}>
+                  Negative balance risk: <strong>{refundModalImpact.willGoNegative ? 'Yes' : 'No'}</strong>
+                </p>
+                {refundModalImpact.alreadyPaidOut && (
+                  <p className="text-red-700 dark:text-red-300 font-semibold">
+                    Warning: this order is already linked to a payout snapshot.
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
+
           <div className="mb-4">
             <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Reason (optional)</label>
             <textarea
@@ -940,6 +1363,153 @@ const AdminDashboard: React.FC = () => {
             </p>
           </div>
         </RefundOtpModal>
+      )}
+      {/* Admin Refund OTP Modal */}
+      {adminRefundModalReq && (
+        <AccountOtpModal
+          isOpen={!!adminRefundModalReq}
+          onClose={() => { setAdminRefundModalReq(null); setAdminRefundResult(null); setAdminRefundOTPSent(false); setAdminRefundNote(''); }}
+          title={adminRefundAction === 'APPROVE' ? `Issue External Refund` : `Reject Refund Request`}
+          description={
+            <>
+              <p className="mb-2">
+                {adminRefundAction === 'APPROVE'
+                  ? <>You are about to issue a <strong>full refund</strong> for order <strong>#{adminRefundModalReq.orderId.slice(-6)}</strong>. This action is irreversible.</>
+                  : <>You are about to <strong>reject</strong> this refund request. The student will be notified.</>}
+              </p>
+              <p className="text-xs text-amber-500 font-semibold mb-2">OTP verification is required.</p>
+            </>
+          }
+          confirmText={adminRefundAction === 'APPROVE' ? 'Verify & Refund' : 'Verify & Reject'}
+          loadingText="Processing..."
+          onConfirm={async (otp) => {
+            setIsAdminRefundProcessing(true);
+            const result = await resolveRefundRequest(
+              adminRefundModalReq.id,
+              adminRefundAction,
+              otp,
+              adminRefundNote || undefined
+            );
+            setIsAdminRefundProcessing(false);
+            setAdminRefundResult({ success: result.success, message: result.message || (result.success ? 'Success!' : 'Failed.') });
+            if (result.success) {
+              adminRefundCloseTimerRef.current = setTimeout(() => { setAdminRefundModalReq(null); setAdminRefundResult(null); setAdminRefundOTPSent(false); }, 2000);
+            }
+          }}
+          onRequestOTP={async () => {
+            setIsAdminRefundOTPRequesting(true);
+            const result = await requestAccountActionOTP('RESOLVE_REFUND_REQUEST');
+            setIsAdminRefundOTPRequesting(false);
+            if (result.success) {
+              setAdminRefundOTPSent(true);
+            } else {
+              setAdminRefundResult({ success: false, message: result.message || 'Failed to send OTP.' });
+            }
+          }}
+          isProcessing={isAdminRefundProcessing}
+          isRequestingOTP={isAdminRefundOTPRequesting}
+          otpSent={adminRefundOTPSent}
+          resultMessage={adminRefundResult}
+        >
+          {adminRefundImpact && (
+            <div className={`mb-4 rounded-xl border p-4 ${adminRefundImpact.willGoNegative ? 'border-red-200 bg-red-50 dark:border-red-900/40 dark:bg-red-900/20' : 'border-amber-200 bg-amber-50 dark:border-amber-900/40 dark:bg-amber-900/20'}`}>
+              <p className="text-sm font-semibold text-gray-900 dark:text-white mb-2">Shop Financial Impact</p>
+              <div className="space-y-1 text-xs text-gray-700 dark:text-gray-300">
+                <p>Current ledger balance: <strong>₹{adminRefundImpact.ledgerBalance.toFixed(2)}</strong></p>
+                <p>Current pending balance: <strong>₹{adminRefundImpact.pendingBalance.toFixed(2)}</strong></p>
+                <p>Shop earning reversal for this refund: <strong>₹{adminRefundImpact.deductionAmount.toFixed(2)}</strong></p>
+                <p className={adminRefundImpact.willGoNegative ? 'text-red-700 dark:text-red-300 font-semibold' : ''}>
+                  Negative balance risk: <strong>{adminRefundImpact.willGoNegative ? 'Yes' : 'No'}</strong>
+                </p>
+                {adminRefundImpact.willGoNegative && (
+                  <p className="text-red-700 dark:text-red-300 font-semibold">
+                    Warning: this refund will push the shop’s current ledger below zero.
+                  </p>
+                )}
+                {adminRefundImpact.alreadyPaidOut && (
+                  <p className="text-red-700 dark:text-red-300 font-semibold">
+                    Warning: this order is already linked to a payout snapshot.
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
+
+          <div className="mb-4">
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+              {adminRefundAction === 'APPROVE' ? 'Reason (optional)' : 'Reason (required)'}
+            </label>
+            <textarea
+              value={adminRefundNote}
+              onChange={(e) => setAdminRefundNote(e.target.value)}
+              placeholder={adminRefundAction === 'APPROVE' ? "Internal audit note..." : "Reason for rejection..."}
+              rows={2}
+              className="w-full px-3 py-2 rounded-lg bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-700 text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-brand-primary text-sm resize-none"
+            />
+          </div>
+        </AccountOtpModal>
+      )}
+
+      {/* Reactivation OTP Modal */}
+      {reactivationModalRequest && (
+        <AccountOtpModal
+          isOpen={!!reactivationModalRequest}
+          onClose={() => { setReactivationModalRequest(null); setReactivationResult(null); setReactivationOTPSent(false); setReactivationRejectionReason(''); }}
+          title={reactivationAction === 'approve' ? `Approve Reactivation` : `Reject Reactivation`}
+          description={
+            <>
+              <p className="mb-2">
+                {reactivationAction === 'approve'
+                  ? <>You are about to <strong>approve</strong> the reactivation of shop <strong>"{reactivationModalRequest.shopName}"</strong> for {reactivationModalRequest.ownerEmail}.  The shop will be unarchived and the owner will regain access.</>
+                  : <>You are about to <strong>reject</strong> the reactivation of shop <strong>"{reactivationModalRequest.shopName}"</strong>. The owner will be notified.</>}
+              </p>
+              <p className="text-xs text-gray-500">OTP verification is required to proceed.</p>
+            </>
+          }
+          confirmText={reactivationAction === 'approve' ? 'Approve Reactivation' : 'Reject Reactivation'}
+          loadingText="Processing..."
+          onConfirm={async (otp) => {
+            setIsReactivationProcessing(true);
+            const result = await resolveReactivationRequest(
+              reactivationModalRequest.id,
+              reactivationAction,
+              otp,
+              reactivationAction === 'reject' ? reactivationRejectionReason : undefined
+            );
+            setIsReactivationProcessing(false);
+            setReactivationResult({ success: result.success, message: result.message || (result.success ? 'Done!' : 'Failed.') });
+            if (result.success) {
+              reactivationCloseTimerRef.current = setTimeout(() => { setReactivationModalRequest(null); setReactivationResult(null); setReactivationOTPSent(false); }, 2000);
+            }
+          }}
+          onRequestOTP={async () => {
+            setIsReactivationOTPRequesting(true);
+            const result = await requestAccountActionOTP('RESOLVE_REACTIVATION');
+            setIsReactivationOTPRequesting(false);
+            if (result.success) {
+              setReactivationOTPSent(true);
+            } else {
+              setReactivationResult({ success: false, message: result.message || 'Failed to send OTP.' });
+            }
+          }}
+          isProcessing={isReactivationProcessing}
+          isRequestingOTP={isReactivationOTPRequesting}
+          otpSent={reactivationOTPSent}
+          resultMessage={reactivationResult}
+        >
+          {reactivationAction === 'reject' && !reactivationOTPSent && (
+            <div className="mb-4">
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Rejection Reason (optional)</label>
+              <textarea
+                value={reactivationRejectionReason}
+                onChange={(e) => setReactivationRejectionReason(e.target.value)}
+                placeholder="e.g. Shop violated platform policies..."
+                rows={2}
+                className="w-full px-3 py-2 rounded-lg bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-700 text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-brand-primary text-sm resize-none"
+              />
+            </div>
+          )}
+        </AccountOtpModal>
       )}
     </div>
   );

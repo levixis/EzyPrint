@@ -22,6 +22,8 @@ import {
   getDoc,
   updateDoc,
   deleteDoc,
+  deleteField,
+  writeBatch,
   collection,
   getDocs,
   connectFirestoreEmulator,
@@ -31,7 +33,8 @@ import {
   orderBy,
   limit,          // Added for capping notification queries
   addDoc,         // Added for creating notification documents
-  enableNetwork  // Added for app resume reconnection
+  enableNetwork,  // Added for app resume reconnection
+  or              // Added for complex composite queries
 } from 'firebase/firestore';
 import {
   getStorage,
@@ -42,19 +45,24 @@ import {
   getBlob,             // Added for CORS-safe file downloads
   deleteObject         // Added for file cleanup after order completion
 } from 'firebase/storage';
+import { getFunctions, httpsCallable } from 'firebase/functions';
+
+const debugLog = (...args: unknown[]) => {
+  void args;
+};
 
 // Firebase configuration — reads from environment variables (VITE_ prefix for Vite exposure)
-// Falls back to hardcoded values if env vars are not set
+// Empty string fallbacks ensure no accidental repository credential leakage.
 const firebaseConfig = {
-  apiKey: import.meta.env.VITE_FIREBASE_API_KEY || "AIzaSyBLmBxkJaImXrB-eOHpaieDTVhcLjOsod0",
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY || "",
   // Use the web.app domain (same as hosting) to prevent cross-origin storage
   // partitioning issues with signInWithRedirect in Android WebViews
-  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || "ezyyprint.web.app",
-  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID || "ezyyprint",
-  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET || "ezyyprint.firebasestorage.app",
-  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || "283831997162",
-  appId: import.meta.env.VITE_FIREBASE_APP_ID || "1:283831997162:web:70794657f55abfe91d7d93",
-  measurementId: import.meta.env.VITE_FIREBASE_MEASUREMENT_ID || "G-W8E74WXNM3"
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || "",
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID || "",
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET || "",
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || "",
+  appId: import.meta.env.VITE_FIREBASE_APP_ID || "",
+  measurementId: import.meta.env.VITE_FIREBASE_MEASUREMENT_ID || ""
 };
 
 // Initialize Firebase
@@ -68,57 +76,39 @@ if (!getApps().length) {
 const auth = getAuth(app);
 const db = getFirestore(app);
 const storage = getStorage(app);
+const functions = getFunctions(app, 'asia-south1');
 
 
 // --- Environment Detection Logic ---
-let viteDevMode = false;
-try {
-  if (typeof import.meta !== 'undefined' && typeof import.meta.env !== 'undefined' && import.meta.env.DEV === true) {
-    viteDevMode = true;
-  }
-} catch (e) {
-  console.warn("[FirebaseConnection] Error safely accessing import.meta.env.DEV. Defaulting viteDevMode to false.", e);
-  viteDevMode = false;
-}
-
-let actualHostname = "unknown_hostname";
-try {
-  if (typeof window !== 'undefined' && typeof window.location !== 'undefined') {
-    actualHostname = window.location.hostname;
-  } else {
-    console.warn("[FirebaseConnectionDEBUG] window.location.hostname is not available.");
-  }
-} catch (e) {
-}
-
-
-// FORCE DISABLE EMULATORS for now to allow connection to live Firebase
-// Change this back to `viteDevMode || isLocalHostname` if you want to use local emulators and have started them with `firebase emulators:start`
-const connectToEmulators = false;
+const viteDevMode = import.meta.env.DEV === true;
+const actualHostname = typeof window !== 'undefined' && typeof window.location !== 'undefined'
+  ? window.location.hostname
+  : "unknown_hostname";
+const isLocalHostname = actualHostname === "127.0.0.1" || actualHostname === "localhost";
+const connectToEmulators = viteDevMode && isLocalHostname;
 
 
 if (connectToEmulators) {
-  console.warn(`[FirebaseConnectionDEBUG] ==> DEVELOPMENT-LIKE environment DETECTED (viteDevMode: ${viteDevMode}, actualHostname: "${actualHostname}"). Attempting to connect to Firebase Emulators...`);
   try {
     // Simplified connectAuthEmulator call
     connectAuthEmulator(auth, "http://127.0.0.1:9099");
-  } catch (e) {
+  } catch {
+    // Ignore duplicate emulator-init failures.
   }
 
   try {
     connectFirestoreEmulator(db, "127.0.0.1", 8081);
-  } catch (e) {
+  } catch {
+    // Ignore duplicate emulator-init failures.
   }
 
   try {
     connectStorageEmulator(storage, "127.0.0.1", 9199);
-  } catch (e) {
+  } catch {
+    // Ignore duplicate emulator-init failures.
   }
 } else {
-  console.log(`[Firebase] Production mode (host: "${actualHostname}"). Connected to LIVE Firebase services.`);
-  if (actualHostname === "127.0.0.1" || actualHostname === "localhost") {
-    // debugger; // Uncomment this line if you want the script to pause here for inspection
-  }
+  debugLog(`[Firebase] Production mode (host: "${actualHostname}"). Connected to LIVE Firebase services.`);
 }
 
 // Export Firebase services and specific auth methods/types for convenience
@@ -127,6 +117,8 @@ export {
   auth,
   db,
   storage,
+  functions,
+  httpsCallable,
   GoogleAuthProvider,
   signInWithPopup,
   signInWithCredential,
@@ -141,11 +133,14 @@ export {
   getDoc,
   updateDoc,
   deleteDoc,            // Exported deleteDoc
+  deleteField,          // Exported for clearing optional fields safely
+  writeBatch,           // Exported for atomic multi-doc writes
   collection,
   getDocs,
   onSnapshot,          // Exported onSnapshot
   query,               // Exported query
   where,               // Exported where
+  or,                  // Exported or
   orderBy,             // Exported orderBy
   limit,               // Exported for notification query limits
   addDoc,              // Exported for creating notification documents

@@ -5,8 +5,6 @@ const config: CapacitorConfig = {
   appName: 'EzyPrint',
   webDir: 'dist',
   server: {
-    // Load from live hosted URL — app auto-updates on every hosting deploy
-    url: 'https://ezyyprint.web.app',
     // Allow navigation to external URLs (Google auth, Razorpay checkout, etc.)
     allowNavigation: [
       '*.razorpay.com',
@@ -32,6 +30,7 @@ const config: CapacitorConfig = {
       backgroundColor: '#0F172A',
     },
     Keyboard: {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       resize: 'none' as any,
       resizeOnFullScreen: false,
     },

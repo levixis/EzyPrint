@@ -41,13 +41,13 @@ export const Modal: React.FC<ModalProps> = ({ isOpen, onClose, title, children, 
   const modalContent = (
     <div 
       className={`fixed inset-0 z-[100] flex items-end p-0 sm:items-center sm:p-4 justify-center transition-opacity duration-300 ease-out
-                  ${isOpen ? 'opacity-100 bg-brand-bg/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`}
+                  ${isOpen ? 'opacity-100 bg-brand-bg/80 dark:bg-black/60 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`}
       aria-labelledby="modal-title" 
       role="dialog" 
       aria-modal="true"
     >
       <div 
-        className={`bg-brand-secondary rounded-t-2xl sm:rounded-xl my-0 sm:my-8 w-full text-left overflow-hidden shadow-modal transform transition-all duration-300 ease-out sm:align-middle ${sizeClasses[size]} flex flex-col
+        className={`bg-brand-secondary dark:bg-brand-dark-surface rounded-t-2xl sm:rounded-xl my-0 sm:my-8 w-full text-left overflow-hidden shadow-modal dark:shadow-2xl dark:shadow-black/40 transform transition-all duration-300 ease-out sm:align-middle ${sizeClasses[size]} flex flex-col
                     ${isOpen ? 'opacity-100 translate-y-0 sm:scale-100' : 'opacity-0 translate-y-8 sm:translate-y-0 sm:scale-95'}`}
       >
         <div 
@@ -77,7 +77,7 @@ export const Modal: React.FC<ModalProps> = ({ isOpen, onClose, title, children, 
         </div>
         {(footerContent || !hideCloseButton) && (
           <div 
-            className="bg-brand-secondaryLight/50 px-4 py-3 sm:py-3 sm:px-6 flex justify-end sm:flex-row-reverse items-center w-full"
+            className="bg-brand-secondaryLight/50 dark:bg-brand-dark-bg/50 px-4 py-3 sm:py-3 sm:px-6 flex justify-end sm:flex-row-reverse items-center w-full border-t border-gray-200 dark:border-zinc-700"
           >
             {footerContent}
             {!hideCloseButton && !footerContent && (

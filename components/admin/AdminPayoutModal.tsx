@@ -1,9 +1,10 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { Modal } from '../common/Modal';
 import { Button } from '../common/Button';
 import { Input } from '../common/Input';
 import { ShopProfile, DocumentOrder, ShopPayout, OrderStatus, PayoutStatus } from '../../types';
 import { useAppContext } from '../../contexts/AppContext';
+import { AccountOtpModal } from '../common/AccountOtpModal';
 
 interface AdminPayoutModalProps {
   isOpen: boolean;
@@ -14,20 +15,48 @@ interface AdminPayoutModalProps {
 }
 
 const AdminPayoutModal: React.FC<AdminPayoutModalProps> = ({ isOpen, onClose, shop, allOrders, payouts }) => {
-  const { createPayout } = useAppContext();
+  const { createPayout, getPaymentConfig } = useAppContext();
   const [amount, setAmount] = useState('');
   const [adminNote, setAdminNote] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState('');
   const [payoutMode, setPayoutMode] = useState<'all' | 'custom'>('all');
 
-  const primaryUpi = shop.payoutMethods?.find(pm => pm.isPrimary && pm.type === 'UPI');
-  const anyUpi = shop.payoutMethods?.find(pm => pm.type === 'UPI');
+  const [retrievedPayoutMethods, setRetrievedPayoutMethods] = useState<import('../../types').PayoutMethod[]>([]);
+  const [isLoadingMethods, setIsLoadingMethods] = useState(false);
+
+  // OTP State
+  const { requestAccountActionOTP } = useAppContext();
+  const [isOTPModalOpen, setIsOTPModalOpen] = useState(false);
+  const [otpSent, setOtpSent] = useState(false);
+  const [isRequestingOTP, setIsRequestingOTP] = useState(false);
+  const [otpResult, setOtpResult] = useState<{ success: boolean; message: string } | null>(null);
+
+  useEffect(() => {
+    if (isOpen) {
+      setIsLoadingMethods(true);
+      getPaymentConfig(shop.id).then(config => {
+        if (config && config.payoutMethods && config.payoutMethods.length > 0) {
+          setRetrievedPayoutMethods(config.payoutMethods);
+        } else {
+          setRetrievedPayoutMethods([]);
+        }
+        setIsLoadingMethods(false);
+      });
+    }
+  }, [isOpen, shop.id, getPaymentConfig]);
+
+  const primaryUpi = retrievedPayoutMethods.find(pm => pm.isPrimary && pm.type === 'UPI');
+  const anyUpi = retrievedPayoutMethods.find(pm => pm.type === 'UPI');
   const upiMethod = primaryUpi || anyUpi;
 
-  // Calculate how much the shop has earned and what's still owed
+  // Read financials directly from the shop document (canonical source of truth)
   const financials = useMemo(() => {
-    // Only count fully completed orders as earned revenue — in-progress orders shouldn't be payable
+    // We source the current canonical balance directly from the shop ledger
+    // This removes the stale client-side order aggregation loop.
+    const pendingDue = shop.ledgerBalance || 0;
+    
+    // We can keep these metrics for UI presentation context 
     const shopCompletedOrders = allOrders.filter(o => o.shopId === shop.id && o.status === OrderStatus.COMPLETED);
     const totalEarned = shopCompletedOrders.reduce((sum, o) => sum + o.priceDetails.pageCost, 0);
     const completedOrderCount = shopCompletedOrders.length;
@@ -40,13 +69,8 @@ const AdminPayoutModal: React.FC<AdminPayoutModalProps> = ({ isOpen, onClose, sh
       .filter(p => p.shopId === shop.id && p.status === PayoutStatus.PENDING)
       .reduce((sum, p) => sum + p.amount, 0);
 
-    // pendingDue = what the shop has earned minus what's actually been paid out
-    // NOTE: We do NOT subtract pendingPayoutAmount here — those are just requests,
-    // not actual payments. The admin should still be able to pay the full due.
-    const pendingDue = Math.max(0, totalEarned - totalAlreadyPaid);
-
     return { totalEarned, totalAlreadyPaid, pendingDue, completedOrderCount, pendingPayoutAmount };
-  }, [allOrders, payouts, shop.id]);
+  }, [shop.ledgerBalance, allOrders, payouts, shop.id]);
 
   const effectiveAmount = payoutMode === 'all' ? financials.pendingDue : parseFloat(amount || '0');
 
@@ -64,16 +88,24 @@ const AdminPayoutModal: React.FC<AdminPayoutModalProps> = ({ isOpen, onClose, sh
       return;
     }
 
+    setIsOTPModalOpen(true);
+  };
+
+  const executePayout = async (otp: string) => {
     setIsSubmitting(true);
-    const result = await createPayout(shop.id, shop.name, parsedAmount, adminNote.trim());
+    setOtpResult(null);
+    const parsedAmount = payoutMode === 'all' ? financials.pendingDue : parseFloat(amount);
+    
+    const result = await createPayout(shop.id, shop.name, parsedAmount, adminNote.trim(), otp);
     setIsSubmitting(false);
 
     if (result.success) {
       setAmount('');
       setAdminNote('');
+      setIsOTPModalOpen(false);
       onClose();
     } else {
-      setError(result.message || 'Failed to create payout.');
+      setOtpResult({ success: false, message: result.message || 'Failed to create payout.' });
     }
   };
 
@@ -132,7 +164,9 @@ const AdminPayoutModal: React.FC<AdminPayoutModalProps> = ({ isOpen, onClose, sh
         {/* UPI Info */}
         <div className="bg-gradient-to-br from-emerald-50 to-teal-50 dark:from-emerald-900/20 dark:to-teal-900/20 rounded-xl p-4 border border-emerald-200 dark:border-emerald-800/50">
           <p className="text-xs font-semibold text-emerald-700 dark:text-emerald-400 uppercase tracking-wider mb-2">Pay via UPI</p>
-          {upiMethod ? (
+          {isLoadingMethods ? (
+            <p className="text-sm text-emerald-600 dark:text-emerald-400 animate-pulse">Loading payout configuration...</p>
+          ) : upiMethod ? (
             <div className="flex items-center gap-3">
               <div className="w-10 h-10 rounded-lg bg-emerald-100 dark:bg-emerald-800/50 flex items-center justify-center">
                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-5 h-5 text-emerald-600 dark:text-emerald-400">
@@ -228,13 +262,39 @@ const AdminPayoutModal: React.FC<AdminPayoutModalProps> = ({ isOpen, onClose, sh
           <Button
             variant="primary"
             onClick={handleSubmit}
-            disabled={isSubmitting || financials.pendingDue <= 0 || effectiveAmount <= 0}
+            disabled={financials.pendingDue <= 0 || effectiveAmount <= 0}
             className="!bg-gradient-to-r !from-emerald-500 !to-green-600 hover:!from-emerald-600 hover:!to-green-700"
           >
-            {isSubmitting ? 'Sending...' : `Mark Payout as Paid — ₹${effectiveAmount.toFixed(2)}`}
+            Mark Payout as Paid — ₹{effectiveAmount.toFixed(2)}
           </Button>
         </div>
       </div>
+      
+      {/* OTP Gate Modal */}
+      <AccountOtpModal
+        isOpen={isOTPModalOpen}
+        onClose={() => setIsOTPModalOpen(false)}
+        title="Verify Payout"
+        description={<p>You are authorizing a manual payout of <strong>₹{effectiveAmount.toFixed(2)}</strong> to <strong>{shop.name}</strong>.</p>}
+        confirmText="Confirm Payout"
+        loadingText="Processing..."
+        isProcessing={isSubmitting}
+        isRequestingOTP={isRequestingOTP}
+        otpSent={otpSent}
+        resultMessage={otpResult}
+        onRequestOTP={async () => {
+          setIsRequestingOTP(true);
+          setOtpResult(null);
+          const res = await requestAccountActionOTP('CREATE_MANUAL_PAYOUT');
+          setIsRequestingOTP(false);
+          if (res.success) {
+            setOtpSent(true);
+          } else {
+            setOtpResult({ success: false, message: res.message || "Failed to send OTP" });
+          }
+        }}
+        onConfirm={executePayout}
+      />
     </Modal>
   );
 };

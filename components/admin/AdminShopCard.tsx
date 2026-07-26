@@ -1,8 +1,10 @@
-import React, { useState } from 'react';
-import { ShopProfile, DocumentOrder, OrderStatus, ShopPayout, PayoutStatus, BankDetails } from '../../types';
+import React, { useState, useEffect, useRef } from 'react';
+import { ShopProfile, DocumentOrder, OrderStatus, ShopPayout, PayoutStatus, BankDetails, ShopAggregate } from '../../types';
 import { Card } from '../common/Card';
 import { Button } from '../common/Button';
+import { AccountOtpModal } from '../common/AccountOtpModal';
 import { useAppContext } from '../../contexts/AppContext';
+import { db, doc, onSnapshot } from '../../firebase';
 
 interface AdminShopCardProps {
   shop: ShopProfile;
@@ -12,12 +14,46 @@ interface AdminShopCardProps {
 }
 
 const AdminShopCard: React.FC<AdminShopCardProps> = ({ shop, orders, payouts, onCreatePayout }) => {
-  const { approveShop, rejectShop, deleteShopAndOwner, archiveShop, unarchiveShop, getBankDetails, verifyBankDetails, logBankAccess } = useAppContext();
+  const { approveShop, rejectShop, unarchiveShop, requestAccountActionOTP, executeAccountAction, getBankDetails, verifyBankDetails, logBankAccess, getPaymentConfig } = useAppContext();
   const [isProcessing, setIsProcessing] = useState(false);
   const [bankDetails, setBankDetails] = useState<BankDetails | null>(null);
   const [isBankLoading, setIsBankLoading] = useState(false);
   const [isBankVerifying, setIsBankVerifying] = useState(false);
-  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [retrievedPayoutMethods, setRetrievedPayoutMethods] = useState<import('../../types').PayoutMethod[]>([]);
+  const [shopAggregate, setShopAggregate] = useState<ShopAggregate | null>(null);
+  const closeModalTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    let isMounted = true;
+    getPaymentConfig(shop.id).then(config => {
+      if (isMounted && config && config.payoutMethods && config.payoutMethods.length > 0) {
+        setRetrievedPayoutMethods(config.payoutMethods);
+      }
+    });
+    return () => { isMounted = false; };
+  }, [shop.id, getPaymentConfig]);
+
+  useEffect(() => {
+    const aggregateRef = doc(db, 'shopAggregates', shop.id);
+    const unsubscribe = onSnapshot(aggregateRef, (docSnap) => {
+      setShopAggregate(docSnap.exists() ? ({ shopId: docSnap.id, ...docSnap.data() } as ShopAggregate) : null);
+    });
+
+    return () => unsubscribe();
+  }, [shop.id]);
+
+  useEffect(() => () => {
+    if (closeModalTimerRef.current) {
+      clearTimeout(closeModalTimerRef.current);
+    }
+  }, []);
+  
+  // OTP Orchestration State
+  const [showOtpModal, setShowOtpModal] = useState(false);
+  const [otpActionType, setOtpActionType] = useState<"DELETE_USER" | "ARCHIVE_USER" | null>(null);
+  const [isRequestingOTP, setIsRequestingOTP] = useState(false);
+  const [otpSent, setOtpSent] = useState(false);
+  const [otpResultMessage, setOtpResultMessage] = useState<{ success: boolean; message: string } | null>(null);
 
   const shopOrders = orders.filter(o => o.shopId === shop.id);
   // Only count fully completed orders as earned revenue
@@ -25,19 +61,24 @@ const AdminShopCard: React.FC<AdminShopCardProps> = ({ shop, orders, payouts, on
   const activeOrders = shopOrders.filter(o => 
     o.status !== OrderStatus.COMPLETED && 
     o.status !== OrderStatus.CANCELLED && 
+    o.status !== OrderStatus.REFUNDED &&
     o.status !== OrderStatus.PAYMENT_FAILED
   );
 
   // Revenue = sum of pageCost from paid orders (baseFee goes to platform)
-  const totalRevenue = paidOrders.reduce((sum, o) => sum + o.priceDetails.pageCost, 0);
+  const totalRevenue = shopAggregate?.totalRevenue ?? paidOrders.reduce((sum, o) => sum + o.priceDetails.pageCost, 0);
   // Total paid out via confirmed/paid payouts
-  const totalPaidOut = payouts
+  const totalPaidOut = shopAggregate?.totalPaidOut ?? payouts
     .filter(p => p.shopId === shop.id && (p.status === PayoutStatus.CONFIRMED || p.status === PayoutStatus.PAID))
     .reduce((sum, p) => sum + p.amount, 0);
-  const pendingAmount = Math.max(0, totalRevenue - totalPaidOut);
+  // Use canonical ledgerBalance from shop doc when available (accounts for debt, refunds, pending)
+  // Fall back to the naive formula only if no ledger data exists
+  const pendingAmount = Math.max(0, shop.ledgerBalance ?? (totalRevenue - totalPaidOut));
+  const totalOrders = shopAggregate?.totalOrders ?? shopOrders.length;
+  const activeOrderCount = shopAggregate?.activeOrders ?? activeOrders.length;
 
-  const primaryUpi = shop.payoutMethods?.find(pm => pm.isPrimary && pm.type === 'UPI');
-  const anyUpi = shop.payoutMethods?.find(pm => pm.type === 'UPI');
+  const primaryUpi = retrievedPayoutMethods.find(pm => pm.isPrimary && pm.type === 'UPI');
+  const anyUpi = retrievedPayoutMethods.find(pm => pm.type === 'UPI');
   const upiMethod = primaryUpi || anyUpi;
 
   const handleApprove = async () => {
@@ -52,20 +93,44 @@ const AdminShopCard: React.FC<AdminShopCardProps> = ({ shop, orders, payouts, on
     setIsProcessing(false);
   };
 
-  const handleDelete = async () => {
-    setIsProcessing(true);
-    await deleteShopAndOwner(shop.id, shop.ownerUserId);
-    setIsProcessing(false);
-    setShowDeleteConfirm(false);
+  const handleActionRequest = async (action: "DELETE_USER" | "ARCHIVE_USER") => {
+    setOtpActionType(action);
+    setOtpSent(false);
+    setOtpResultMessage(null);
+    setShowOtpModal(true);
   };
 
-  const handleArchiveToggle = async () => {
-    setIsProcessing(true);
-    if (shop.isArchived) {
-      await unarchiveShop(shop.id);
+  const handleRequestOTP = async () => {
+    setIsRequestingOTP(true);
+    setOtpResultMessage(null);
+    const res = await requestAccountActionOTP(otpActionType || "ACCOUNT_ACTION");
+    setIsRequestingOTP(false);
+    if (res.success) {
+      setOtpSent(true);
     } else {
-      await archiveShop(shop.id);
+      setOtpResultMessage({ success: false, message: res.message || "Failed to send OTP" });
     }
+  };
+
+  const handleExecuteAction = async (otp: string) => {
+    setIsProcessing(true);
+    setOtpResultMessage(null);
+    const targetUid = shop.ownerUserId;
+    
+    const res = await executeAccountAction(otpActionType!, otp, targetUid);
+    
+    setIsProcessing(false);
+    if (res.success) {
+      setOtpResultMessage({ success: true, message: "Action completed successfully." });
+      closeModalTimerRef.current = setTimeout(() => setShowOtpModal(false), 2000);
+    } else {
+       setOtpResultMessage({ success: false, message: res.message || "Action failed." });
+    }
+  };
+
+  const handleUnarchive = async () => {
+    setIsProcessing(true);
+    await unarchiveShop(shop.id);
     setIsProcessing(false);
   };
 
@@ -114,7 +179,7 @@ const AdminShopCard: React.FC<AdminShopCardProps> = ({ shop, orders, payouts, on
         {shop.isApproved && (
           <div className="grid grid-cols-2 gap-3 mb-4">
             <div className="bg-blue-50 dark:bg-blue-900/20 rounded-lg p-3 text-center">
-              <p className="text-2xl font-bold text-blue-600 dark:text-blue-400">{shopOrders.length}</p>
+              <p className="text-2xl font-bold text-blue-600 dark:text-blue-400">{totalOrders}</p>
               <p className="text-xs text-gray-500 dark:text-gray-400">Total Orders</p>
             </div>
             <div className="bg-green-50 dark:bg-green-900/20 rounded-lg p-3 text-center">
@@ -122,7 +187,7 @@ const AdminShopCard: React.FC<AdminShopCardProps> = ({ shop, orders, payouts, on
               <p className="text-xs text-gray-500 dark:text-gray-400">Revenue</p>
             </div>
             <div className="bg-amber-50 dark:bg-amber-900/20 rounded-lg p-3 text-center">
-              <p className="text-2xl font-bold text-amber-600 dark:text-amber-400">{activeOrders.length}</p>
+              <p className="text-2xl font-bold text-amber-600 dark:text-amber-400">{activeOrderCount}</p>
               <p className="text-xs text-gray-500 dark:text-gray-400">Active Orders</p>
             </div>
             <div className="bg-rose-50 dark:bg-rose-900/20 rounded-lg p-3 text-center">
@@ -254,7 +319,7 @@ const AdminShopCard: React.FC<AdminShopCardProps> = ({ shop, orders, payouts, on
               </Button>
             )}
             <Button
-              onClick={handleArchiveToggle}
+              onClick={() => { shop.isArchived ? handleUnarchive() : handleActionRequest("ARCHIVE_USER") }}
               variant="secondary"
               size="sm"
               fullWidth
@@ -268,29 +333,35 @@ const AdminShopCard: React.FC<AdminShopCardProps> = ({ shop, orders, payouts, on
             >
               {shop.isArchived ? 'Unarchive Shop' : 'Archive Shop'}
             </Button>
-            {!showDeleteConfirm ? (
-              <button
-                onClick={() => setShowDeleteConfirm(true)}
-                className="w-full text-xs text-red-500 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300 py-1 transition-colors"
-              >
-                Delete Shop & Owner Account
-              </button>
-            ) : (
-              <div className="bg-red-50 dark:bg-red-900/20 rounded-lg p-3 border border-red-200 dark:border-red-800/30">
-                <p className="text-xs text-red-600 dark:text-red-400 mb-2 font-medium">Are you sure? This will permanently delete the shop and owner account.</p>
-                <div className="flex gap-2">
-                  <Button onClick={handleDelete} variant="danger" size="sm" fullWidth disabled={isProcessing}>
-                    Confirm Delete
-                  </Button>
-                  <Button onClick={() => setShowDeleteConfirm(false)} variant="ghost" size="sm" fullWidth>
-                    Cancel
-                  </Button>
-                </div>
-              </div>
-            )}
+            <button
+              onClick={() => handleActionRequest("DELETE_USER")}
+              disabled={isProcessing}
+              className="w-full text-xs text-red-500 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300 py-1 transition-colors"
+            >
+              Delete Shop & Owner Account
+            </button>
           </div>
         )}
       </div>
+
+      <AccountOtpModal
+        isOpen={showOtpModal}
+        onClose={() => setShowOtpModal(false)}
+        title={otpActionType === "DELETE_USER" ? "Verify Account Deletion" : "Verify Archive Request"}
+        description={
+          otpActionType === "DELETE_USER" 
+            ? `You are about to permanently delete the shop account for ${shop.name}. This action cannot be undone.` 
+            : `You are archiving the shop account for ${shop.name}.`
+        }
+        confirmText={otpActionType === "DELETE_USER" ? "Delete Account" : "Archive Account"}
+        loadingText="Executing..."
+        onConfirm={handleExecuteAction}
+        onRequestOTP={handleRequestOTP}
+        isProcessing={isProcessing}
+        isRequestingOTP={isRequestingOTP}
+        otpSent={otpSent}
+        resultMessage={otpResultMessage}
+      />
     </Card>
   );
 };

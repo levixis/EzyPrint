@@ -4,6 +4,7 @@ import { Button } from '../common/Button';
 import { Input } from '../common/Input';
 import { Select } from '../common/Select';
 import { ShopProfile, ShopPricing, PayoutMethod, PayoutMethodType, BankDetails } from '../../types';
+import { AccountOtpModal } from '../common/AccountOtpModal';
 import { useAppContext } from '../../contexts/AppContext';
 import { calculateBaseFee } from '../../utils/pricing';
 import { Card } from '../common/Card';
@@ -12,7 +13,7 @@ interface ShopSettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
   shop: ShopProfile;
-  onSaveSettings: (shopId: string, newSettings: { pricing: ShopPricing; isOpen: boolean; payoutMethods?: PayoutMethod[]; contactPhone?: string; contactPhoneAlt?: string; contactEmail?: string; whatsappNumber?: string }) => void;
+  onSaveSettings: (shopId: string, newSettings: { pricing: ShopPricing; isOpen: boolean; payoutMethods?: PayoutMethod[]; contactPhone?: string; contactPhoneAlt?: string; contactEmail?: string; whatsappNumber?: string }) => Promise<{ success: boolean; message?: string }>;
 }
 
 const generatePayoutMethodId = () => `pm_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
@@ -30,18 +31,25 @@ const EMPTY_PAYOUT_METHOD_FORM: Partial<PayoutMethod> & { type: PayoutMethodType
 };
 
 const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, shop, onSaveSettings }) => {
-  const { deleteOwnShopAccount, getBankDetails, saveBankDetails, logBankAccess } = useAppContext();
+  const { requestAccountActionOTP, executeAccountAction, getBankDetails, saveBankDetails, logBankAccess, currentUser, getPaymentConfig } = useAppContext();
   const [bwPriceInput, setBwPriceInput] = useState(String(shop.customPricing.bwPerPage));
   const [colorPriceInput, setColorPriceInput] = useState(String(shop.customPricing.colorPerPage));
   const [isShopOpen, setIsShopOpen] = useState(shop.isOpen);
 
-  const [currentPayoutMethods, setCurrentPayoutMethods] = useState<PayoutMethod[]>(shop.payoutMethods || []);
+  const [currentPayoutMethods, setCurrentPayoutMethods] = useState<PayoutMethod[]>([]);
+  const [isPayoutConfigLoading, setIsPayoutConfigLoading] = useState(false);
   const [editingPayoutMethod, setEditingPayoutMethod] = useState<Partial<PayoutMethod> & { type: PayoutMethodType } | null>(null);
 
   const [error, setError] = useState('');
   const [formError, setFormError] = useState('');
-  const [showDeleteAccountConfirm, setShowDeleteAccountConfirm] = useState(false);
+
+  // OTP State handling
+  const [showOtpModal, setShowOtpModal] = useState(false);
+  const [isRequestingOTP, setIsRequestingOTP] = useState(false);
+  const [otpSent, setOtpSent] = useState(false);
+  const [otpResultMessage, setOtpResultMessage] = useState<{ success: boolean; message: string } | null>(null);
   const [isDeletingAccount, setIsDeletingAccount] = useState(false);
+  const closeOtpTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Contact info state
   const [contactPhone, setContactPhone] = useState(shop.contactPhone || '');
@@ -67,7 +75,6 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
             setBwPriceInput(String(shop.customPricing.bwPerPage));
             setColorPriceInput(String(shop.customPricing.colorPerPage));
             setIsShopOpen(shop.isOpen);
-            setCurrentPayoutMethods(shop.payoutMethods ? JSON.parse(JSON.stringify(shop.payoutMethods)) : []);
             setEditingPayoutMethod(null);
             setError('');
             setFormError('');
@@ -79,14 +86,65 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
             setBankDetails(null);
             setIsBankEditing(false);
             setShowBankDetails(false);
+
+            // Dual-read migration for private payment config
+            setIsPayoutConfigLoading(true);
+            getPaymentConfig(shop.id).then(config => {
+                if (config && config.payoutMethods && config.payoutMethods.length > 0) {
+                    setCurrentPayoutMethods(config.payoutMethods);
+                } else {
+                    setCurrentPayoutMethods([]);
+                }
+                setIsPayoutConfigLoading(false);
+            });
         }
     }
     prevIsOpen.current = isOpen;
     prevShopId.current = shop.id;
-  }, [isOpen, shop]);
+  }, [isOpen, shop, getPaymentConfig]);
+
+  useEffect(() => () => {
+    if (closeOtpTimerRef.current) {
+      clearTimeout(closeOtpTimerRef.current);
+    }
+  }, []);
 
 
-  const handleMainSave = () => {
+  const handleRequestOTP = async () => {
+    setIsRequestingOTP(true);
+    setOtpResultMessage(null);
+    const res = await requestAccountActionOTP("DELETE_OWN_ACCOUNT");
+    setIsRequestingOTP(false);
+    if (res.success) {
+      setOtpSent(true);
+    } else {
+      setOtpResultMessage({ success: false, message: res.message || "Failed to send OTP" });
+    }
+  };
+
+  const handleExecuteDelete = async (otp: string) => {
+    setIsDeletingAccount(true);
+    setOtpResultMessage(null);
+    const targetUid = currentUser?.id; // Current user is the shop owner doing self-delete
+    
+    const res = await executeAccountAction("DELETE_OWN_ACCOUNT", otp, targetUid);
+    
+    setIsDeletingAccount(false);
+    if (res.success) {
+      setOtpResultMessage({ success: true, message: "Account deleted successfully." });
+      closeOtpTimerRef.current = setTimeout(() => setShowOtpModal(false), 2000);
+    } else {
+       setOtpResultMessage({ success: false, message: res.message || "Failed to delete account." });
+    }
+  };
+
+  const handleStartDelete = () => {
+    setOtpSent(false);
+    setOtpResultMessage(null);
+    setShowOtpModal(true);
+  };
+
+  const handleMainSave = async () => {
     setError('');
 
     const parsedBwPrice = parseFloat(bwPriceInput);
@@ -127,7 +185,24 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
         return;
     }
 
-    onSaveSettings(shop.id, {
+    if (contactPhone.trim() && !/^\d{10}$/.test(contactPhone.trim())) {
+      setError("Primary phone must be exactly 10 digits.");
+      return;
+    }
+    if (contactPhoneAlt.trim() && !/^\d{10}$/.test(contactPhoneAlt.trim())) {
+      setError("Alternate phone must be exactly 10 digits.");
+      return;
+    }
+    if (whatsappNumber.trim() && !/^\d{10}$/.test(whatsappNumber.trim())) {
+      setError("WhatsApp number must be exactly 10 digits.");
+      return;
+    }
+    if (contactEmail.trim() && !/^[\w-.]+@([\w-]+\.)+[\w-]{2,4}$/.test(contactEmail.trim())) {
+      setError("Please enter a valid email address format.");
+      return;
+    }
+
+    const result = await onSaveSettings(shop.id, {
         pricing: { bwPerPage: finalBw, colorPerPage: finalColor },
         isOpen: isShopOpen,
         payoutMethods: cleanedPayoutMethods,
@@ -136,7 +211,11 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
         contactEmail: contactEmail.trim() || undefined,
         whatsappNumber: whatsappNumber.trim() || undefined,
     });
-    onClose();
+    if (result.success) {
+      onClose();
+    } else {
+      setError(result.message || 'Failed to save shop settings.');
+    }
   };
 
   const handleStartAddPayoutMethod = () => {
@@ -195,10 +274,22 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
             setFormError('For Bank Account, all fields (Holder, Number, IFSC, Bank Name) are required.');
             return;
         }
+        if (!/^\d{9,18}$/.test(finalAccountNumber)) {
+            setFormError('Account number must be between 9 and 18 digits, numbers only.');
+            return;
+        }
+        if (!/^[A-Z]{4}0[A-Z0-9]{6}$/.test(finalIfscCode)) {
+            setFormError('Invalid IFSC code format.');
+            return;
+        }
         finalUpiId = '';
     } else if (type === 'UPI') {
         if (!finalUpiId) {
             setFormError('For UPI, UPI ID is required.');
+            return;
+        }
+        if (!/^[\w.-]+@[\w.-]+$/.test(finalUpiId)) {
+            setFormError('Invalid UPI ID format.');
             return;
         }
         finalAccountHolderName = ''; finalAccountNumber = ''; finalIfscCode = ''; finalBankName = '';
@@ -240,7 +331,7 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
   };
 
   const handleDeletePayoutMethod = (methodId: string) => {
-    let newMethods = currentPayoutMethods.filter(pm => pm.id !== methodId);
+    const newMethods = currentPayoutMethods.filter(pm => pm.id !== methodId);
     // If the deleted method was primary, and other methods exist, make the first one primary.
     const deletedMethodWasPrimary = currentPayoutMethods.find(pm => pm.id === methodId)?.isPrimary;
     if (deletedMethodWasPrimary && newMethods.length > 0) {
@@ -271,7 +362,7 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
   return (
     <Modal isOpen={isOpen} onClose={onClose} title={`Settings for ${shop.name}`} size="2xl">
       <div className="space-y-6">
-        {error && <p className="text-sm text-status-error bg-red-700/20 p-3 rounded-md mb-3 -mt-2" role="alert">{error}</p>}
+        {error && <p className="text-sm text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800/30 p-3 rounded-md mb-3 -mt-2" role="alert">{error}</p>}
         <div>
           <h4 className="text-lg font-semibold text-brand-primary mb-2">Shop Status</h4>
            <div className={`p-3 rounded-lg border flex items-center justify-between ${isShopOpen ? 'bg-status-success/10 border-status-success' : 'bg-status-error/10 border-status-error'}`}>
@@ -460,6 +551,16 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
                   size="sm"
                   disabled={isBankSaving || !bankForm.accountHolderName.trim() || !bankForm.accountNumber.trim() || !bankForm.ifscCode.trim() || !bankForm.bankName.trim()}
                   onClick={async () => {
+                    if (!/^\d{9,18}$/.test(bankForm.accountNumber.trim())) {
+                      setError("Account number must be between 9 and 18 digits.");
+                      return;
+                    }
+                    if (!/^[A-Z]{4}0[A-Z0-9]{6}$/.test(bankForm.ifscCode.trim())) {
+                      setError("Invalid IFSC code format.");
+                      return;
+                    }
+
+                    setError('');
                     setIsBankSaving(true);
                     const result = await saveBankDetails(shop.id, {
                       accountHolderName: bankForm.accountHolderName.trim(),
@@ -477,10 +578,13 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
                         ifscCode: bankForm.ifscCode.trim(),
                         bankName: bankForm.bankName.trim(),
                         accountType: bankForm.accountType,
-                        isVerified: false,
+                        ...(bankDetails?.isVerified !== undefined ? { isVerified: bankDetails.isVerified } : {}),
+                        ...(bankDetails?.verifiedAt ? { verifiedAt: bankDetails.verifiedAt } : {}),
                       });
                       setIsBankEditing(false);
                       setShowBankDetails(true);
+                    } else {
+                      setError(result.message || 'Failed to save bank details. Please try again.');
                     }
                   }}
                 >
@@ -528,7 +632,7 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
             {currentPayoutMethods.length > 0 && (
                 <div className="space-y-3 mb-4">
                     {currentPayoutMethods.map(method => (
-                        <Card key={method.id} className="bg-brand-secondaryLight/50 !p-3 border border-brand-muted/30" noPadding>
+                        <Card key={method.id} className="bg-gray-50 dark:bg-zinc-800/50 !p-3 border border-gray-200 dark:border-zinc-700" noPadding>
                            <div className="p-3">
                             <div className="flex justify-between items-start">
                                 <div>
@@ -547,19 +651,21 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
                     ))}
                 </div>
             )}
-             {currentPayoutMethods.length === 0 && !editingPayoutMethod && (
-                 <p className="text-brand-muted text-center py-3 border border-dashed border-brand-muted/50 rounded-lg">No payout methods added yet.</p>
-             )}
+            {currentPayoutMethods.length === 0 && !editingPayoutMethod && (
+                <p className="text-brand-muted text-center py-3 border border-dashed border-brand-muted/50 rounded-lg">
+                    {isPayoutConfigLoading ? 'Loading payout methods...' : 'No payout methods added yet.'}
+                </p>
+            )}
 
             {!editingPayoutMethod ? (
                 <Button onClick={handleStartAddPayoutMethod} variant="secondary" size="md" fullWidth>
                     Add New Payout Method
                 </Button>
             ) : (
-                <Card className="bg-brand-secondaryLight/70 p-4 mt-4 border-2 border-brand-primary/50" noPadding>
+                <Card className="bg-gray-50 dark:bg-zinc-800/50 p-4 mt-4 border-2 border-brand-primary/50" noPadding>
                   <div className="p-4 space-y-3">
                     <h5 className="text-md font-semibold text-brand-primary">{currentPayoutMethods.find(pm=>pm.id === editingPayoutMethod!.id) ? 'Edit Payout Method' : 'Add New Payout Method'}</h5>
-                    {formError && <p className="text-sm text-status-error bg-red-700/20 p-2 rounded-md" role="alert">{formError}</p>}
+                    {formError && <p className="text-sm text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800/30 p-2 rounded-md" role="alert">{formError}</p>}
                     <Input label="Nickname" name="nickname" type="text" value={editingPayoutMethod.nickname || ''} onChange={handlePayoutFormChange} placeholder="e.g., Main Business Account" required/>
                     <Select label="Type" name="type" value={editingPayoutMethod.type} onChange={handlePayoutFormChange}
                         options={[ { value: 'UPI', label: 'UPI' }, { value: 'BANK_ACCOUNT', label: 'Bank Account' }]}
@@ -578,7 +684,7 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
                         <Input label="UPI ID" name="upiId" type="text" value={editingPayoutMethod.upiId || ''} onChange={handlePayoutFormChange} placeholder="e.g. yourname@upi" />
                     )}
                     <div className="flex items-center pt-2">
-                        <input id="isPrimaryPayout" name="isPrimary" type="checkbox" checked={editingPayoutMethod.isPrimary || false} onChange={handlePayoutFormChange} className="h-4 w-4 text-brand-primary bg-brand-secondaryLight border-brand-muted rounded focus:ring-brand-primary focus:ring-offset-brand-secondary"/>
+                        <input id="isPrimaryPayout" name="isPrimary" type="checkbox" checked={editingPayoutMethod.isPrimary || false} onChange={handlePayoutFormChange} className="h-4 w-4 text-brand-primary bg-white dark:bg-zinc-700 border-gray-300 dark:border-zinc-600 rounded focus:ring-brand-primary focus:ring-offset-white dark:focus:ring-offset-zinc-800"/>
                         <label htmlFor="isPrimaryPayout" className="ml-2 block text-sm text-gray-600 dark:text-gray-400">Set as primary payout method</label>
                     </div>
                     <div className="flex justify-end space-x-2 pt-3">
@@ -595,7 +701,7 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
             <p className="text-sm text-gray-600 dark:text-gray-400 mb-3">
                 A tiered base fee is automatically added to each order based on the total cost of the printed pages (before base fee). This fee is fixed.
             </p>
-            <ul className="list-disc list-inside text-sm text-gray-600 dark:text-gray-400 space-y-1 bg-brand-secondaryLight/50 p-3 rounded-md border border-brand-muted/30">
+            <ul className="list-disc list-inside text-sm text-gray-700 dark:text-gray-300 space-y-1.5 bg-gray-50 dark:bg-zinc-800/60 p-4 rounded-xl border border-gray-200 dark:border-zinc-700">
                 {baseFeeTiers.map(tier => (
                     <li key={tier.range}>For page costs in range <strong>{tier.range}</strong>, Base Fee = <strong>
                         {`₹${tier.fee.toFixed(2)}`}
@@ -618,53 +724,28 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
             </div>
           </div>
 
-          {!showDeleteAccountConfirm ? (
-            <button
-              onClick={() => setShowDeleteAccountConfirm(true)}
-              className="w-full py-2.5 px-4 rounded-lg border-2 border-red-300 dark:border-red-800 text-red-600 dark:text-red-400 text-sm font-medium hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
-            >
-              Delete My Shop & Account
-            </button>
-          ) : (
-            <div className="bg-red-50 dark:bg-red-900/20 rounded-xl p-4 border border-red-200 dark:border-red-800/40 space-y-3">
-              <div className="flex items-start gap-2">
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-5 h-5 text-red-500 mt-0.5 flex-shrink-0">
-                  <path fillRule="evenodd" d="M9.401 3.003c1.155-2 4.043-2 5.197 0l7.355 12.748c1.154 2-.29 4.5-2.599 4.5H4.645c-2.309 0-3.752-2.5-2.598-4.5L9.4 3.003ZM12 8.25a.75.75 0 0 1 .75.75v3.75a.75.75 0 0 1-1.5 0V9a.75.75 0 0 1 .75-.75Zm0 8.25a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Z" clipRule="evenodd" />
-                </svg>
-                <div>
-                  <p className="text-sm font-semibold text-red-700 dark:text-red-400">Are you sure?</p>
-                  <p className="text-xs text-red-600/70 dark:text-red-400/70 mt-1">
-                    This will permanently delete your shop "{shop.name}" and your account. All order history will be lost. This action cannot be undone.
-                  </p>
-                </div>
-              </div>
-              <div className="flex gap-2">
-                <Button
-                  onClick={async () => {
-                    setIsDeletingAccount(true);
-                    await deleteOwnShopAccount();
-                    setIsDeletingAccount(false);
-                  }}
-                  variant="danger"
-                  size="sm"
-                  fullWidth
-                  disabled={isDeletingAccount}
-                >
-                  {isDeletingAccount ? 'Deleting...' : 'Yes, Delete Everything'}
-                </Button>
-                <Button
-                  onClick={() => setShowDeleteAccountConfirm(false)}
-                  variant="ghost"
-                  size="sm"
-                  fullWidth
-                  disabled={isDeletingAccount}
-                >
-                  Cancel
-                </Button>
-              </div>
-            </div>
-          )}
+          <button
+            onClick={handleStartDelete}
+            className="w-full py-2.5 px-4 rounded-lg border-2 border-red-300 dark:border-red-800 text-red-600 dark:text-red-400 text-sm font-medium hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
+          >
+            Delete My Shop & Account
+          </button>
         </div>
+
+        <AccountOtpModal
+          isOpen={showOtpModal}
+          onClose={() => setShowOtpModal(false)}
+          title={"Verify Account Deletion"}
+          description={`You are about to permanently delete your shop "${shop.name}" and your account. All order history will be lost. This action cannot be undone.`}
+          confirmText={"Yes, Delete Everything"}
+          loadingText="Deleting..."
+          onConfirm={handleExecuteDelete}
+          onRequestOTP={handleRequestOTP}
+          isProcessing={isDeletingAccount}
+          isRequestingOTP={isRequestingOTP}
+          otpSent={otpSent}
+          resultMessage={otpResultMessage}
+        />
 
         <div className="pt-6 flex justify-end space-x-3 border-t border-brand-muted/20 mt-6">
           <Button onClick={onClose} variant="ghost">Cancel</Button>

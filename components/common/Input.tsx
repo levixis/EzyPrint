@@ -28,6 +28,7 @@ export const Input: React.FC<InputProps> = ({ label, id, error, containerClassNa
   if (props.type === 'textarea') {
     // Type is known to be 'textarea' here, so we cast props to TextareaInputProps
     // and destructure specific props, excluding 'type' as it's already handled.
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
     const { type: _type, ...textareaSpecificProps } = props as Omit<TextareaInputProps, keyof BaseSharedInputProps>;
     return (
       <div className={`mb-4 ${containerClassName}`}>

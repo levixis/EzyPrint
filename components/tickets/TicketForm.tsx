@@ -1,6 +1,6 @@
 import React, { useState, useRef } from 'react';
 import { useAppContext } from '../../contexts/AppContext';
-import { TicketCategory } from '../../types';
+import { TicketCategory, UserType } from '../../types';
 import { Button } from '../common/Button';
 import { Input } from '../common/Input';
 import { Select } from '../common/Select';
@@ -16,21 +16,25 @@ const CATEGORY_OPTIONS = [
   { value: TicketCategory.ORDER_ISSUE, label: 'Order Issue' },
   { value: TicketCategory.PAYMENT_ISSUE, label: 'Payment Issue' },
   { value: TicketCategory.DELIVERY_ISSUE, label: 'Delivery Issue' },
-  { value: TicketCategory.OTHER, label: 'Other' },
+  { value: 'OTHER', label: 'Other/General Query' },
 ];
 
 const TicketForm: React.FC<TicketFormProps> = ({ isOpen, onClose, prefilledOrderId }) => {
-  const { createTicket, orders } = useAppContext();
+  const { createTicket, orders, currentUser } = useAppContext();
+  const isShopOwner = currentUser?.type === UserType.SHOP_OWNER;
   const [subject, setSubject] = useState('');
   const [category, setCategory] = useState<TicketCategory>(prefilledOrderId ? TicketCategory.ORDER_ISSUE : TicketCategory.OTHER);
   const [description, setDescription] = useState('');
-  const [relatedOrderId, setRelatedOrderId] = useState(prefilledOrderId || '');
+  // Shop owners do NOT supply relatedOrderId — their context orders belong to students,
+  // and the rules only allow relatedOrderId when the caller owns the order.
+  const [relatedOrderId, setRelatedOrderId] = useState(isShopOwner ? '' : (prefilledOrderId || ''));
   const [attachments, setAttachments] = useState<File[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const userOrders = orders;
+  // Only students see their own orders; shop owners see shop orders (different ownership semantics)
+  const userOrders = isShopOwner ? [] : orders;
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []);
@@ -54,22 +58,22 @@ const TicketForm: React.FC<TicketFormProps> = ({ isOpen, onClose, prefilledOrder
     if (!description.trim()) { setError('Description is required.'); return; }
 
     setIsSubmitting(true);
-    const result = await createTicket({
-      subject: subject.trim(),
-      category,
-      description: description.trim(),
-      relatedOrderId: relatedOrderId || undefined,
-      attachmentFiles: attachments.length > 0 ? attachments : undefined,
-    });
+      const result = await createTicket({
+        subject: subject.trim(),
+        category,
+        description: description.trim(),
+        relatedOrderId: relatedOrderId || undefined,
+        attachmentFiles: attachments.length > 0 ? attachments : undefined,
+      });
 
-    setIsSubmitting(false);
-    if (result.success) {
-      setSubject('');
-      setDescription('');
-      setRelatedOrderId('');
-      setAttachments([]);
-      onClose();
-    } else {
+      setIsSubmitting(false);
+      if (result.success) {
+        setSubject('');
+        setDescription('');
+        setRelatedOrderId(prefilledOrderId || '');
+        setAttachments([]);
+        onClose();
+      } else {
       setError(result.message || 'Failed to create ticket.');
     }
   };
@@ -77,7 +81,7 @@ const TicketForm: React.FC<TicketFormProps> = ({ isOpen, onClose, prefilledOrder
   return (
     <Modal isOpen={isOpen} onClose={onClose} title="Raise a Support Ticket" size="lg">
       <form onSubmit={handleSubmit} className="space-y-4">
-        {error && <p className="text-sm text-status-error bg-red-700/20 p-3 rounded-lg">{error}</p>}
+        {error && <p className="text-sm text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800/30 p-3 rounded-lg">{error}</p>}
 
         <Input
           label="Subject"
@@ -97,20 +101,41 @@ const TicketForm: React.FC<TicketFormProps> = ({ isOpen, onClose, prefilledOrder
           options={CATEGORY_OPTIONS}
         />
 
-        {userOrders.length > 0 && (
-          <Select
-            label="Related Order (optional)"
-            name="relatedOrder"
-            value={relatedOrderId}
-            onChange={(e) => setRelatedOrderId(e.target.value)}
-            options={[
-              { value: '', label: 'None' },
-              ...userOrders.slice(0, 20).map(o => ({
-                value: o.id,
-                label: `#${o.id.slice(-6)} — ${o.fileName} (₹${o.priceDetails.totalPrice.toFixed(2)})`,
-              })),
-            ]}
-          />
+        {prefilledOrderId ? (
+          <div className="bg-brand-primary/5 dark:bg-brand-primary/10 p-3 rounded-xl border border-brand-primary/20">
+            <p className="text-sm font-semibold text-brand-primary flex items-center gap-2">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
+                <path fillRule="evenodd" d="M10 18a8 8 0 1 0 0-16 8 8 0 0 0 0 16Zm.75-13a.75.75 0 0 0-1.5 0v5c0 .414.336.75.75.75h4a.75.75 0 0 0 0-1.5h-3.25V5Z" clipRule="evenodd" />
+              </svg>
+              Raising issue for Order #{prefilledOrderId.slice(-6)}
+            </p>
+          </div>
+        ) : (
+          userOrders.length > 0 && (
+            <>
+              <Select
+                label="Related Order (optional)"
+                name="relatedOrder"
+                value={relatedOrderId}
+                onChange={(e) => setRelatedOrderId(e.target.value)}
+                options={[
+                  { value: '', label: 'None — General platform query' },
+                  ...userOrders.slice(0, 20).map(o => ({
+                    value: o.id,
+                    label: `#${o.id.slice(-6)} — ${o.fileName} (₹${o.priceDetails.totalPrice.toFixed(2)})`,
+                  })),
+                ]}
+              />
+              <div className={`flex items-center gap-2 text-xs px-3 py-2 rounded-lg ${relatedOrderId ? 'bg-indigo-50 dark:bg-indigo-900/20 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800/50' : 'bg-gray-50 dark:bg-zinc-800 text-gray-500 dark:text-gray-400 border border-gray-200 dark:border-zinc-700'}`}>
+                <span className="text-base">{relatedOrderId ? '🏪' : '🛡️'}</span>
+                <span>
+                  {relatedOrderId
+                    ? 'This ticket will be sent to the shop for that order.'
+                    : 'No order selected — this ticket will go to platform support (Admin).'}
+                </span>
+              </div>
+            </>
+          )
         )}
 
         <div>
@@ -141,7 +166,7 @@ const TicketForm: React.FC<TicketFormProps> = ({ isOpen, onClose, prefilledOrder
           ))}
           {attachments.length < 3 && (
             <>
-              <input ref={fileInputRef} type="file" onChange={handleFileChange} className="hidden" multiple accept="image/*,.pdf,.txt,.doc,.docx" />
+              <input ref={fileInputRef} type="file" onChange={handleFileChange} className="hidden" multiple accept="image/*,.pdf,.txt" />
               <button
                 type="button"
                 onClick={() => fileInputRef.current?.click()}
