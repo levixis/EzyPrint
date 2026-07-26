@@ -16,3 +16,6 @@ prisma/migrations/
 
 # OS
 .DS_Store
+
+# Uploaded files (local dev storage)
+uploads/

@@ -22,6 +22,15 @@ export const env = {
   RAZORPAY_KEY_ID: process.env.RAZORPAY_KEY_ID || '',
   RAZORPAY_KEY_SECRET: process.env.RAZORPAY_KEY_SECRET || '',
 
+  // Storage (file uploads)
+  STORAGE_MODE: (process.env.STORAGE_MODE || 'local') as 'local' | 's3',
+  S3_BUCKET: process.env.S3_BUCKET || '',
+  S3_REGION: process.env.S3_REGION || 'auto',
+  S3_ENDPOINT: process.env.S3_ENDPOINT || '',  // For R2: https://<account_id>.r2.cloudflarestorage.com
+  S3_ACCESS_KEY: process.env.S3_ACCESS_KEY || '',
+  S3_SECRET_KEY: process.env.S3_SECRET_KEY || '',
+  LOCAL_UPLOAD_DIR: process.env.LOCAL_UPLOAD_DIR || 'uploads',
+
   // Helpers
   isDev: (process.env.NODE_ENV || 'development') === 'development',
   isProd: process.env.NODE_ENV === 'production',
