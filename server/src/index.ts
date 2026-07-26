@@ -8,6 +8,7 @@ import { generalLimiter } from './middleware/rateLimiter';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler';
 import routes from './routes';
 import { prisma } from './utils/prisma';
+import { sanitizeBody, additionalSecurityHeaders } from './middleware/security';
 
 /**
  * EzyPrint Backend Server
@@ -48,6 +49,10 @@ app.use(morgan(env.isDev ? 'dev' : 'combined'));
 // ── Body Parsing ──
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// ── Security: XSS Sanitization + Extra Headers ──
+app.use(sanitizeBody);
+app.use(additionalSecurityHeaders);
 
 // ── Rate Limiting ──
 app.use('/api/', generalLimiter);
