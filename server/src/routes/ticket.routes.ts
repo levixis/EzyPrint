@@ -1,46 +1,36 @@
 import { Router } from 'express';
-import { authenticate } from '../middleware/auth';
+import { authenticate, authorize } from '../middleware/auth';
+import * as ticketController from '../controllers/ticket.controller';
 
 const router = Router();
 
 /**
- * POST /api/v1/tickets
- * Create a new support ticket
+ * POST /api/v1/tickets — Create a support ticket
+ * Body: { subject, description, category, orderId?, shopId? }
  */
-router.post('/', authenticate, (_req, res) => {
-  res.status(501).json({ success: false, message: 'Create ticket — coming in Phase 6' });
-});
+router.post('/', authenticate, ticketController.createTicket);
 
 /**
- * GET /api/v1/tickets
- * List tickets for current user (admin sees all)
+ * GET /api/v1/tickets — List tickets (user's own, admin sees all)
+ * Query: ?status=open&page=1&limit=20
  */
-router.get('/', authenticate, (_req, res) => {
-  res.status(501).json({ success: false, message: 'List tickets — coming in Phase 6' });
-});
+router.get('/', authenticate, ticketController.listTickets);
 
 /**
- * GET /api/v1/tickets/:ticketId
- * Get ticket details with messages
+ * GET /api/v1/tickets/:ticketId — Get ticket with messages
  */
-router.get('/:ticketId', authenticate, (_req, res) => {
-  res.status(501).json({ success: false, message: 'Get ticket — coming in Phase 6' });
-});
+router.get('/:ticketId', authenticate, ticketController.getTicket);
 
 /**
- * POST /api/v1/tickets/:ticketId/messages
- * Add a message to a ticket
+ * POST /api/v1/tickets/:ticketId/messages — Add a message
+ * Body: { message }
  */
-router.post('/:ticketId/messages', authenticate, (_req, res) => {
-  res.status(501).json({ success: false, message: 'Add ticket message — coming in Phase 6' });
-});
+router.post('/:ticketId/messages', authenticate, ticketController.addMessage);
 
 /**
- * PATCH /api/v1/tickets/:ticketId/status
- * Update ticket status
+ * PATCH /api/v1/tickets/:ticketId/status — Update ticket status (admin)
+ * Body: { status, note? }
  */
-router.patch('/:ticketId/status', authenticate, (_req, res) => {
-  res.status(501).json({ success: false, message: 'Update ticket status — coming in Phase 6' });
-});
+router.patch('/:ticketId/status', authenticate, authorize('ADMIN'), ticketController.updateStatus);
 
 export default router;

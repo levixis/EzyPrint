@@ -1,30 +1,23 @@
 import { Router } from 'express';
 import { authenticate } from '../middleware/auth';
+import * as notifController from '../controllers/notification.controller';
 
 const router = Router();
 
 /**
- * GET /api/v1/notifications
- * Get notifications for current user
+ * GET /api/v1/notifications — List notifications
+ * Query: ?page=1&limit=20&unreadOnly=true
  */
-router.get('/', authenticate, (_req, res) => {
-  res.status(501).json({ success: false, message: 'List notifications — coming in Phase 6' });
-});
+router.get('/', authenticate, notifController.getNotifications);
 
 /**
- * PATCH /api/v1/notifications/:notificationId/read
- * Mark a notification as read
+ * PATCH /api/v1/notifications/read-all — Mark all as read
  */
-router.patch('/:notificationId/read', authenticate, (_req, res) => {
-  res.status(501).json({ success: false, message: 'Mark read — coming in Phase 6' });
-});
+router.patch('/read-all', authenticate, notifController.markAllAsRead);
 
 /**
- * PATCH /api/v1/notifications/read-all
- * Mark all notifications as read
+ * PATCH /api/v1/notifications/:notificationId/read — Mark one as read
  */
-router.patch('/read-all', authenticate, (_req, res) => {
-  res.status(501).json({ success: false, message: 'Mark all read — coming in Phase 6' });
-});
+router.patch('/:notificationId/read', authenticate, notifController.markAsRead);
 
 export default router;
