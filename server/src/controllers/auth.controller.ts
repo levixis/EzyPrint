@@ -1,0 +1,218 @@
+import { Request, Response, NextFunction } from 'express';
+import {
+  registerWithEmail,
+  loginWithEmail,
+  loginWithGoogle,
+  refreshTokens,
+  logout,
+  logoutAll,
+  getCurrentUser,
+} from '../services/auth.service';
+import { ApiError } from '../utils/ApiError';
+
+/**
+ * Auth Controller — thin request handlers that delegate to auth.service.
+ *
+ * Each handler:
+ * 1. Extracts & validates input from the request
+ * 2. Calls the appropriate service method
+ * 3. Returns a consistent JSON response
+ *
+ * All errors are thrown and caught by the centralized error handler.
+ */
+
+/**
+ * POST /api/v1/auth/register
+ * Body: { email, password, name, type, shopName?, shopAddress? }
+ */
+export async function register(req: Request, res: Response, next: NextFunction) {
+  try {
+    const { email, password, name, type, shopName, shopAddress } = req.body;
+
+    // Basic input validation (Zod schema would handle this in production)
+    if (!email || !password || !name || !type) {
+      throw ApiError.badRequest('Email, password, name, and type are required');
+    }
+
+    if (!['STUDENT', 'SHOP_OWNER'].includes(type)) {
+      throw ApiError.badRequest('Type must be STUDENT or SHOP_OWNER');
+    }
+
+    if (type === 'SHOP_OWNER' && (!shopName || !shopAddress)) {
+      throw ApiError.badRequest('Shop name and address are required for shop owners');
+    }
+
+    const result = await registerWithEmail(
+      { email, password, name, type, shopName, shopAddress },
+      req.headers['user-agent'],
+      req.ip
+    );
+
+    res.status(201).json({
+      success: true,
+      message: 'Registration successful',
+      data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+/**
+ * POST /api/v1/auth/login
+ * Body: { email, password }
+ */
+export async function login(req: Request, res: Response, next: NextFunction) {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      throw ApiError.badRequest('Email and password are required');
+    }
+
+    const result = await loginWithEmail(
+      email,
+      password,
+      req.headers['user-agent'],
+      req.ip
+    );
+
+    res.json({
+      success: true,
+      message: 'Login successful',
+      data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+/**
+ * POST /api/v1/auth/google
+ * Body: { idToken, userType? }
+ *
+ * The frontend sends the Google ID token obtained from Google Sign-In SDK.
+ * We verify it server-side and create/find the user.
+ */
+export async function googleAuth(req: Request, res: Response, next: NextFunction) {
+  try {
+    const { idToken, userType } = req.body;
+
+    if (!idToken) {
+      throw ApiError.badRequest('Google ID token is required');
+    }
+
+    const validTypes = ['STUDENT', 'SHOP_OWNER'];
+    const type = validTypes.includes(userType) ? userType : 'STUDENT';
+
+    const result = await loginWithGoogle(
+      idToken,
+      type,
+      req.headers['user-agent'],
+      req.ip
+    );
+
+    res.json({
+      success: true,
+      message: 'Google authentication successful',
+      data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+/**
+ * POST /api/v1/auth/refresh
+ * Body: { refreshToken }
+ *
+ * Uses refresh token rotation — the old token is revoked and a new pair is issued.
+ */
+export async function refresh(req: Request, res: Response, next: NextFunction) {
+  try {
+    const { refreshToken } = req.body;
+
+    if (!refreshToken) {
+      throw ApiError.badRequest('Refresh token is required');
+    }
+
+    const tokens = await refreshTokens(
+      refreshToken,
+      req.headers['user-agent'],
+      req.ip
+    );
+
+    res.json({
+      success: true,
+      message: 'Tokens refreshed',
+      data: { tokens },
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+/**
+ * POST /api/v1/auth/logout
+ * Body: { refreshToken }
+ *
+ * Revokes the specific refresh token (single device logout).
+ */
+export async function logoutHandler(req: Request, res: Response, next: NextFunction) {
+  try {
+    const { refreshToken } = req.body;
+
+    if (refreshToken) {
+      await logout(refreshToken);
+    }
+
+    res.json({
+      success: true,
+      message: 'Logged out successfully',
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+/**
+ * POST /api/v1/auth/logout-all
+ * Requires authentication — revokes ALL refresh tokens for the user.
+ */
+export async function logoutAllHandler(req: Request, res: Response, next: NextFunction) {
+  try {
+    if (!req.user) {
+      throw ApiError.unauthorized('Authentication required');
+    }
+
+    await logoutAll(req.user.userId);
+
+    res.json({
+      success: true,
+      message: 'Logged out from all devices',
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+/**
+ * GET /api/v1/auth/me
+ * Returns the current authenticated user's profile.
+ */
+export async function me(req: Request, res: Response, next: NextFunction) {
+  try {
+    if (!req.user) {
+      throw ApiError.unauthorized('Authentication required');
+    }
+
+    const user = await getCurrentUser(req.user.userId);
+
+    res.json({
+      success: true,
+      data: { user },
+    });
+  } catch (error) {
+    next(error);
+  }
+}

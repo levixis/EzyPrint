@@ -162,10 +162,31 @@ model User {
   bankAccessLogs    BankAccessLog[]
   refundRequests    RefundRequest[] @relation("RefundStudent")
   reactivationRequests ReactivationRequest[]
+  refreshTokens     RefreshToken[]
 
   @@index([type])
   @@index([email])
   @@map("users")
+}
+
+/// Refresh tokens for JWT rotation — stored server-side for revocation
+model RefreshToken {
+  id          String   @id @default(cuid())
+  userId      String
+  tokenHash   String   @unique  // SHA-256 hash of the actual token
+  expiresAt   DateTime
+  deviceInfo  String?           // User-Agent or device identifier
+  ip          String?
+  isRevoked   Boolean  @default(false)
+
+  createdAt   DateTime @default(now())
+
+  // ── Relations ──
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
 }
 
 /// Print shop profile — owned by a SHOP_OWNER user
