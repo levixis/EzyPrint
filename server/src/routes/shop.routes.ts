@@ -1,62 +1,41 @@
 import { Router } from 'express';
 import { authenticate, authorize } from '../middleware/auth';
+import * as shopController from '../controllers/shop.controller';
 
 const router = Router();
 
 /**
- * GET /api/v1/shops
- * List all approved, open shops (for students)
+ * GET /api/v1/shops — List shops
+ * Students: approved, non-archived shops. Query: ?onlyOpen=true
+ * Admin: all shops including unapproved/archived
  */
-router.get('/', (_req, res) => {
-  res.status(501).json({ success: false, message: 'List shops — coming in Phase 3' });
-});
+router.get('/', shopController.listShops);
 
 /**
- * GET /api/v1/shops/:shopId
- * Get shop details
+ * GET /api/v1/shops/:shopId — Get shop details
  */
-router.get('/:shopId', (_req, res) => {
-  res.status(501).json({ success: false, message: 'Get shop — coming in Phase 3' });
-});
+router.get('/:shopId', shopController.getShop);
 
 /**
- * POST /api/v1/shops
- * Register a new shop (shop owner)
+ * PATCH /api/v1/shops/:shopId — Update shop settings
+ * Body: { bwPerPage?, colorPerPage?, isOpen?, contactPhone?, ... }
  */
-router.post('/', authenticate, authorize('SHOP_OWNER'), (_req, res) => {
-  res.status(501).json({ success: false, message: 'Register shop — coming in Phase 3' });
-});
+router.patch('/:shopId', authenticate, authorize('SHOP_OWNER', 'ADMIN'), shopController.updateShopSettings);
 
 /**
- * PATCH /api/v1/shops/:shopId
- * Update shop settings (pricing, status, contact info)
+ * PATCH /api/v1/shops/:shopId/approve — Admin approves a shop
  */
-router.patch('/:shopId', authenticate, authorize('SHOP_OWNER', 'ADMIN'), (_req, res) => {
-  res.status(501).json({ success: false, message: 'Update shop — coming in Phase 3' });
-});
+router.patch('/:shopId/approve', authenticate, authorize('ADMIN'), shopController.approveShop);
 
 /**
- * PATCH /api/v1/shops/:shopId/approve
- * Admin approves a shop
+ * PATCH /api/v1/shops/:shopId/archive — Admin archives/unarchives a shop
+ * Body: { action: 'archive' | 'unarchive' }
  */
-router.patch('/:shopId/approve', authenticate, authorize('ADMIN'), (_req, res) => {
-  res.status(501).json({ success: false, message: 'Approve shop — coming in Phase 3' });
-});
+router.patch('/:shopId/archive', authenticate, authorize('ADMIN'), shopController.archiveShop);
 
 /**
- * PATCH /api/v1/shops/:shopId/archive
- * Admin archives a shop
+ * GET /api/v1/shops/:shopId/aggregate — Shop dashboard stats
  */
-router.patch('/:shopId/archive', authenticate, authorize('ADMIN'), (_req, res) => {
-  res.status(501).json({ success: false, message: 'Archive shop — coming in Phase 3' });
-});
-
-/**
- * GET /api/v1/shops/:shopId/aggregate
- * Get shop dashboard aggregate stats
- */
-router.get('/:shopId/aggregate', authenticate, authorize('SHOP_OWNER', 'ADMIN'), (_req, res) => {
-  res.status(501).json({ success: false, message: 'Shop aggregate — coming in Phase 3' });
-});
+router.get('/:shopId/aggregate', authenticate, authorize('SHOP_OWNER', 'ADMIN'), shopController.getAggregate);
 
 export default router;

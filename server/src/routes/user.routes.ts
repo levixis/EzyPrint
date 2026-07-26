@@ -1,30 +1,24 @@
 import { Router } from 'express';
 import { authenticate, authorize } from '../middleware/auth';
+import * as userController from '../controllers/user.controller';
 
 const router = Router();
 
 /**
- * GET /api/v1/users/me
- * Get current user profile
+ * GET /api/v1/users/me — Get current user profile
  */
-router.get('/me', authenticate, (_req, res) => {
-  res.status(501).json({ success: false, message: 'Get profile — coming in Phase 3' });
-});
+router.get('/me', authenticate, userController.getProfile);
 
 /**
- * PATCH /api/v1/users/me
- * Update current user profile
+ * PATCH /api/v1/users/me — Update current user profile
+ * Body: { name?, phone?, preferredLanguage?, profilePhotoUrl? }
  */
-router.patch('/me', authenticate, (_req, res) => {
-  res.status(501).json({ success: false, message: 'Update profile — coming in Phase 3' });
-});
+router.patch('/me', authenticate, userController.updateProfile);
 
 /**
- * GET /api/v1/users (Admin only)
- * List all users
+ * GET /api/v1/users — Admin: list all users with pagination
+ * Query: ?page=1&limit=20&type=STUDENT&search=john
  */
-router.get('/', authenticate, authorize('ADMIN'), (_req, res) => {
-  res.status(501).json({ success: false, message: 'List users — coming in Phase 3' });
-});
+router.get('/', authenticate, authorize('ADMIN'), userController.listUsers);
 
 export default router;

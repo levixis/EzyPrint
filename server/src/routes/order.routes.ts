@@ -1,63 +1,59 @@
 import { Router } from 'express';
 import { authenticate, authorize } from '../middleware/auth';
 import { sensitiveLimiter } from '../middleware/rateLimiter';
+import * as orderController from '../controllers/order.controller';
 
 const router = Router();
 
 /**
- * POST /api/v1/orders
- * Create a new print order (student)
+ * IMPORTANT: /admin/all must be defined BEFORE /:orderId
+ * otherwise Express treats "admin" as an orderId parameter.
  */
-router.post('/', authenticate, authorize('STUDENT'), (_req, res) => {
-  res.status(501).json({ success: false, message: 'Create order — coming in Phase 3' });
-});
 
 /**
- * GET /api/v1/orders
- * Get orders for current user (student sees their orders, shop sees shop orders)
+ * GET /api/v1/orders/admin/all — Admin: list all orders
+ * Query: ?status=PRINTING&shopId=xxx&page=1&limit=20
  */
-router.get('/', authenticate, (_req, res) => {
-  res.status(501).json({ success: false, message: 'List orders — coming in Phase 3' });
-});
+router.get('/admin/all', authenticate, authorize('ADMIN'), orderController.listAllOrders);
 
 /**
- * GET /api/v1/orders/:orderId
- * Get single order details
+ * POST /api/v1/orders — Create a new print order (student)
+ * Body: { shopId, fileName, fileType, copies, color, pages, doubleSided, ... }
  */
-router.get('/:orderId', authenticate, (_req, res) => {
-  res.status(501).json({ success: false, message: 'Get order — coming in Phase 3' });
-});
+router.post('/', authenticate, authorize('STUDENT'), orderController.createOrder);
 
 /**
- * PATCH /api/v1/orders/:orderId/status
- * Update order status (shop owner or admin)
+ * GET /api/v1/orders — List orders for current user
+ * Student: their orders. Shop owner: their shop's orders.
+ * Query: ?status=PRINTING&page=1&limit=20
  */
-router.patch('/:orderId/status', authenticate, authorize('SHOP_OWNER', 'ADMIN'), (_req, res) => {
-  res.status(501).json({ success: false, message: 'Update order status — coming in Phase 3' });
-});
+router.get('/', authenticate, orderController.listOrders);
 
 /**
- * POST /api/v1/orders/:orderId/verify-payment
- * Verify Razorpay payment for an order
+ * GET /api/v1/orders/:orderId — Get single order details
+ */
+router.get('/:orderId', authenticate, orderController.getOrder);
+
+/**
+ * PATCH /api/v1/orders/:orderId/status — Update order status
+ * Body: { status: 'PRINTING', shopNotes?: 'Your order is being printed' }
+ */
+router.patch('/:orderId/status', authenticate, authorize('SHOP_OWNER', 'ADMIN'), orderController.updateStatus);
+
+/**
+ * POST /api/v1/orders/:orderId/verify-payment — Verify Razorpay payment
+ * → Phase 5 implementation
  */
 router.post('/:orderId/verify-payment', authenticate, sensitiveLimiter, (_req, res) => {
   res.status(501).json({ success: false, message: 'Verify payment — coming in Phase 5' });
 });
 
 /**
- * POST /api/v1/orders/:orderId/refund
- * Request a refund for an order (student)
+ * POST /api/v1/orders/:orderId/refund — Request refund
+ * → Phase 6 implementation
  */
 router.post('/:orderId/refund', authenticate, authorize('STUDENT'), sensitiveLimiter, (_req, res) => {
   res.status(501).json({ success: false, message: 'Request refund — coming in Phase 6' });
-});
-
-/**
- * GET /api/v1/orders/admin/all
- * Admin: get all orders across all shops
- */
-router.get('/admin/all', authenticate, authorize('ADMIN'), (_req, res) => {
-  res.status(501).json({ success: false, message: 'Admin list all orders — coming in Phase 3' });
 });
 
 export default router;
