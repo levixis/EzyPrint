@@ -9,6 +9,7 @@ import payoutRoutes from './payout.routes';
 import ticketRoutes from './ticket.routes';
 import notificationRoutes from './notification.routes';
 import uploadRoutes from './upload.routes';
+import paymentRoutes from './payment.routes';
 
 const router = Router();
 
@@ -37,5 +38,6 @@ router.use('/payouts', payoutRoutes);
 router.use('/tickets', ticketRoutes);
 router.use('/notifications', notificationRoutes);
 router.use('/uploads', uploadRoutes);
+router.use('/payments', paymentRoutes);
 
 export default router;

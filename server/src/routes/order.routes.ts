@@ -41,12 +41,11 @@ router.get('/:orderId', authenticate, orderController.getOrder);
 router.patch('/:orderId/status', authenticate, authorize('SHOP_OWNER', 'ADMIN'), orderController.updateStatus);
 
 /**
- * POST /api/v1/orders/:orderId/verify-payment — Verify Razorpay payment
- * → Phase 5 implementation
+ * Payment endpoints moved to /api/v1/payments/
+ *   POST /payments/create-order — Create Razorpay order
+ *   POST /payments/verify       — Verify payment signature
+ *   POST /payments/webhook      — Razorpay webhook
  */
-router.post('/:orderId/verify-payment', authenticate, sensitiveLimiter, (_req, res) => {
-  res.status(501).json({ success: false, message: 'Verify payment — coming in Phase 5' });
-});
 
 /**
  * POST /api/v1/orders/:orderId/refund — Request refund
