@@ -1,0 +1,626 @@
+// EzyPrint Database Schema
+// Mapped 1:1 from the existing types.ts — every Firestore collection
+// becomes a proper relational table with foreign keys and indexes.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────
+// ENUMS — PostgreSQL native enums for type safety
+// ─────────────────────────────────────────────────────────────
+
+enum UserType {
+  STUDENT
+  SHOP_OWNER
+  ADMIN
+}
+
+enum PrintColor {
+  BLACK_WHITE
+  COLOR
+}
+
+enum OrderStatus {
+  PENDING_PAYMENT
+  PENDING_APPROVAL
+  PRINTING
+  READY_FOR_PICKUP
+  COMPLETED
+  CANCELLED
+  PAYMENT_FAILED
+  REFUNDED
+}
+
+enum PayoutStatus {
+  PENDING
+  PAID
+  CONFIRMED
+  DISPUTED
+  REJECTED
+  CANCELLED
+}
+
+enum PayoutMethodType {
+  BANK_ACCOUNT
+  UPI
+}
+
+enum BankAccountType {
+  SAVINGS
+  CURRENT
+}
+
+enum TicketCategory {
+  ORDER_ISSUE
+  PAYMENT_ISSUE
+  DELIVERY_ISSUE
+  OTHER
+}
+
+enum TicketStatus {
+  OPEN
+  IN_REVIEW
+  RESOLVED
+  CLOSED
+}
+
+enum LedgerEntryType {
+  ORDER_EARNING
+  REFUND_DEDUCTION
+  PAYOUT
+  MANUAL_PAYOUT_DEDUCTION
+  PAYOUT_CANCEL_REFUND
+  PAYOUT_REJECT_REFUND
+  CLAWBACK
+  ADJUSTMENT
+}
+
+enum LedgerEntryStatus {
+  PENDING
+  SETTLED
+  VOID
+}
+
+enum LedgerCounterparty {
+  PLATFORM
+  SHOP
+  STUDENT
+}
+
+enum LedgerCreatedBy {
+  SYSTEM
+  ADMIN
+  SHOP
+}
+
+enum NotificationType {
+  success
+  info
+  warning
+  error
+}
+
+enum RefundRequestStatus {
+  PENDING_SHOP
+  APPROVED_BY_SHOP
+  REJECTED_BY_SHOP
+  ESCALATED_TO_ADMIN
+  AUTO_ESCALATED
+  RESOLVED_REFUNDED
+  RESOLVED_DENIED
+}
+
+enum ReactivationRequestStatus {
+  pending
+  approved
+  rejected
+}
+
+// ─────────────────────────────────────────────────────────────
+// MODELS
+// ─────────────────────────────────────────────────────────────
+
+/// Core user model — students, shop owners, and admins
+model User {
+  id        String   @id @default(cuid())
+  type      UserType
+  name      String?
+  email     String?  @unique
+  phone     String?
+  password  String?  // bcrypt hash — null for Google OAuth users
+
+  // Google OAuth fields
+  googleId  String?  @unique
+  profilePhotoUrl String?
+
+  // Student Pass
+  hasStudentPass         Boolean   @default(false)
+  studentPassActivatedAt DateTime?
+  studentPassPaymentId   String?
+
+  // Push notification tokens
+  fcmTokens String[] @default([])
+
+  // Preferences
+  preferredLanguage String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // ── Relations ──
+  shop              Shop?          @relation("ShopOwner")
+  orders            Order[]
+  notifications     Notification[]
+  ticketsRaised     Ticket[]       @relation("TicketRaiser")
+  ticketMessages    TicketMessage[]
+  bankAccessLogs    BankAccessLog[]
+  refundRequests    RefundRequest[] @relation("RefundStudent")
+  reactivationRequests ReactivationRequest[]
+
+  @@index([type])
+  @@index([email])
+  @@map("users")
+}
+
+/// Print shop profile — owned by a SHOP_OWNER user
+model Shop {
+  id           String  @id @default(cuid())
+  ownerUserId  String  @unique
+  name         String
+  address      String
+
+  // Pricing
+  bwPerPage    Float   @default(1)
+  colorPerPage Float   @default(3)
+
+  // Status
+  isOpen       Boolean @default(false)
+  isApproved   Boolean @default(false)
+  isArchived   Boolean @default(false)
+  isVerified   Boolean @default(false)
+
+  // Contact info
+  contactPhone    String?
+  contactPhoneAlt String?
+  contactEmail    String?
+  whatsappNumber  String?
+
+  // Ledger balances (denormalized for fast reads)
+  pendingBalance   Float    @default(0)
+  ledgerBalance    Float    @default(0)
+  debtAmount       Float    @default(0)
+  lastSettlementAt DateTime?
+  financialVersion Int      @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // ── Relations ──
+  owner              User                  @relation("ShopOwner", fields: [ownerUserId], references: [id], onDelete: Cascade)
+  orders             Order[]
+  payoutMethods      PayoutMethod[]
+  bankDetails        BankDetails?
+  payouts            Payout[]
+  ledgerEntries      LedgerEntry[]
+  aggregate          ShopAggregate?
+  tickets            Ticket[]              @relation("ShopTickets")
+  refundRequests     RefundRequest[]
+  reactivationRequests ReactivationRequest[]
+
+  @@index([isOpen, isApproved, isArchived])
+  @@index([ownerUserId])
+  @@map("shops")
+}
+
+/// Document print order — placed by a student at a shop
+model Order {
+  id        String      @id @default(cuid())
+  userId    String
+  shopId    String
+  status    OrderStatus @default(PENDING_PAYMENT)
+
+  // Legacy single-file fields (backward compat)
+  fileName        String
+  fileType        String
+  fileStoragePath String?
+  fileSizeBytes   Int?
+  isFileDeleted   Boolean @default(false)
+
+  // Denormalized shop name (for display when shop is deleted)
+  shopName    String?
+  deletedShop Boolean @default(false)
+
+  // Print options (embedded — these don't need their own table)
+  copies      Int          @default(1)
+  color       PrintColor   @default(BLACK_WHITE)
+  pages       Int          @default(1)
+  doubleSided Boolean      @default(false)
+  startPage   Int?
+  endPage     Int?
+
+  // Pricing breakdown
+  pageCost   Float @default(0)
+  baseFee    Float @default(0)
+  totalPrice Float @default(0)
+
+  // Order metadata
+  shopNotes           String?
+  pickupCode          String?
+  specialInstructions String?
+  userName            String?
+  isPremiumOrder      Boolean @default(false)
+
+  // Payment tracking
+  razorpayOrderId   String?
+  razorpayPaymentId String?
+  paymentAttemptedAt DateTime?
+  paymentVerifiedVia String?
+
+  // Refund tracking
+  refundId                   String?
+  refundStatus               String?
+  refundAmount               Float?
+  refundedAt                 DateTime?
+  refundError                String?
+  refundInitiatedBy          String?
+  refundReason               String?
+  refundProcessingStartedAt  DateTime?
+
+  // Lifecycle timestamps
+  uploadedAt  DateTime  @default(now())
+  cancelledAt DateTime?
+  completedAt DateTime?
+
+  // Ledger link
+  ledgerEntryId String?
+
+  // ── Relations ──
+  user           User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  shop           Shop           @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  files          OrderFile[]
+  refundRequest  RefundRequest?
+
+  @@index([userId])
+  @@index([shopId])
+  @@index([status])
+  @@index([shopId, status])
+  @@index([razorpayOrderId])
+  @@map("orders")
+}
+
+/// Individual file within a multi-file order
+model OrderFile {
+  id            String     @id @default(cuid())
+  orderId       String
+  fileName      String
+  fileType      String
+  fileStoragePath String?
+  fileSizeBytes Int?
+  isFileDeleted Boolean    @default(false)
+  pageCount     Int        @default(1)
+  color         PrintColor @default(BLACK_WHITE)
+  copies        Int        @default(1)
+  doubleSided   Boolean    @default(false)
+
+  createdAt DateTime @default(now())
+
+  // ── Relations ──
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@map("order_files")
+}
+
+/// In-app notification for a user
+model Notification {
+  id               String           @id @default(cuid())
+  recipientUserId  String
+  message          String
+  type             NotificationType @default(info)
+  read             Boolean          @default(false)
+
+  // Optional targeting metadata
+  orderId        String?
+  targetUserType UserType?
+  targetShopId   String?
+
+  createdAt DateTime @default(now())
+
+  // ── Relations ──
+  recipient User @relation(fields: [recipientUserId], references: [id], onDelete: Cascade)
+
+  @@index([recipientUserId, read])
+  @@index([recipientUserId, createdAt])
+  @@map("notifications")
+}
+
+/// Shop payout method (bank account or UPI)
+model PayoutMethod {
+  id                String          @id @default(cuid())
+  shopId            String
+  type              PayoutMethodType
+  accountHolderName String?
+  accountNumber     String?
+  ifscCode          String?
+  bankName          String?
+  upiId             String?
+  isPrimary         Boolean         @default(false)
+  nickname          String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // ── Relations ──
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@index([shopId])
+  @@map("payout_methods")
+}
+
+/// Sensitive bank details — restricted access, separate from PayoutMethod
+model BankDetails {
+  id                String          @id @default(cuid())
+  shopId            String          @unique
+  accountHolderName String
+  bankName          String
+  accountNumber     String          // Stored encrypted or plain, masked in UI
+  ifscCode          String
+  accountType       BankAccountType @default(SAVINGS)
+  upiId             String?
+
+  isVerified Boolean   @default(false)
+  verifiedAt DateTime?
+  verifiedBy String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // ── Relations ──
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@map("bank_details")
+}
+
+/// Audit log for bank detail access
+model BankAccessLog {
+  id        String   @id @default(cuid())
+  userId    String
+  userRole  UserType
+  action    String   // VIEW, EDIT, VERIFY
+  ip        String?
+
+  createdAt DateTime @default(now())
+
+  // ── Relations ──
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("bank_access_logs")
+}
+
+/// Shop payout record — tracks money paid out to shops
+model Payout {
+  id             String       @id @default(cuid())
+  shopId         String
+  shopName       String
+  amount         Float
+  status         PayoutStatus @default(PENDING)
+  payoutOrderIds String[]     @default([])
+  adminNote      String?
+  shopOwnerNote  String?
+
+  createdAt   DateTime  @default(now())
+  paidAt      DateTime?
+  confirmedAt DateTime?
+
+  // ── Relations ──
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@index([shopId])
+  @@index([status])
+  @@index([shopId, status])
+  @@map("payouts")
+}
+
+/// Support ticket raised by users
+model Ticket {
+  id             String         @id @default(cuid())
+  raisedBy       String
+  raisedByType   UserType
+  raisedByName   String
+  raisedByEmail  String?
+  shopId         String?
+  shopName       String?
+  deletedShop    Boolean        @default(false)
+  relatedOrderId String?
+  subject        String
+  category       TicketCategory
+  description    String
+  status         TicketStatus   @default(OPEN)
+  attachmentPaths String[]      @default([])
+
+  // Timestamps for tracking response times
+  adminLastRepliedAt  DateTime?
+  raiserLastRepliedAt DateTime?
+  shopLastRepliedAt   DateTime?
+  attachmentsCleanedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // ── Relations ──
+  raiser        User            @relation("TicketRaiser", fields: [raisedBy], references: [id], onDelete: Cascade)
+  shop          Shop?           @relation("ShopTickets", fields: [shopId], references: [id], onDelete: SetNull)
+  messages      TicketMessage[]
+  statusHistory TicketStatusChange[]
+
+  @@index([raisedBy])
+  @@index([shopId])
+  @@index([status])
+  @@map("tickets")
+}
+
+/// Individual message within a support ticket
+model TicketMessage {
+  id         String   @id @default(cuid())
+  ticketId   String
+  senderId   String
+  senderName String
+  senderType UserType
+  message    String
+
+  createdAt DateTime @default(now())
+
+  // ── Relations ──
+  ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  sender User   @relation(fields: [senderId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId])
+  @@map("ticket_messages")
+}
+
+/// Status change audit trail for tickets
+model TicketStatusChange {
+  id            String       @id @default(cuid())
+  ticketId      String
+  from          TicketStatus
+  to            TicketStatus
+  changedBy     String
+  changedByName String
+  note          String?
+
+  createdAt DateTime @default(now())
+
+  // ── Relations ──
+  ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId])
+  @@map("ticket_status_changes")
+}
+
+/// Financial ledger entry for a shop — double-entry style
+model LedgerEntry {
+  id           String             @id @default(cuid())
+  eventId      String?            @unique // Deterministic dedup key
+  shopId       String
+  orderId      String?
+  type         LedgerEntryType
+  status       LedgerEntryStatus  @default(PENDING)
+  amount       Float
+  counterparty LedgerCounterparty
+  description  String
+  createdBy    LedgerCreatedBy    @default(SYSTEM)
+
+  createdAt DateTime  @default(now())
+  settledAt DateTime?
+
+  // ── Relations ──
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@index([shopId])
+  @@index([shopId, type, status])
+  @@index([shopId, status])
+  @@map("ledger_entries")
+}
+
+/// Pre-computed shop aggregate stats (denormalized for dashboard performance)
+model ShopAggregate {
+  id                String @id @default(cuid())
+  shopId            String @unique
+  totalOrders       Int    @default(0)
+  activeOrders      Int    @default(0)
+  completedOrders   Int    @default(0)
+  totalRevenue      Float  @default(0)
+  totalBaseFees     Float  @default(0)
+  totalPaidOut      Float  @default(0)
+  pendingPayouts    Float  @default(0)
+  pendingPayoutCount Int   @default(0)
+
+  updatedAt DateTime @updatedAt
+
+  // ── Relations ──
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@map("shop_aggregates")
+}
+
+/// Reactivation request for archived shops
+model ReactivationRequest {
+  id              String                     @id @default(cuid())
+  shopId          String
+  ownerUid        String
+  ownerEmail      String
+  ownerName       String
+  shopName        String
+  status          ReactivationRequestStatus  @default(pending)
+  rejectionReason String?
+  resolvedBy      String?
+
+  requestedAt DateTime @default(now())
+  resolvedAt  DateTime?
+
+  // ── Relations ──
+  shop  Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  owner User @relation(fields: [ownerUid], references: [id], onDelete: Cascade)
+
+  @@index([shopId])
+  @@index([status])
+  @@map("reactivation_requests")
+}
+
+/// Refund request — student requests, shop/admin resolves
+model RefundRequest {
+  id               String              @id @default(cuid())
+  orderId          String              @unique
+  studentId        String
+  shopId           String
+  reason           String
+  status           RefundRequestStatus @default(PENDING_SHOP)
+  refundAmount     Float?
+  razorpayRefundId String?
+
+  // Response tracking
+  shopResponse   String?
+  adminNote      String?
+  resolvedBy     String?
+
+  // Timestamps
+  studentRequestedAt DateTime @default(now())
+  shopRespondedAt    DateTime?
+  adminResolvedAt    DateTime?
+
+  // ── Relations ──
+  order   Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  student User  @relation("RefundStudent", fields: [studentId], references: [id], onDelete: Cascade)
+  shop    Shop  @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@index([studentId])
+  @@index([shopId])
+  @@index([status])
+  @@map("refund_requests")
+}
+
+/// Earnings report metadata (the actual report files are stored in S3/R2)
+model EarningsReport {
+  id            String @id @default(cuid())
+  type          String
+  startDate     String
+  endDate       String
+  totalOrders   Int    @default(0)
+  totalRevenue  Float  @default(0)
+  totalBaseFees Float  @default(0)
+  totalPageCosts Float @default(0)
+  storagePath   String
+  downloadUrl   String
+  generatedBy   String
+
+  generatedAt DateTime @default(now())
+
+  @@map("earnings_reports")
+}
