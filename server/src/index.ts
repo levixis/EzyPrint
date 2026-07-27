@@ -73,7 +73,7 @@ const startServer = async () => {
     await prisma.$connect();
     console.log('✅ Database connected successfully');
 
-    app.listen(env.PORT, () => {
+    const server = app.listen(env.PORT, () => {
       console.log(`
   ┌─────────────────────────────────────────┐
   │                                         │
@@ -87,21 +87,37 @@ const startServer = async () => {
   └─────────────────────────────────────────┘
       `);
     });
+
+    // ── Graceful Shutdown ──
+    // When Railway/Render sends SIGTERM (container restart, deploy, etc.),
+    // we stop accepting new connections but let in-flight requests finish.
+    // This prevents webhook processing from being killed mid-transaction.
+    const shutdown = async (signal: string) => {
+      console.log(`\n🛑 ${signal} received — shutting down gracefully...`);
+
+      // Stop accepting new connections, wait for in-flight to finish
+      server.close(async () => {
+        console.log('  ✓ All in-flight requests completed');
+        await prisma.$disconnect();
+        console.log('  ✓ Database disconnected');
+        process.exit(0);
+      });
+
+      // Force kill after 30 seconds if requests don't finish
+      setTimeout(() => {
+        console.error('  ✗ Forced shutdown after 30s timeout');
+        process.exit(1);
+      }, 30_000);
+    };
+
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+
   } catch (error) {
     console.error('💥 Failed to start server:', error);
     process.exit(1);
   }
 };
-
-// Graceful shutdown
-const shutdown = async () => {
-  console.log('\n🛑 Shutting down gracefully...');
-  await prisma.$disconnect();
-  process.exit(0);
-};
-
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
 
 startServer();
 

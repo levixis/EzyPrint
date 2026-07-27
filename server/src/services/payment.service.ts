@@ -5,18 +5,14 @@ import { ApiError } from '../utils/ApiError';
 import { env } from '../config/env';
 
 /**
- * Payment Service — Razorpay integration for order payments.
+ * Payment Service — Razorpay integration with production-grade safety.
  *
- * Flow (interview-ready):
- * 1. Student creates an order → status: PENDING_PAYMENT
- * 2. Frontend calls createPaymentOrder() → gets Razorpay order_id
- * 3. Frontend opens Razorpay checkout with that order_id
- * 4. After payment, frontend sends signature to verifyPayment()
- * 5. We verify the signature using HMAC SHA-256 with our secret
- * 6. If valid → update order to PENDING_APPROVAL + record payment IDs
- *
- * Security: The signature verification ensures the payment came from
- * Razorpay and wasn't tampered with by the client.
+ * Implements three critical upgrades:
+ *   A. WebhookEvent idempotency — log raw payload, dedup on event.id,
+ *      process ledger in same transaction as marking processed.
+ *   B. Reconciliation — poll Razorpay API for stuck "pending" orders.
+ *   C. Order-creation idempotency — prevent double-charge when student
+ *      retries payment during the reconciliation gap window.
  */
 
 // ── Razorpay Client (lazy-initialized) ──
@@ -50,30 +46,45 @@ interface CreatePaymentResult {
 /**
  * Create a Razorpay payment order for an existing EzyPrint order.
  *
- * The student must own the order, and it must be in PENDING_PAYMENT status.
+ * Upgrade C (Order-creation idempotency):
+ * If the student already has a Razorpay order for this EzyPrint order
+ * (e.g., they refreshed the page, or hit "Pay" twice), we return
+ * the existing Razorpay order instead of creating a duplicate.
+ * This prevents double-charge during the reconciliation gap window.
  */
 export async function createPaymentOrder(
   orderId: string,
   userId: string
 ): Promise<CreatePaymentResult> {
-  // Fetch the order
   const order = await prisma.order.findUnique({ where: { id: orderId } });
   if (!order) throw ApiError.notFound('Order not found');
   if (order.userId !== userId) throw ApiError.forbidden('This is not your order');
+
+  // ── Upgrade C: Idempotency on order-creation ──
+  // If a Razorpay order already exists for this order, return it.
+  // This prevents the double-charge scenario where a student retries
+  // payment while reconciliation hasn't caught up yet.
+  if (order.razorpayOrderId && order.status === 'PENDING_PAYMENT') {
+    return {
+      razorpayOrderId: order.razorpayOrderId,
+      amount: Math.round(order.totalPrice * 100),
+      currency: 'INR',
+      orderId: orderId,
+      keyId: env.RAZORPAY_KEY_ID,
+    };
+  }
+
   if (order.status !== 'PENDING_PAYMENT') {
     throw ApiError.badRequest(`Order is in ${order.status} status, not PENDING_PAYMENT`);
   }
 
-  // Amount in paise (Razorpay uses smallest currency unit)
   const amountInPaise = Math.round(order.totalPrice * 100);
-
   if (amountInPaise < 100) {
     throw ApiError.badRequest('Minimum order amount is ₹1');
   }
 
   const razorpay = getRazorpay();
 
-  // Create Razorpay order
   const rpOrder = await razorpay.orders.create({
     amount: amountInPaise,
     currency: 'INR',
@@ -85,7 +96,6 @@ export async function createPaymentOrder(
     },
   });
 
-  // Save Razorpay order ID to our order
   await prisma.order.update({
     where: { id: orderId },
     data: {
@@ -104,7 +114,7 @@ export async function createPaymentOrder(
 }
 
 // ────────────────────────────────────────────────────────────
-// VERIFY PAYMENT
+// VERIFY PAYMENT (client-side callback)
 // ────────────────────────────────────────────────────────────
 
 interface VerifyPaymentInput {
@@ -117,11 +127,9 @@ interface VerifyPaymentInput {
 /**
  * Verify Razorpay payment signature and update order status.
  *
- * Signature verification formula:
- *   generated_signature = HMAC_SHA256(razorpay_order_id + "|" + razorpay_payment_id, key_secret)
- *   if generated_signature === razorpay_signature → payment is authentic
- *
- * This prevents the client from faking a successful payment.
+ * Upgrade C (continued): If the order is already PENDING_APPROVAL
+ * (i.e., the webhook beat the client callback), return success
+ * idempotently instead of throwing an error.
  */
 export async function verifyPayment(
   input: VerifyPaymentInput,
@@ -129,15 +137,20 @@ export async function verifyPayment(
 ) {
   const { orderId, razorpayPaymentId, razorpayOrderId, razorpaySignature } = input;
 
-  // Fetch order
   const order = await prisma.order.findUnique({ where: { id: orderId } });
   if (!order) throw ApiError.notFound('Order not found');
   if (order.userId !== userId) throw ApiError.forbidden('This is not your order');
+
+  // ── Upgrade C: Idempotent verify ──
+  // If the webhook already processed this payment, return success.
+  if (order.status === 'PENDING_APPROVAL' && order.razorpayPaymentId === razorpayPaymentId) {
+    return order;
+  }
+
   if (order.status !== 'PENDING_PAYMENT') {
     throw ApiError.badRequest('Order is not awaiting payment');
   }
 
-  // Verify that the razorpayOrderId matches what we stored
   if (order.razorpayOrderId !== razorpayOrderId) {
     throw ApiError.badRequest('Razorpay order ID mismatch');
   }
@@ -150,7 +163,6 @@ export async function verifyPayment(
     .digest('hex');
 
   if (expectedSignature !== razorpaySignature) {
-    // Payment verification failed — mark as PAYMENT_FAILED
     await prisma.order.update({
       where: { id: orderId },
       data: {
@@ -161,7 +173,6 @@ export async function verifyPayment(
     throw ApiError.badRequest('Payment verification failed — signature mismatch');
   }
 
-  // Payment verified! Update order status
   const updatedOrder = await prisma.order.update({
     where: { id: orderId },
     data: {
@@ -175,24 +186,30 @@ export async function verifyPayment(
 }
 
 // ────────────────────────────────────────────────────────────
-// WEBHOOK (Razorpay server-to-server callback)
+// WEBHOOK — Upgrade A: Idempotent, logged, transactional
 // ────────────────────────────────────────────────────────────
 
 /**
- * Handle Razorpay webhook events.
+ * Handle Razorpay webhook events with production-grade safety.
  *
- * Razorpay sends a POST to our webhook URL with payment events.
- * We verify the webhook signature using the webhook secret.
+ * The flow is:
+ *   1. Verify HMAC signature (reject fakes before any DB work)
+ *   2. Extract event.id — this is Razorpay's unique event identifier
+ *   3. INSERT into WebhookEvent with unique constraint on eventId
+ *      - If duplicate → skip (idempotent)
+ *   4. Process business logic (update order status)
+ *   5. Mark WebhookEvent as processed in the SAME transaction
+ *   6. Return 200 to Razorpay immediately
  *
- * This is a fallback — if the client-side verification fails or
- * the user closes the browser, the webhook still processes the payment.
+ * If step 4 crashes, the WebhookEvent exists with processed=false.
+ * The reconciliation job (Upgrade B) will pick it up.
  */
 export async function handleWebhook(
   rawBody: string,
   signature: string,
   webhookSecret: string
 ) {
-  // Verify webhook signature
+  // Step 1: Verify signature BEFORE any DB work
   const expectedSignature = crypto
     .createHmac('sha256', webhookSecret)
     .update(rawBody)
@@ -203,28 +220,91 @@ export async function handleWebhook(
   }
 
   const event = JSON.parse(rawBody);
+  const eventId = event.id; // Razorpay's unique event ID
+  const eventType = event.event;
 
-  switch (event.event) {
+  if (!eventId) {
+    throw ApiError.badRequest('Webhook payload missing event.id');
+  }
+
+  // Step 2: Check idempotency — has this event already been processed?
+  const existing = await prisma.webhookEvent.findUnique({
+    where: { eventId },
+  });
+
+  if (existing?.processed) {
+    // Already processed — return 200 idempotently
+    return { received: true, status: 'already_processed' };
+  }
+
+  // Step 3: Log the raw event (even if processing fails later)
+  const rpOrderId = event.payload?.payment?.entity?.order_id || null;
+
+  if (!existing) {
+    await prisma.webhookEvent.create({
+      data: {
+        source: 'razorpay',
+        eventId,
+        eventType,
+        razorpayOrderId: rpOrderId,
+        payload: event,
+      },
+    });
+  }
+
+  // Step 4+5: Process and mark as processed in a single transaction
+  try {
+    await processWebhookEvent(eventType, event, eventId);
+  } catch (error) {
+    // Log the error but still return 200 to Razorpay so it stops retrying.
+    // The reconciliation job will pick up unprocessed events.
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    await prisma.webhookEvent.update({
+      where: { eventId },
+      data: { processingError: errorMessage },
+    });
+    console.error(`⚠️ Webhook processing failed for event ${eventId}:`, errorMessage);
+    return { received: true, status: 'processing_failed' };
+  }
+
+  return { received: true, status: 'processed' };
+}
+
+/**
+ * Process a single webhook event. Called from both the webhook handler
+ * and the reconciliation job. Uses a Prisma transaction to atomically
+ * update the order AND mark the webhook as processed.
+ */
+async function processWebhookEvent(eventType: string, event: any, eventId: string) {
+  switch (eventType) {
     case 'payment.captured': {
       const payment = event.payload.payment.entity;
       const rpOrderId = payment.order_id;
       const rpPaymentId = payment.id;
 
-      // Find order by Razorpay order ID
-      const order = await prisma.order.findFirst({
-        where: { razorpayOrderId: rpOrderId },
-      });
-
-      if (order && order.status === 'PENDING_PAYMENT') {
-        await prisma.order.update({
-          where: { id: order.id },
-          data: {
-            status: 'PENDING_APPROVAL',
-            razorpayPaymentId: rpPaymentId,
-            paymentVerifiedVia: 'webhook',
-          },
+      await prisma.$transaction(async (tx) => {
+        const order = await tx.order.findFirst({
+          where: { razorpayOrderId: rpOrderId },
         });
-      }
+
+        // Only process if order exists and is still pending payment
+        if (order && order.status === 'PENDING_PAYMENT') {
+          await tx.order.update({
+            where: { id: order.id },
+            data: {
+              status: 'PENDING_APPROVAL',
+              razorpayPaymentId: rpPaymentId,
+              paymentVerifiedVia: 'webhook',
+            },
+          });
+        }
+
+        // Mark webhook as processed (inside the same transaction)
+        await tx.webhookEvent.update({
+          where: { eventId },
+          data: { processed: true, processedAt: new Date() },
+        });
+      });
       break;
     }
 
@@ -232,26 +312,134 @@ export async function handleWebhook(
       const payment = event.payload.payment.entity;
       const rpOrderId = payment.order_id;
 
-      const order = await prisma.order.findFirst({
-        where: { razorpayOrderId: rpOrderId },
-      });
-
-      if (order && order.status === 'PENDING_PAYMENT') {
-        await prisma.order.update({
-          where: { id: order.id },
-          data: {
-            status: 'PAYMENT_FAILED',
-            paymentVerifiedVia: 'webhook_failed',
-          },
+      await prisma.$transaction(async (tx) => {
+        const order = await tx.order.findFirst({
+          where: { razorpayOrderId: rpOrderId },
         });
-      }
+
+        if (order && order.status === 'PENDING_PAYMENT') {
+          await tx.order.update({
+            where: { id: order.id },
+            data: {
+              status: 'PAYMENT_FAILED',
+              paymentVerifiedVia: 'webhook_failed',
+            },
+          });
+        }
+
+        await tx.webhookEvent.update({
+          where: { eventId },
+          data: { processed: true, processedAt: new Date() },
+        });
+      });
       break;
     }
 
-    default:
-      // Ignore other events
+    default: {
+      // Unknown event type — mark as processed so we don't retry it
+      await prisma.webhookEvent.update({
+        where: { eventId },
+        data: { processed: true, processedAt: new Date() },
+      });
       break;
+    }
+  }
+}
+
+// ────────────────────────────────────────────────────────────
+// RECONCILIATION — Upgrade B: The safety net
+// ────────────────────────────────────────────────────────────
+
+/**
+ * Reconcile stuck payments by polling Razorpay's API.
+ *
+ * This is the PULL mechanism. Webhooks are the PUSH mechanism.
+ * Together they ensure no payment is ever lost.
+ *
+ * Scans for orders stuck in PENDING_PAYMENT with a razorpayOrderId
+ * older than `thresholdMinutes`. For each, queries Razorpay's Orders
+ * API for the ground truth. If Razorpay says "paid", we fulfill it.
+ *
+ * Called by: a cron service hitting POST /api/v1/payments/reconcile
+ */
+export async function reconcilePayments(thresholdMinutes: number = 15) {
+  const threshold = new Date(Date.now() - thresholdMinutes * 60 * 1000);
+
+  // Find orders stuck in PENDING_PAYMENT with a Razorpay order ID
+  // that were created more than `thresholdMinutes` ago
+  const stuckOrders = await prisma.order.findMany({
+    where: {
+      status: 'PENDING_PAYMENT',
+      razorpayOrderId: { not: null },
+      paymentAttemptedAt: { lt: threshold },
+    },
+    select: {
+      id: true,
+      razorpayOrderId: true,
+      totalPrice: true,
+    },
+  });
+
+  if (stuckOrders.length === 0) {
+    return { reconciled: 0, checked: 0 };
   }
 
-  return { received: true };
+  const razorpay = getRazorpay();
+  let reconciled = 0;
+
+  for (const order of stuckOrders) {
+    try {
+      // Ask Razorpay: "What's the actual status of this order?"
+      const rpOrder = await razorpay.orders.fetch(order.razorpayOrderId!);
+
+      if (rpOrder.status === 'paid') {
+        // Razorpay says paid but our DB says pending — the webhook was missed.
+        // Fetch the payment details to get the payment ID
+        const payments = await razorpay.orders.fetchPayments(order.razorpayOrderId!);
+        const capturedPayment = (payments as any).items?.find(
+          (p: any) => p.status === 'captured'
+        );
+
+        if (capturedPayment) {
+          await prisma.order.update({
+            where: { id: order.id },
+            data: {
+              status: 'PENDING_APPROVAL',
+              razorpayPaymentId: capturedPayment.id,
+              paymentVerifiedVia: 'reconciliation',
+            },
+          });
+          reconciled++;
+          console.log(`🔄 Reconciled order ${order.id} — payment ${capturedPayment.id}`);
+        }
+      }
+    } catch (error) {
+      // Don't let one failed reconciliation kill the whole batch
+      console.error(`❌ Reconciliation failed for order ${order.id}:`, error);
+    }
+  }
+
+  // Also retry any unprocessed webhook events
+  const unprocessedEvents = await prisma.webhookEvent.findMany({
+    where: {
+      processed: false,
+      createdAt: { lt: threshold },
+    },
+  });
+
+  for (const webhookEvent of unprocessedEvents) {
+    try {
+      const payload = webhookEvent.payload as any;
+      await processWebhookEvent(webhookEvent.eventType, payload, webhookEvent.eventId);
+      console.log(`🔄 Reprocessed webhook event ${webhookEvent.eventId}`);
+    } catch (error) {
+      console.error(`❌ Failed to reprocess webhook ${webhookEvent.eventId}:`, error);
+    }
+  }
+
+  return {
+    checked: stuckOrders.length,
+    reconciled,
+    retriedWebhooks: unprocessedEvents.length,
+  };
 }

@@ -627,6 +627,30 @@ model RefundRequest {
   @@map("refund_requests")
 }
 
+/// Webhook event log — Upgrade A: idempotent, auditable webhook processing.
+///
+/// Every incoming Razorpay webhook is logged here BEFORE any business logic runs.
+/// The unique eventId constraint prevents double-processing.
+/// If the server crashes mid-processing, unprocessed events can be replayed
+/// via the reconciliation job (Upgrade B).
+model WebhookEvent {
+  id              String   @id @default(cuid())
+  source          String   // 'razorpay'
+  eventId         String   @unique // Razorpay's event.id — dedup key
+  eventType       String   // 'payment.captured', 'payment.failed', etc.
+  razorpayOrderId String?  // For quick lookups during reconciliation
+  payload         Json     // Full raw webhook payload
+  processed       Boolean  @default(false)
+  processingError String?  // Error message if processing failed
+  processedAt     DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([processed, createdAt])
+  @@index([razorpayOrderId])
+  @@map("webhook_events")
+}
+
 /// Earnings report metadata (the actual report files are stored in S3/R2)
 model EarningsReport {
   id            String @id @default(cuid())
