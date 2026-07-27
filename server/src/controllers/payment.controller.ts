@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import * as paymentService from '../services/payment.service';
 import { ApiError } from '../utils/ApiError';
+import { env } from '../config/env';
 
 /**
  * Payment Controller — Razorpay payment flow + reconciliation.
@@ -78,7 +79,7 @@ export async function webhook(req: Request, res: Response, next: NextFunction) {
     const signature = req.headers['x-razorpay-signature'] as string;
     if (!signature) throw ApiError.badRequest('Missing webhook signature');
 
-    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET || '';
+    const webhookSecret = env.RAZORPAY_WEBHOOK_SECRET;
     if (!webhookSecret) {
       // If no webhook secret configured, just acknowledge
       return res.json({ received: true });

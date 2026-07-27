@@ -17,7 +17,7 @@ export async function listShops(req: Request, res: Response, next: NextFunction)
 
 export async function getShop(req: Request, res: Response, next: NextFunction) {
   try {
-    const shop = await shopService.getShopById(req.params.shopId);
+    const shop = await shopService.getShopById(req.params.shopId as string);
     res.json({ success: true, data: { shop } });
   } catch (error) { next(error); }
 }
@@ -26,7 +26,7 @@ export async function updateShopSettings(req: Request, res: Response, next: Next
   try {
     if (!req.user) throw ApiError.unauthorized();
     const shop = await shopService.updateShopSettings(
-      req.params.shopId,
+      req.params.shopId as string,
       req.user.userId,
       req.body
     );
@@ -36,7 +36,7 @@ export async function updateShopSettings(req: Request, res: Response, next: Next
 
 export async function approveShop(req: Request, res: Response, next: NextFunction) {
   try {
-    const shop = await shopService.approveShop(req.params.shopId);
+    const shop = await shopService.approveShop(req.params.shopId as string);
     res.json({ success: true, message: 'Shop approved', data: { shop } });
   } catch (error) { next(error); }
 }
@@ -45,8 +45,8 @@ export async function archiveShop(req: Request, res: Response, next: NextFunctio
   try {
     const { action } = req.body; // 'archive' or 'unarchive'
     const shop = action === 'unarchive'
-      ? await shopService.unarchiveShop(req.params.shopId)
-      : await shopService.archiveShop(req.params.shopId);
+      ? await shopService.unarchiveShop(req.params.shopId as string)
+      : await shopService.archiveShop(req.params.shopId as string);
     res.json({ success: true, message: `Shop ${action || 'archive'}d`, data: { shop } });
   } catch (error) { next(error); }
 }
@@ -54,7 +54,7 @@ export async function archiveShop(req: Request, res: Response, next: NextFunctio
 export async function getAggregate(req: Request, res: Response, next: NextFunction) {
   try {
     if (!req.user) throw ApiError.unauthorized();
-    const aggregate = await shopService.getShopAggregate(req.params.shopId, req.user.userId);
+    const aggregate = await shopService.getShopAggregate(req.params.shopId as string, req.user.userId);
     res.json({ success: true, data: { aggregate } });
   } catch (error) { next(error); }
 }

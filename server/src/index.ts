@@ -103,11 +103,13 @@ const startServer = async () => {
         process.exit(0);
       });
 
-      // Force kill after 30 seconds if requests don't finish
+      // Force kill after 30 seconds if requests don't finish.
+      // .unref() ensures this timer doesn't prevent clean exit
+      // if all requests finish before the timeout.
       setTimeout(() => {
         console.error('  ✗ Forced shutdown after 30s timeout');
         process.exit(1);
-      }, 30_000);
+      }, 30_000).unref();
     };
 
     process.on('SIGINT', () => shutdown('SIGINT'));
@@ -120,5 +122,23 @@ const startServer = async () => {
 };
 
 startServer();
+
+// ── Fix 9: Process-level error handlers ──
+// Catch errors thrown outside Express request handlers (e.g., in
+// setTimeout, event listeners, background reconciliation jobs).
+// Without these, the process crashes silently.
+process.on('unhandledRejection', (reason: unknown) => {
+  console.error('💥 UNHANDLED REJECTION:', reason);
+  // Don't crash — log and let the server continue.
+  // In a production observability stack, this would fire an alert.
+});
+
+process.on('uncaughtException', (error: Error) => {
+  console.error('💥 UNCAUGHT EXCEPTION:', error);
+  // Uncaught exceptions leave the process in an undefined state.
+  // Log the error and exit — the container orchestrator (Railway)
+  // will restart the process automatically.
+  process.exit(1);
+});
 
 export default app;

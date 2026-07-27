@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import * as orderService from '../services/order.service';
 import { ApiError } from '../utils/ApiError';
+import type { OrderStatus } from '@prisma/client';
 
 export async function createOrder(req: Request, res: Response, next: NextFunction) {
   try {
@@ -19,7 +20,7 @@ export async function listOrders(req: Request, res: Response, next: NextFunction
     if (!req.user) throw ApiError.unauthorized();
     const { status, page, limit } = req.query;
     const options = {
-      status: status as any,
+      status: status as OrderStatus | undefined,
       page: page ? parseInt(page as string, 10) : undefined,
       limit: limit ? parseInt(limit as string, 10) : undefined,
     };
@@ -41,7 +42,7 @@ export async function getOrder(req: Request, res: Response, next: NextFunction) 
   try {
     if (!req.user) throw ApiError.unauthorized();
     const order = await orderService.getOrderById(
-      req.params.orderId,
+      req.params.orderId as string,
       req.user.userId,
       req.user.userType
     );
@@ -56,7 +57,7 @@ export async function updateStatus(req: Request, res: Response, next: NextFuncti
     if (!status) throw ApiError.badRequest('Status is required');
 
     const order = await orderService.updateOrderStatus(
-      req.params.orderId,
+      req.params.orderId as string,
       status,
       req.user.userId,
       req.user.userType,
@@ -70,7 +71,7 @@ export async function listAllOrders(req: Request, res: Response, next: NextFunct
   try {
     const { status, shopId, page, limit } = req.query;
     const result = await orderService.listAllOrders({
-      status: status as any,
+      status: status as OrderStatus | undefined,
       shopId: shopId as string,
       page: page ? parseInt(page as string, 10) : undefined,
       limit: limit ? parseInt(limit as string, 10) : undefined,

@@ -29,18 +29,8 @@ export async function register(req: Request, res: Response, next: NextFunction) 
   try {
     const { email, password, name, type, shopName, shopAddress } = req.body;
 
-    // Basic input validation (Zod schema would handle this in production)
-    if (!email || !password || !name || !type) {
-      throw ApiError.badRequest('Email, password, name, and type are required');
-    }
-
-    if (!['STUDENT', 'SHOP_OWNER'].includes(type)) {
-      throw ApiError.badRequest('Type must be STUDENT or SHOP_OWNER');
-    }
-
-    if (type === 'SHOP_OWNER' && (!shopName || !shopAddress)) {
-      throw ApiError.badRequest('Shop name and address are required for shop owners');
-    }
+    // Zod schema (validate middleware) already validates all fields.
+    // No manual checks needed here.
 
     const result = await registerWithEmail(
       { email, password, name, type, shopName, shopAddress },

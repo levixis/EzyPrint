@@ -18,7 +18,7 @@ export async function getNotifications(req: Request, res: Response, next: NextFu
 export async function markAsRead(req: Request, res: Response, next: NextFunction) {
   try {
     if (!req.user) throw ApiError.unauthorized();
-    const notification = await notifService.markAsRead(req.params.notificationId, req.user.userId);
+    const notification = await notifService.markAsRead(req.params.notificationId as string, req.user.userId);
     res.json({ success: true, data: { notification } });
   } catch (error) { next(error); }
 }

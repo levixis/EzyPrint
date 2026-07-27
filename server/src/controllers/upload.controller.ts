@@ -82,7 +82,7 @@ export async function uploadMultiple(req: Request, res: Response, next: NextFunc
  */
 export async function getDownloadUrl(req: Request, res: Response, next: NextFunction) {
   try {
-    const storageKey = decodeURIComponent(req.params.storageKey);
+    const storageKey = decodeURIComponent(req.params.storageKey as string);
     if (!storageKey) throw ApiError.badRequest('Storage key is required');
 
     const downloadInfo = await storageService.getDownloadUrl(storageKey);
@@ -142,7 +142,7 @@ export async function downloadFile(req: Request, res: Response, next: NextFuncti
  */
 export async function deleteFileHandler(req: Request, res: Response, next: NextFunction) {
   try {
-    const storageKey = decodeURIComponent(req.params.storageKey);
+    const storageKey = decodeURIComponent(req.params.storageKey as string);
     if (!storageKey) throw ApiError.badRequest('Storage key is required');
 
     await storageService.deleteFile(storageKey);

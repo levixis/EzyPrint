@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import * as userService from '../services/user.service';
 import { ApiError } from '../utils/ApiError';
+import type { UserType } from '@prisma/client';
 
 export async function getProfile(req: Request, res: Response, next: NextFunction) {
   try {
@@ -27,9 +28,10 @@ export async function listUsers(req: Request, res: Response, next: NextFunction)
     const result = await userService.listUsers({
       page: page ? parseInt(page as string, 10) : undefined,
       limit: limit ? parseInt(limit as string, 10) : undefined,
-      type: type as any,
+      type: type as UserType | undefined,
       search: search as string,
     });
     res.json({ success: true, data: result });
   } catch (error) { next(error); }
 }
+

@@ -35,8 +35,8 @@ export interface TokenPair {
  */
 export function generateAccessToken(payload: TokenPayload): string {
   return jwt.sign(payload, env.JWT_ACCESS_SECRET, {
-    expiresIn: env.JWT_ACCESS_EXPIRES_IN,
-  });
+    expiresIn: env.JWT_ACCESS_EXPIRES_IN as string & { __brand?: never },
+  } as jwt.SignOptions);
 }
 
 /**

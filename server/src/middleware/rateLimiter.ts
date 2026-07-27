@@ -43,3 +43,20 @@ export const sensitiveLimiter = rateLimit({
     message: 'Too many requests for this sensitive operation. Please try again later.',
   },
 });
+
+/**
+ * Webhook limiter — 60 requests per minute per IP.
+ * Razorpay won't exceed this for legitimate traffic.
+ * Prevents attackers from flooding the webhook endpoint with fake payloads
+ * that burn CPU on HMAC verification + DB lookups before rejection.
+ */
+export const webhookLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: 'Too many webhook requests.',
+  },
+});

@@ -178,6 +178,18 @@ interface GoogleUserInfo {
   profilePhotoUrl?: string;
 }
 
+/** Shape of Google's tokeninfo response */
+interface GoogleTokenInfoResponse {
+  sub: string;      // Google user ID
+  email: string;
+  name?: string;
+  picture?: string;
+  email_verified?: string;
+  aud?: string;     // Client ID the token was issued to
+  iss?: string;     // Issuer
+  exp?: string;     // Expiry timestamp
+}
+
 /**
  * Verify a Google ID token and extract user info.
  *
@@ -195,7 +207,7 @@ async function verifyGoogleToken(idToken: string): Promise<GoogleUserInfo> {
     throw ApiError.unauthorized('Invalid Google token');
   }
 
-  const payload = await response.json();
+  const payload = (await response.json()) as GoogleTokenInfoResponse;
 
   // Validate required fields
   if (!payload.sub || !payload.email) {
