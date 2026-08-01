@@ -124,6 +124,10 @@ export const env = {
   PUSHER_SECRET: requireSecret('PUSHER_SECRET', process.env.PUSHER_SECRET, ''),
   PUSHER_CLUSTER: process.env.PUSHER_CLUSTER || 'ap2',
 
+  // ── Student Pass ──
+  /** Price of a 30-day Student Pass, in paise. */
+  STUDENT_PASS_PRICE_PAISE: intFromEnv('STUDENT_PASS_PRICE_PAISE', 4900),
+
   // ── Settlement ──
   /** Hours an earning stays in "clearing" before becoming withdrawable. */
   SETTLEMENT_DELAY_HOURS: intFromEnv('SETTLEMENT_DELAY_HOURS', 24),

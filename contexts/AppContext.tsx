@@ -976,10 +976,21 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     if (currentUser.type !== UserType.STUDENT) {
       return { success: false, message: "Only students can upgrade to Student Pass." };
     }
-    // Optimistic update — actual pass activation happens after payment verification on server
-    setCurrentUserInternal(prev => prev ? { ...prev, hasStudentPass: true } : null);
-    addNotification({ message: "Congratulations! You have upgraded to Student Pass.", type: 'success', targetUserId: currentUser.id });
-    return { success: true };
+    // The server activated the pass during payment verification; re-read the
+    // profile so the client reflects what was actually persisted. Setting the
+    // flag locally without this was why a bought pass disappeared on refresh —
+    // and why pricing kept charging the base fee, since the server never knew.
+    try {
+      const me = await userApi.getProfile();
+      setCurrentUserInternal(prev => prev ? { ...prev, ...me } : null);
+      if (!me.hasStudentPass) {
+        return { success: false, message: 'Payment went through but the pass is not active yet. Refresh in a moment, or contact support if it persists.' };
+      }
+      addNotification({ message: "Congratulations! You have upgraded to Student Pass.", type: 'success', targetUserId: currentUser.id });
+      return { success: true };
+    } catch (err: unknown) {
+      return { success: false, message: getErrorMessage(err) };
+    }
   };
 
   const cancelStudentPass = async (): Promise<{ success: boolean; message?: string }> => {

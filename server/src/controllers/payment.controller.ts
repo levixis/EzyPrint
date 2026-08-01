@@ -134,3 +134,41 @@ export async function reconcile(req: Request, res: Response, next: NextFunction)
     next(error);
   }
 }
+
+/**
+ * POST /api/v1/payments/pass/create-order
+ */
+export async function createStudentPassOrder(req: Request, res: Response, next: NextFunction) {
+  try {
+    if (!req.user) throw ApiError.unauthorized();
+    const result = await paymentService.createStudentPassOrder(req.user.userId);
+    res.status(201).json({ success: true, message: 'Student Pass order created', data: result });
+  } catch (error) {
+    next(error);
+  }
+}
+
+/**
+ * POST /api/v1/payments/pass/verify
+ */
+export async function verifyStudentPassPayment(req: Request, res: Response, next: NextFunction) {
+  try {
+    if (!req.user) throw ApiError.unauthorized();
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      throw ApiError.badRequest('razorpay_order_id, razorpay_payment_id and razorpay_signature are required');
+    }
+
+    const result = await paymentService.verifyStudentPassPayment(
+      req.user.userId,
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature
+    );
+
+    res.json({ success: true, message: 'Student Pass activated', data: result });
+  } catch (error) {
+    next(error);
+  }
+}

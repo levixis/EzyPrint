@@ -189,6 +189,20 @@ export const paymentApi = {
     orderId: string;
   }) => api.post<{ verified: boolean }>('/payments/verify', data),
 
+  /** Student Pass has no local order row, so it uses its own pair of endpoints. */
+  createPassOrder: () =>
+    api.post<{ razorpayOrderId: string; amount: number; currency: string; key: string }>(
+      '/payments/pass/create-order'
+    ),
+
+  verifyPass: (data: {
+    razorpay_order_id: string;
+    razorpay_payment_id: string;
+    razorpay_signature: string;
+  }) => api.post<{ hasStudentPass: boolean; studentPassActivatedAt: string | null }>(
+    '/payments/pass/verify', data
+  ),
+
   reconcile: () =>
     api.post<{ reconciled: number }>('/payments/reconcile'),
 };

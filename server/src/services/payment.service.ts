@@ -415,6 +415,19 @@ async function processWebhookEvent(eventType: string, event: any, eventId: strin
       const rpOrderId = payment.order_id;
       const rpPaymentId = payment.id;
 
+      // A Student Pass payment has no local order to match — the buyer is
+      // identified by the notes set at creation. This is the path that saves a
+      // student who closed the browser before the verify call ran: they are
+      // charged either way, so the pass must not depend on the tab staying open.
+      if (payment.notes?.subscription_type === 'student_pass' && payment.notes?.userId) {
+        await activateStudentPass(payment.notes.userId, rpPaymentId);
+        await prisma.webhookEvent.update({
+          where: { eventId },
+          data: { processed: true, processedAt: new Date() },
+        });
+        break;
+      }
+
       await prisma.$transaction(async (tx) => {
         const order = await tx.order.findFirst({
           where: { razorpayOrderId: rpOrderId },
@@ -705,5 +718,125 @@ export async function reconcilePayments(thresholdMinutes: number = 15) {
     checked: stuckOrders.length,
     reconciled,
     retriedWebhooks: unprocessedEvents.length,
+  };
+}
+
+// ────────────────────────────────────────────────────────────
+// STUDENT PASS
+// ────────────────────────────────────────────────────────────
+
+/** How long a pass lasts. Mirrors isStudentPassActive in order.service.ts. */
+const PASS_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
+
+function passIsActive(hasPass: boolean, activatedAt: Date | null): boolean {
+  if (!hasPass || !activatedAt) return false;
+  return Date.now() < activatedAt.getTime() + PASS_DURATION_MS;
+}
+
+/**
+ * Create a Razorpay order for a Student Pass.
+ *
+ * Unlike a print order there is no local row to hang this off, so the receipt
+ * and notes carry the user id — that is what lets the webhook activate the pass
+ * if the student closes the browser before the verify call runs.
+ */
+export async function createStudentPassOrder(userId: string) {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { type: true, hasStudentPass: true, studentPassActivatedAt: true },
+  });
+  if (!user) throw ApiError.notFound('User not found');
+  if (user.type !== 'STUDENT') throw ApiError.forbidden('Only students can buy a Student Pass');
+
+  // Refusing rather than stacking: a second pass bought while one is live would
+  // silently reset the 30 days and lose the remainder the student paid for.
+  if (passIsActive(user.hasStudentPass, user.studentPassActivatedAt)) {
+    throw ApiError.badRequest('Your Student Pass is still active.');
+  }
+
+  const razorpay = getRazorpay();
+  const rpOrder = await razorpay.orders.create({
+    amount: env.STUDENT_PASS_PRICE_PAISE,
+    currency: 'INR',
+    // Unique per attempt: Razorpay rejects a duplicate receipt, and a retry
+    // after an abandoned checkout must not collide with the earlier attempt.
+    receipt: `pass_${userId.slice(-8)}_${Date.now()}`,
+    notes: {
+      userId,
+      subscription_type: 'student_pass',
+    },
+  });
+
+  return {
+    razorpayOrderId: rpOrder.id,
+    amount: env.STUDENT_PASS_PRICE_PAISE,
+    currency: 'INR',
+    key: env.RAZORPAY_KEY_ID,
+  };
+}
+
+/**
+ * Turn a paid pass payment into an active pass.
+ *
+ * Idempotent through `studentPassPaymentId`: re-running with the same payment
+ * id matches no row and changes nothing, so a verify call racing the webhook
+ * cannot grant two passes or move the expiry forward twice. A *different*
+ * payment id is allowed through, which is what makes renewal work.
+ *
+ * Returns whether this call was the one that activated it.
+ */
+export async function activateStudentPass(userId: string, paymentId: string): Promise<boolean> {
+  const activated = await prisma.user.updateMany({
+    where: { id: userId, studentPassPaymentId: { not: paymentId } },
+    data: {
+      hasStudentPass: true,
+      studentPassActivatedAt: new Date(),
+      studentPassPaymentId: paymentId,
+    },
+  });
+  return activated.count > 0;
+}
+
+/**
+ * Verify a Student Pass payment and activate the pass.
+ *
+ * The signature is checked against Razorpay's HMAC before anything is written,
+ * so a forged callback cannot grant a free pass.
+ */
+export async function verifyStudentPassPayment(
+  userId: string,
+  razorpayOrderId: string,
+  razorpayPaymentId: string,
+  razorpaySignature: string
+) {
+  const expected = crypto
+    .createHmac('sha256', env.RAZORPAY_KEY_SECRET)
+    .update(`${razorpayOrderId}|${razorpayPaymentId}`)
+    .digest('hex');
+
+  if (!signaturesMatch(expected, razorpaySignature)) {
+    throw ApiError.unauthorized('Invalid payment signature');
+  }
+
+  // Confirm with Razorpay that this order really belongs to this user and was
+  // actually paid. The signature proves the payload is authentic, not that the
+  // payer is who the request claims to be.
+  const razorpay = getRazorpay();
+  const rpOrder = await razorpay.orders.fetch(razorpayOrderId) as any;
+
+  if (rpOrder?.notes?.userId !== userId || rpOrder?.notes?.subscription_type !== 'student_pass') {
+    throw ApiError.forbidden('This payment does not belong to your Student Pass.');
+  }
+
+  await activateStudentPass(userId, razorpayPaymentId);
+
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { hasStudentPass: true, studentPassActivatedAt: true },
+  });
+
+  return {
+    hasStudentPass: user?.hasStudentPass ?? false,
+    studentPassActivatedAt: user?.studentPassActivatedAt ?? null,
   };
 }

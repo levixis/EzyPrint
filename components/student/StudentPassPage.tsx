@@ -55,7 +55,7 @@ const StudentPassPage: React.FC = () => {
         setErrorMessage('');
 
         try {
-            const data = await paymentApi.createOrder('student_pass');
+            const data = await paymentApi.createPassOrder();
 
             setStatusMessage('Opening payment gateway...');
 
@@ -82,11 +82,10 @@ const StudentPassPage: React.FC = () => {
             const verifyAndUpgrade = async (response: { razorpay_order_id: string; razorpay_payment_id: string; razorpay_signature: string }) => {
                 setStatusMessage('Verifying payment...');
                 try {
-                    await paymentApi.verify({
+                    await paymentApi.verifyPass({
                         razorpay_order_id: response.razorpay_order_id,
                         razorpay_payment_id: response.razorpay_payment_id,
                         razorpay_signature: response.razorpay_signature,
-                        orderId: 'student_pass',
                     });
                     await upgradeToStudentPass();
                 } catch (verifyError: unknown) {
