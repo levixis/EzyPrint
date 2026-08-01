@@ -1,0 +1,203 @@
+import { Prisma } from '@prisma/client';
+import { prisma } from '../utils/prisma';
+import { env } from '../config/env';
+import { createLedgerEntry } from './ledger.service';
+import { enqueueShopEvent, publishQueued } from './realtime.service';
+
+/**
+ * Settlement — how a shop's earnings mature into withdrawable money.
+ *
+ * Money moves through four visible stages:
+ *
+ *   in progress → clearing → available → paid out
+ *
+ * A student's payment sits in "in progress" (derived from live orders) until
+ * the shop fulfils the order. On COMPLETED the shop is credited: an
+ * ORDER_EARNING entry lands in "clearing" carrying an `availableAt` stamped at
+ * write time. The sweep below moves entries into "available" once that moment
+ * passes.
+ *
+ * Stamping `availableAt` up front is deliberate. The dashboard can then promise
+ * an exact time ("available Thursday, 6:00 AM") the instant the money is
+ * earned, instead of showing an opaque rolling window and leaving the owner to
+ * guess. Predictability is the thing partner dashboards consistently get asked
+ * for, and the sweep becomes a trivial `availableAt <= now` query.
+ */
+
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000; // IST is UTC+5:30 year-round, no DST.
+
+/**
+ * When money earned at `from` becomes withdrawable: at least
+ * SETTLEMENT_DELAY_HOURS later, rounded up to the next daily release hour.
+ */
+export function computeAvailableAt(from: Date = new Date()): Date {
+  const earliest = from.getTime() + env.SETTLEMENT_DELAY_HOURS * 60 * 60 * 1000;
+
+  // Shift into IST so "6 AM" means 6 AM where the shops actually are.
+  const ist = new Date(earliest + IST_OFFSET_MS);
+  const releaseSameDay = Date.UTC(
+    ist.getUTCFullYear(),
+    ist.getUTCMonth(),
+    ist.getUTCDate(),
+    env.SETTLEMENT_RELEASE_HOUR_IST,
+    0, 0, 0
+  ) - IST_OFFSET_MS;
+
+  return new Date(
+    releaseSameDay >= earliest
+      ? releaseSameDay
+      : releaseSameDay + 24 * 60 * 60 * 1000
+  );
+}
+
+/**
+ * Credit a shop for a fulfilled order.
+ *
+ * The shop earns the page cost; the platform keeps the base fee.
+ *
+ * Idempotency is structural, not checked-then-acted: `eventId` is a
+ * deterministic `earn:<orderId>` and `LedgerEntry.eventId` carries a unique
+ * constraint. Two concurrent completions — or a webhook redelivery racing a
+ * manual transition — cannot both credit, because the second insert violates
+ * the constraint inside its own transaction and rolls back. There is no window
+ * between a check and a write for a duplicate to slip through.
+ *
+ * Must be called with the transaction that moved the order to COMPLETED, so the
+ * credit and the status change commit or fail together.
+ */
+export async function creditOrderEarning(
+  tx: Prisma.TransactionClient,
+  order: { id: string; shopId: string; pageCost: number }
+): Promise<void> {
+  if (order.pageCost <= 0) return;
+
+  await createLedgerEntry(
+    {
+      shopId: order.shopId,
+      type: 'ORDER_EARNING',
+      amount: order.pageCost,
+      description: `Earnings for order #${order.id.slice(-6)}`,
+      counterparty: 'STUDENT',
+      createdBy: 'SYSTEM',
+      orderId: order.id,
+      eventId: `earn:${order.id}`,
+      availableAt: computeAvailableAt(),
+    },
+    tx
+  );
+}
+
+export interface SweepResult {
+  shopsSettled: number;
+  entriesSettled: number;
+  amountSettled: number;
+}
+
+/**
+ * Move matured earnings from clearing into available.
+ *
+ * Runs per shop in its own transaction so one shop's concurrent-update conflict
+ * cannot roll back every other shop's settlement.
+ */
+export async function runSettlementSweep(now: Date = new Date()): Promise<SweepResult> {
+  const due = await prisma.ledgerEntry.groupBy({
+    by: ['shopId'],
+    where: { status: 'PENDING', availableAt: { not: null, lte: now } },
+    _sum: { amount: true },
+    _count: { _all: true },
+  });
+
+  const result: SweepResult = { shopsSettled: 0, entriesSettled: 0, amountSettled: 0 };
+
+  for (const group of due) {
+    try {
+      const settled = await settleShop(group.shopId, now);
+      if (settled.entries > 0) {
+        result.shopsSettled += 1;
+        result.entriesSettled += settled.entries;
+        result.amountSettled += settled.amount;
+      }
+    } catch (error) {
+      // One shop failing must not abort the run; the next sweep retries it.
+      console.error(`[settlement] shop ${group.shopId} failed to settle:`, error);
+    }
+  }
+
+  return result;
+}
+
+async function settleShop(shopId: string, now: Date): Promise<{ entries: number; amount: number }> {
+  const outboxIds: string[] = [];
+
+  const outcome = await prisma.$transaction(async (tx) => {
+    const shop = await tx.shop.findUnique({ where: { id: shopId } });
+    if (!shop) return { entries: 0, amount: 0 };
+
+    const dueEntries = await tx.ledgerEntry.findMany({
+      where: { shopId, status: 'PENDING', availableAt: { not: null, lte: now } },
+      select: { id: true, amount: true, type: true },
+    });
+    if (dueEntries.length === 0) return { entries: 0, amount: 0 };
+
+    // Only earnings mature into withdrawable money. A PENDING payout
+    // reservation also lives in this table and must not be swept into the
+    // shop's available balance.
+    const earnings = dueEntries.filter(e => e.type === 'ORDER_EARNING');
+    if (earnings.length === 0) return { entries: 0, amount: 0 };
+
+    const total = earnings.reduce((sum, e) => sum + e.amount, 0);
+
+    // Never move more than is actually sitting in clearing — a refund may have
+    // drawn it down since these entries were written.
+    const movable = Math.min(total, shop.pendingBalance);
+
+    const marked = await tx.ledgerEntry.updateMany({
+      where: { id: { in: earnings.map(e => e.id) }, status: 'PENDING' },
+      data: { status: 'SETTLED', settledAt: now },
+    });
+    if (marked.count === 0) return { entries: 0, amount: 0 };
+
+    // Same compare-and-swap the ledger uses, so a settlement cannot race a
+    // payout or refund landing at the same moment.
+    const updated = await tx.shop.updateMany({
+      where: {
+        id: shopId,
+        financialVersion: shop.financialVersion,
+        pendingBalance: { gte: movable },
+      },
+      data: {
+        pendingBalance: { decrement: movable },
+        ledgerBalance: { increment: movable },
+        lastSettlementAt: now,
+        financialVersion: { increment: 1 },
+      },
+    });
+
+    if (updated.count === 0) {
+      // Roll back by throwing — the entries must not stay marked SETTLED if the
+      // money did not move.
+      throw new Error('Concurrent balance update during settlement');
+    }
+
+    const outboxId = await enqueueShopEvent(tx, {
+      shopId,
+      type: 'ledger.settled',
+      seq: shop.financialVersion + 1,
+      data: {
+        settledEntryIds: earnings.map(e => e.id),
+        amount: movable,
+        balances: {
+          clearing: shop.pendingBalance - movable,
+          available: shop.ledgerBalance + movable,
+          debt: shop.debtAmount,
+        },
+      },
+    });
+    outboxIds.push(outboxId);
+
+    return { entries: marked.count, amount: movable };
+  });
+
+  await publishQueued(outboxIds);
+  return outcome;
+}

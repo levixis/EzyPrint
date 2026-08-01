@@ -8,7 +8,12 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
+  // Pooled connection (Neon PgBouncer, the `-pooler` host) — used at runtime.
+  url       = env("DATABASE_URL")
+  // Direct connection (no PgBouncer) — used by `prisma migrate` only.
+  // PgBouncer in transaction mode cannot hold the session-level advisory locks
+  // migrations take, so DDL run through the pooler fails or deadlocks.
+  directUrl = env("DIRECT_URL")
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -37,7 +42,13 @@ enum OrderStatus {
   REFUNDED
 }
 
+/// Payout lifecycle.
+///
+/// IN_TRANSIT sits between approval and arrival: the transfer has been
+/// initiated but the shop's bank has not credited it yet. Without it, a shop
+/// owner sees "paid" and an unchanged bank balance, and reports missing money.
 enum PayoutStatus {
+  IN_TRANSIT
   PENDING
   PAID
   CONFIRMED
@@ -112,7 +123,9 @@ enum RefundRequestStatus {
   REJECTED_BY_SHOP
   ESCALATED_TO_ADMIN
   AUTO_ESCALATED
+  PROCESSING_REFUND
   RESOLVED_REFUNDED
+  REFUND_SETTLED_OFFLINE
   RESOLVED_DENIED
 }
 
@@ -197,14 +210,16 @@ model Shop {
   address      String
 
   // Pricing
-  bwPerPage    Float   @default(1)
-  colorPerPage Float   @default(3)
+  bwPerPage    Int   @default(100)
+  colorPerPage Int   @default(300)
 
   // Status
   isOpen       Boolean @default(false)
   isApproved   Boolean @default(false)
   isArchived   Boolean @default(false)
   isVerified   Boolean @default(false)
+  isRejected   Boolean @default(false)
+  rejectionReason String?
 
   // Contact info
   contactPhone    String?
@@ -213,9 +228,9 @@ model Shop {
   whatsappNumber  String?
 
   // Ledger balances (denormalized for fast reads)
-  pendingBalance   Float    @default(0)
-  ledgerBalance    Float    @default(0)
-  debtAmount       Float    @default(0)
+  pendingBalance   Int    @default(0)
+  ledgerBalance    Int    @default(0)
+  debtAmount       Int    @default(0)
   lastSettlementAt DateTime?
   financialVersion Int      @default(0)
 
@@ -266,9 +281,9 @@ model Order {
   endPage     Int?
 
   // Pricing breakdown
-  pageCost   Float @default(0)
-  baseFee    Float @default(0)
-  totalPrice Float @default(0)
+  pageCost   Int @default(0)
+  baseFee    Int @default(0)
+  totalPrice Int @default(0)
 
   // Order metadata
   shopNotes           String?
@@ -278,7 +293,10 @@ model Order {
   isPremiumOrder      Boolean @default(false)
 
   // Payment tracking
-  razorpayOrderId   String?
+  // razorpayOrderId is unique so the database itself rejects a second Razorpay
+  // order being attached to any EzyPrint order. Postgres permits many NULLs in
+  // a unique index, so unpaid orders are unaffected.
+  razorpayOrderId   String? @unique
   razorpayPaymentId String?
   paymentAttemptedAt DateTime?
   paymentVerifiedVia String?
@@ -286,7 +304,7 @@ model Order {
   // Refund tracking
   refundId                   String?
   refundStatus               String?
-  refundAmount               Float?
+  refundAmount               Int?
   refundedAt                 DateTime?
   refundError                String?
   refundInitiatedBy          String?
@@ -311,13 +329,14 @@ model Order {
   @@index([shopId])
   @@index([status])
   @@index([shopId, status])
-  @@index([razorpayOrderId])
+  @@index([status, paymentAttemptedAt])  // reconciliation sweep for stuck payments
   @@map("orders")
 }
 
 /// Individual file within a multi-file order
 model OrderFile {
   id            String     @id @default(cuid())
+  uploadId      String?    @unique // Idempotency key for file uploads
   orderId       String
   fileName      String
   fileType      String
@@ -411,9 +430,12 @@ model BankDetails {
 /// Audit log for bank detail access
 model BankAccessLog {
   id        String   @id @default(cuid())
+  shopId    String?
+  targetId  String?
   userId    String
   userRole  UserType
   action    String   // VIEW, EDIT, VERIFY
+  success   Boolean  @default(true)
   ip        String?
 
   createdAt DateTime @default(now())
@@ -430,7 +452,7 @@ model Payout {
   id             String       @id @default(cuid())
   shopId         String
   shopName       String
-  amount         Float
+  amount         Int
   status         PayoutStatus @default(PENDING)
   payoutOrderIds String[]     @default([])
   adminNote      String?
@@ -480,6 +502,7 @@ model Ticket {
   shop          Shop?           @relation("ShopTickets", fields: [shopId], references: [id], onDelete: SetNull)
   messages      TicketMessage[]
   statusHistory TicketStatusChange[]
+  attachments   TicketAttachment[]
 
   @@index([raisedBy])
   @@index([shopId])
@@ -525,6 +548,25 @@ model TicketStatusChange {
   @@map("ticket_status_changes")
 }
 
+/// Durable attachment records for tickets
+model TicketAttachment {
+  id              String   @id @default(cuid())
+  uploadId        String?  @unique // Idempotency key for file uploads
+  ticketId        String
+  storageKey      String
+  originalName    String
+  mimeType        String
+  sizeBytes       Int?
+  
+  createdAt       DateTime @default(now())
+
+  // ── Relations ──
+  ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId])
+  @@map("ticket_attachments")
+}
+
 /// Financial ledger entry for a shop — double-entry style
 model LedgerEntry {
   id           String             @id @default(cuid())
@@ -533,7 +575,7 @@ model LedgerEntry {
   orderId      String?
   type         LedgerEntryType
   status       LedgerEntryStatus  @default(PENDING)
-  amount       Float
+  amount       Int
   counterparty LedgerCounterparty
   description  String
   createdBy    LedgerCreatedBy    @default(SYSTEM)
@@ -541,13 +583,48 @@ model LedgerEntry {
   createdAt DateTime  @default(now())
   settledAt DateTime?
 
+  /// When this entry becomes withdrawable.
+  ///
+  /// Stamped when the entry is created rather than computed when the settlement
+  /// sweep runs, so the dashboard can promise the shop owner an exact date the
+  /// moment they earn the money instead of showing a vague rolling window.
+  availableAt DateTime?
+
   // ── Relations ──
   shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
 
   @@index([shopId])
   @@index([shopId, type, status])
   @@index([shopId, status])
+  @@index([status, availableAt])  // drives the settlement sweep
   @@map("ledger_entries")
+}
+
+/// Outbox for real-time events (Pusher).
+///
+/// Rows are written inside the same transaction as the ledger write they
+/// describe, so an event can never announce money movement that later rolled
+/// back, and a committed movement can never fail to be announced. A dispatcher
+/// publishes them after commit; the request path also publishes immediately for
+/// latency, leaving the dispatcher as the crash-recovery sweep.
+model RealtimeOutbox {
+  id      String @id @default(cuid())
+  channel String
+  event   String
+  payload Json
+
+  /// Shop.financialVersion at write time — monotonic per shop, so a client can
+  /// discard events that arrive out of order and detect gaps.
+  seq Int
+
+  publishedAt DateTime?
+  attempts    Int       @default(0)
+  lastError   String?
+
+  createdAt DateTime @default(now())
+
+  @@index([publishedAt, createdAt])
+  @@map("realtime_outbox")
 }
 
 /// Pre-computed shop aggregate stats (denormalized for dashboard performance)
@@ -557,10 +634,10 @@ model ShopAggregate {
   totalOrders       Int    @default(0)
   activeOrders      Int    @default(0)
   completedOrders   Int    @default(0)
-  totalRevenue      Float  @default(0)
-  totalBaseFees     Float  @default(0)
-  totalPaidOut      Float  @default(0)
-  pendingPayouts    Float  @default(0)
+  totalRevenue      Int  @default(0)
+  totalBaseFees     Int  @default(0)
+  totalPaidOut      Int  @default(0)
+  pendingPayouts    Int  @default(0)
   pendingPayoutCount Int   @default(0)
 
   updatedAt DateTime @updatedAt
@@ -603,7 +680,7 @@ model RefundRequest {
   shopId           String
   reason           String
   status           RefundRequestStatus @default(PENDING_SHOP)
-  refundAmount     Float?
+  refundAmount     Int?
   razorpayRefundId String?
 
   // Response tracking
@@ -658,9 +735,9 @@ model EarningsReport {
   startDate     String
   endDate       String
   totalOrders   Int    @default(0)
-  totalRevenue  Float  @default(0)
-  totalBaseFees Float  @default(0)
-  totalPageCosts Float @default(0)
+  totalRevenue  Int  @default(0)
+  totalBaseFees Int  @default(0)
+  totalPageCosts Int @default(0)
   storagePath   String
   downloadUrl   String
   generatedBy   String
@@ -668,4 +745,36 @@ model EarningsReport {
   generatedAt DateTime @default(now())
 
   @@map("earnings_reports")
+}
+
+/// Referral codes generated by admins for shop owner registration
+model ReferralCode {
+  id        String    @id @default(cuid())
+  code      String    @unique
+  createdBy String    // Admin User ID
+  usedBy    String?   @unique // Shop Owner User ID
+  usedAt    DateTime?
+  expiresAt DateTime? // Optional expiration date
+  
+  createdAt DateTime  @default(now())
+
+  @@index([code, usedBy])
+  @@map("referral_codes")
+}
+
+/// OTP tokens for sensitive admin/account actions (delete, archive, etc.)
+model AdminOtp {
+  id             String   @id @default(cuid())
+  userId         String
+  otp            String
+  actionId       String
+  expiresAt      DateTime
+  failedAttempts Int      @default(0)
+  lockUntil      DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, actionId])
+  @@index([userId])
+  @@map("admin_otps")
 }

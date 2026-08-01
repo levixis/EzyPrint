@@ -1,107 +1,245 @@
 import { prisma } from '../utils/prisma';
 import { ApiError } from '../utils/ApiError';
-import type { LedgerEntryType, LedgerCounterparty, LedgerCreatedBy } from '@prisma/client';
+import { enqueueShopEvent, publishQueued, type RealtimeEventType } from './realtime.service';
+import type { LedgerEntryType, LedgerCounterparty, LedgerCreatedBy, LedgerEntryStatus } from '@prisma/client';
 
 /**
  * Ledger Service — financial tracking for shops.
  *
- * Every monetary event creates an immutable, append-only ledger entry.
- * Uses an interactive Prisma transaction with optimistic concurrency
- * (financialVersion) to prevent race conditions on balance updates.
+ * Every monetary event creates an immutable, append-only ledger entry. All
+ * amounts are paise.
  *
- * Fix 3 (Audit): Changed from batch $transaction to interactive $transaction
- * so the shop row is read INSIDE the transaction, preventing two concurrent
- * requests from reading the same financialVersion and both succeeding.
+ * Balance updates use optimistic concurrency on `Shop.financialVersion`: the
+ * shop row is read inside an interactive transaction and written with the
+ * version in the WHERE clause, so two concurrent writers cannot both apply
+ * their delta to the same starting balance. `financialVersion` doubles as the
+ * per-shop sequence number for real-time events.
  */
 
-export async function createLedgerEntry(data: {
+/** Which ledger types add to the balance rather than draw from it. */
+const CREDIT_TYPES: ReadonlySet<LedgerEntryType> = new Set<LedgerEntryType>([
+  'ORDER_EARNING',
+  'PAYOUT_CANCEL_REFUND',
+  'PAYOUT_REJECT_REFUND',
+  'ADJUSTMENT',
+]);
+
+/**
+ * Which balance a movement primarily touches.
+ *
+ * Earnings land in CLEARING and mature into AVAILABLE at settlement. Payouts
+ * draw from AVAILABLE, because money still inside the settlement window is not
+ * withdrawable yet — that distinction is the whole point of the two buckets.
+ */
+type Bucket = 'CLEARING' | 'AVAILABLE';
+
+const BUCKET_FOR_TYPE: Record<LedgerEntryType, Bucket> = {
+  ORDER_EARNING: 'CLEARING',
+  REFUND_DEDUCTION: 'CLEARING',
+  CLAWBACK: 'CLEARING',
+  ADJUSTMENT: 'CLEARING',
+  PAYOUT: 'AVAILABLE',
+  MANUAL_PAYOUT_DEDUCTION: 'AVAILABLE',
+  PAYOUT_CANCEL_REFUND: 'AVAILABLE',
+  PAYOUT_REJECT_REFUND: 'AVAILABLE',
+};
+
+interface BalanceMovement {
+  clearing: number;
+  available: number;
+  debt: number;
+}
+
+/**
+ * Work out how a movement redistributes across the shop's balances.
+ *
+ * Credits pay down outstanding debt before adding to a balance. Debits drain
+ * their own bucket first, spill into the other, and only then accrue debt — so
+ * a refund on a shop that has already been paid out still succeeds, and the
+ * shortfall stays visible as debt rather than as a negative balance.
+ */
+export function computeBalanceMovement(
+  type: LedgerEntryType,
+  amount: number,
+  shop: { pendingBalance: number; ledgerBalance: number; debtAmount: number }
+): BalanceMovement {
+  const bucket = BUCKET_FOR_TYPE[type];
+
+  if (CREDIT_TYPES.has(type)) {
+    const towardsDebt = Math.min(amount, Math.max(0, shop.debtAmount));
+    const remainder = amount - towardsDebt;
+    return {
+      clearing: bucket === 'CLEARING' ? remainder : 0,
+      available: bucket === 'AVAILABLE' ? remainder : 0,
+      // `|| 0` normalises negative zero, which is a distinct value in JS and
+      // leaks into equality checks and serialized event payloads.
+      debt: -towardsDebt || 0,
+    };
+  }
+
+  let remaining = amount;
+  const movement: BalanceMovement = { clearing: 0, available: 0, debt: 0 };
+  const drainOrder: Bucket[] = bucket === 'AVAILABLE'
+    ? ['AVAILABLE', 'CLEARING']
+    : ['CLEARING', 'AVAILABLE'];
+
+  for (const target of drainOrder) {
+    const balance = target === 'AVAILABLE' ? shop.ledgerBalance : shop.pendingBalance;
+    const take = Math.min(remaining, Math.max(0, balance));
+    if (target === 'AVAILABLE') movement.available -= take;
+    else movement.clearing -= take;
+    remaining -= take;
+  }
+
+  movement.debt = remaining;
+  return movement;
+}
+
+/** Real-time event type implied by a ledger movement. */
+function eventTypeFor(type: LedgerEntryType): RealtimeEventType {
+  return CREDIT_TYPES.has(type) ? 'ledger.credited' : 'ledger.debited';
+}
+
+export interface CreateLedgerEntryInput {
   shopId: string;
   type: LedgerEntryType;
+  /** Paise. Always positive — direction comes from `type`. */
   amount: number;
   description: string;
   counterparty: LedgerCounterparty;
   createdBy?: LedgerCreatedBy;
   orderId?: string;
+  /** Deterministic dedup key. The unique constraint on it is what makes
+   *  double-crediting impossible under concurrent delivery. */
   eventId?: string;
-}) {
-  // Interactive transaction — the shop read + balance update + entry create
-  // all happen atomically. If two requests race, one will fail the version
-  // check and get a Prisma "Record not found" error, which we catch.
-  try {
-    return await prisma.$transaction(async (tx) => {
-      // Read shop INSIDE the transaction — this is the critical fix.
-      // In PostgreSQL with Prisma's default isolation level (READ COMMITTED),
-      // this ensures we see the latest committed version.
-      const shop = await tx.shop.findUnique({ where: { id: data.shopId } });
-      if (!shop) throw ApiError.notFound('Shop not found');
+  /** When the entry becomes withdrawable. Stamped at write time. */
+  availableAt?: Date | null;
+  status?: LedgerEntryStatus;
+  /**
+   * Allow the balance to go negative, carrying the shortfall into
+   * `Shop.debtAmount`. Used for refunds, which must succeed even when a shop
+   * has already been paid out — the money is owed regardless.
+   */
+  allowDebt?: boolean;
+}
 
-      // Calculate balance delta based on entry type
-      let pendingDelta = 0;
+/**
+ * Create a ledger entry and move the shop's balance atomically.
+ *
+ * Pass `txClient` to join a caller's transaction; otherwise one is opened here.
+ * When joining a transaction the caller owns publishing the returned outbox ids
+ * after commit.
+ */
+export async function createLedgerEntry(
+  data: CreateLedgerEntryInput,
+  txClient?: any,
+  /**
+   * Collects outbox ids when joining a caller's transaction. The caller passes
+   * these to `publishQueued` after committing, so the shop sees the change
+   * immediately rather than waiting for the dispatcher sweep.
+   */
+  outboxSink?: string[]
+) {
+  const outboxIds: string[] = outboxSink ?? [];
 
-      switch (data.type) {
-        case 'ORDER_EARNING':
-          pendingDelta = data.amount;
-          break;
-        case 'REFUND_DEDUCTION':
-        case 'MANUAL_PAYOUT_DEDUCTION':
-        case 'CLAWBACK':
-        case 'PAYOUT':
-          pendingDelta = -data.amount;
-          break;
-        case 'PAYOUT_CANCEL_REFUND':
-        case 'PAYOUT_REJECT_REFUND':
-          pendingDelta = data.amount;
-          break;
-        case 'ADJUSTMENT':
-          pendingDelta = data.amount; // Can be negative
-          break;
-      }
+  const execute = async (tx: any) => {
+    const shop = await tx.shop.findUnique({ where: { id: data.shopId } });
+    if (!shop) throw ApiError.notFound('Shop not found');
 
-      // Create the ledger entry
-      const entry = await tx.ledgerEntry.create({
-        data: {
-          shopId: data.shopId,
-          type: data.type,
-          amount: data.amount,
-          description: data.description,
-          counterparty: data.counterparty,
-          createdBy: data.createdBy || 'SYSTEM',
-          orderId: data.orderId,
-          eventId: data.eventId,
-          status: 'PENDING',
-        },
-      });
-
-      // Update shop balance with optimistic concurrency check.
-      // The `where` includes financialVersion — if another transaction
-      // already incremented it, this update will match 0 rows and Prisma
-      // throws "Record to update not found", which we catch below.
-      await tx.shop.update({
-        where: {
-          id: data.shopId,
-          financialVersion: shop.financialVersion,
-        },
-        data: {
-          pendingBalance: { increment: pendingDelta },
-          financialVersion: { increment: 1 },
-        },
-      });
-
-      return entry;
-    });
-  } catch (error: unknown) {
-    // If Prisma threw because the version check failed (concurrent update),
-    // convert to a user-friendly error instead of a raw 500.
-    if (
-      error instanceof Error &&
-      error.message.includes('Record to update not found')
-    ) {
-      throw ApiError.conflict(
-        'Concurrent balance update detected. Please retry the operation.'
-      );
+    if (!Number.isInteger(data.amount) || data.amount < 0) {
+      throw ApiError.badRequest('Ledger amount must be a non-negative whole number of paise');
     }
-    throw error;
+
+    // Deterministic dedup: if this event was already recorded, do nothing
+    // rather than moving the balance a second time.
+    if (data.eventId) {
+      const existing = await tx.ledgerEntry.findUnique({ where: { eventId: data.eventId } });
+      if (existing) return existing;
+    }
+
+    const movement = computeBalanceMovement(data.type, data.amount, shop);
+
+    if (movement.debt > 0 && !data.allowDebt) {
+      throw ApiError.badRequest('Insufficient balance');
+    }
+
+    const entry = await tx.ledgerEntry.create({
+      data: {
+        shopId: data.shopId,
+        type: data.type,
+        amount: data.amount,
+        description: data.description,
+        counterparty: data.counterparty,
+        createdBy: data.createdBy || 'SYSTEM',
+        orderId: data.orderId,
+        eventId: data.eventId,
+        status: data.status ?? 'PENDING',
+        availableAt: data.availableAt ?? null,
+        settledAt: (data.status ?? 'PENDING') === 'SETTLED' ? new Date() : null,
+      },
+    });
+
+    // Compare-and-swap on financialVersion. A concurrent writer that read the
+    // same version loses here and its whole transaction rolls back, taking the
+    // ledger row with it. The `gte` guards additionally stop a balance being
+    // driven negative if anything slipped past the movement calculation.
+    const updated = await tx.shop.updateMany({
+      where: {
+        id: data.shopId,
+        financialVersion: shop.financialVersion,
+        ...(movement.clearing < 0 ? { pendingBalance: { gte: Math.abs(movement.clearing) } } : {}),
+        ...(movement.available < 0 ? { ledgerBalance: { gte: Math.abs(movement.available) } } : {}),
+      },
+      data: {
+        pendingBalance: { increment: movement.clearing },
+        ledgerBalance: { increment: movement.available },
+        debtAmount: { increment: movement.debt },
+        financialVersion: { increment: 1 },
+      },
+    });
+
+    if (updated.count === 0) {
+      throw ApiError.conflict('Concurrent balance update detected. Please retry the operation.');
+    }
+
+    const seq = shop.financialVersion + 1;
+
+    const outboxId = await enqueueShopEvent(tx, {
+      shopId: data.shopId,
+      type: eventTypeFor(data.type),
+      seq,
+      data: {
+        entry: {
+          id: entry.id,
+          type: entry.type,
+          status: entry.status,
+          amount: entry.amount,
+          description: entry.description,
+          orderId: entry.orderId,
+          createdAt: entry.createdAt,
+          availableAt: entry.availableAt,
+        },
+        balances: {
+          clearing: shop.pendingBalance + movement.clearing,
+          available: shop.ledgerBalance + movement.available,
+          debt: shop.debtAmount + movement.debt,
+        },
+      },
+    });
+    outboxIds.push(outboxId);
+
+    return entry;
+  };
+
+  const entry = txClient ? await execute(txClient) : await prisma.$transaction(execute);
+
+  // Only publish here when we owned the transaction. A caller that passed its
+  // own tx may still roll back after we return.
+  if (!txClient) {
+    await publishQueued(outboxIds);
   }
+
+  return entry;
 }
 
 export async function getLedgerEntries(
@@ -138,7 +276,8 @@ export async function getLedgerEntries(
 }
 
 /**
- * Get balance summary for a shop.
+ * Balance summary for a shop, in the four stages the dashboard shows.
+ *
  * Shop owners see their own; admins can view any.
  */
 export async function getShopBalance(
@@ -156,6 +295,7 @@ export async function getShopBalance(
       ledgerBalance: true,
       debtAmount: true,
       lastSettlementAt: true,
+      financialVersion: true,
     },
   });
 
@@ -164,12 +304,66 @@ export async function getShopBalance(
     throw ApiError.forbidden('Not your shop');
   }
 
+  return buildBalanceSnapshot(shop);
+}
+
+export interface BalanceSnapshot {
+  shopId: string;
+  shopName?: string;
+  /** Paid for but not yet fulfilled — the shop's expected earnings. */
+  inProgress: number;
+  /** Earned, inside the settlement window. */
+  clearing: number;
+  /** Withdrawable now. */
+  available: number;
+  /** Owed back to the platform, offset against future earnings. */
+  debt: number;
+  /** Earliest moment any clearing money becomes available. */
+  nextSettlementAt: string | null;
+  lastSettlementAt: string | null;
+  seq: number;
+}
+
+/**
+ * Assemble the four-stage balance view.
+ *
+ * `inProgress` is derived from orders rather than stored, because money for an
+ * unfulfilled order is not the shop's yet — it just needs to be visible so the
+ * owner can see what is coming.
+ */
+export async function buildBalanceSnapshot(shop: {
+  id: string;
+  name?: string;
+  pendingBalance: number;
+  ledgerBalance: number;
+  debtAmount: number;
+  lastSettlementAt: Date | null;
+  financialVersion: number;
+}): Promise<BalanceSnapshot> {
+  const [inProgressAgg, nextSettlement] = await Promise.all([
+    prisma.order.aggregate({
+      where: {
+        shopId: shop.id,
+        status: { in: ['PENDING_APPROVAL', 'PRINTING', 'READY_FOR_PICKUP'] },
+      },
+      _sum: { pageCost: true },
+    }),
+    prisma.ledgerEntry.findFirst({
+      where: { shopId: shop.id, status: 'PENDING', availableAt: { not: null } },
+      orderBy: { availableAt: 'asc' },
+      select: { availableAt: true },
+    }),
+  ]);
+
   return {
     shopId: shop.id,
     shopName: shop.name,
-    pendingBalance: shop.pendingBalance,
-    ledgerBalance: shop.ledgerBalance,
-    debtAmount: shop.debtAmount,
-    lastSettlementAt: shop.lastSettlementAt,
+    inProgress: inProgressAgg._sum.pageCost ?? 0,
+    clearing: shop.pendingBalance,
+    available: shop.ledgerBalance,
+    debt: shop.debtAmount,
+    nextSettlementAt: nextSettlement?.availableAt?.toISOString() ?? null,
+    lastSettlementAt: shop.lastSettlementAt?.toISOString() ?? null,
+    seq: shop.financialVersion,
   };
 }

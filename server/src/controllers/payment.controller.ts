@@ -44,14 +44,14 @@ export async function createPaymentOrder(req: Request, res: Response, next: Next
 export async function verifyPayment(req: Request, res: Response, next: NextFunction) {
   try {
     if (!req.user) throw ApiError.unauthorized();
-    const { orderId, razorpayPaymentId, razorpayOrderId, razorpaySignature } = req.body;
+    const { orderId, razorpay_payment_id, razorpay_order_id, razorpay_signature } = req.body;
 
-    if (!orderId || !razorpayPaymentId || !razorpayOrderId || !razorpaySignature) {
-      throw ApiError.badRequest('orderId, razorpayPaymentId, razorpayOrderId, and razorpaySignature are required');
+    if (!orderId || !razorpay_payment_id || !razorpay_order_id || !razorpay_signature) {
+      throw ApiError.badRequest('orderId, razorpay_payment_id, razorpay_order_id, and razorpay_signature are required');
     }
 
     const order = await paymentService.verifyPayment(
-      { orderId, razorpayPaymentId, razorpayOrderId, razorpaySignature },
+      { orderId, razorpayPaymentId: razorpay_payment_id, razorpayOrderId: razorpay_order_id, razorpaySignature: razorpay_signature },
       req.user.userId
     );
 
@@ -85,7 +85,11 @@ export async function webhook(req: Request, res: Response, next: NextFunction) {
       return res.json({ received: true });
     }
 
-    const rawBody = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
+    const rawBody = (req as any).rawBody
+      ? (req as any).rawBody.toString()
+      : typeof req.body === 'string'
+      ? req.body
+      : JSON.stringify(req.body);
     const result = await paymentService.handleWebhook(rawBody, signature, webhookSecret);
 
     // Always return 200 to Razorpay — even if processing failed.

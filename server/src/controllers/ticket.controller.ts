@@ -6,12 +6,29 @@ import type { TicketStatus } from '@prisma/client';
 export async function createTicket(req: Request, res: Response, next: NextFunction) {
   try {
     if (!req.user) throw ApiError.unauthorized();
-    const { subject, description, category, orderId, shopId } = req.body;
+    const { subject, description, category, relatedOrderId } = req.body;
     if (!subject || !description || !category) {
       throw ApiError.badRequest('subject, description, and category are required');
     }
+    
+    let verifiedOrderId = undefined;
+    let verifiedShopId = undefined;
+    
+    if (relatedOrderId) {
+      const { prisma } = await import('../utils/prisma');
+      const order = await prisma.order.findUnique({ where: { id: relatedOrderId } });
+      if (!order) {
+        throw ApiError.notFound('Related order not found');
+      }
+      if (order.userId !== req.user.userId && req.user.userType !== 'ADMIN') {
+        throw ApiError.forbidden('You do not own this order');
+      }
+      verifiedOrderId = order.id;
+      verifiedShopId = order.shopId;
+    }
+
     const ticket = await ticketService.createTicket(req.user.userId, {
-      subject, description, category, orderId, shopId,
+      subject, description, category, orderId: verifiedOrderId, shopId: verifiedShopId,
     });
     res.status(201).json({ success: true, message: 'Ticket created', data: { ticket } });
   } catch (error) { next(error); }

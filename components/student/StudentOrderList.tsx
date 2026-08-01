@@ -4,14 +4,12 @@ import { DocumentOrder, OrderStatus, UserType } from '../../types';
 import StudentOrderCard from './StudentOrderCard';
 import { useAppContext } from '../../contexts/AppContext';
 import { getOrderDisplayName } from '../../utils/orderHelpers';
-import { getFunctions, httpsCallable } from 'firebase/functions';
-import { app } from '../../firebase';
+import { paymentApi } from '../../lib/queries';
 import { Spinner } from '../common/Spinner';
 import { Button } from '../common/Button';
 import { Modal } from '../common/Modal';
 
 const RAZORPAY_KEY_ID = import.meta.env.VITE_RAZORPAY_KEY_ID;
-const functions = getFunctions(app, 'asia-south1');
 const debugLog = (...args: unknown[]) => {
   void args;
 };
@@ -61,9 +59,7 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
     if (order.status === OrderStatus.PAYMENT_FAILED && order.razorpayOrderId) {
       setStatusMessage('Checking previous payment...');
       try {
-        const checkPaymentFn = httpsCallable(functions, 'checkPaymentStatus');
-        const checkResult = await checkPaymentFn({ orderId: order.id });
-        const checkData = checkResult.data as { paid: boolean; recovered?: boolean; message: string };
+        const checkData = await paymentApi.createOrder(order.id) as unknown as { paid: boolean; recovered?: boolean; message: string };
 
         if (checkData.paid && checkData.recovered) {
           // Payment was already captured! Order has been recovered.
@@ -84,17 +80,10 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
     setStatusMessage('Creating order...');
 
     try {
-      const createOrderFn = httpsCallable(functions, 'createOrder');
-      const result = await createOrderFn({ orderId: order.id });
-      const data = result.data as {
-        razorpayOrderId: string;
-        amount: number;
-        currency: string;
-        verifiedPrice: { pageCost: number; baseFee: number; totalPrice: number };
-      };
+      const data = await paymentApi.createOrder(order.id);
 
       const baseOptions: Record<string, unknown> = {
-        key: RAZORPAY_KEY_ID,
+        key: data.key || RAZORPAY_KEY_ID,
         amount: data.amount,
         currency: data.currency,
         name: 'EzyPrint',
@@ -179,8 +168,7 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
 
             setShowOverlay(true);
             setStatusMessage('Verifying payment...');
-            const verifyPaymentFn = httpsCallable(functions, 'verifyPayment');
-            await verifyPaymentFn({
+            await paymentApi.verify({
               razorpay_order_id: ordIdFromRzp,
               razorpay_payment_id: paymentId,
               razorpay_signature: signature,
@@ -226,8 +214,7 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
         setShowOverlay(true);
         setStatusMessage('Verifying payment...');
         try {
-          const verifyPaymentFn = httpsCallable(functions, 'verifyPayment');
-          await verifyPaymentFn({
+          await paymentApi.verify({
             razorpay_order_id: response.razorpay_order_id,
             razorpay_payment_id: response.razorpay_payment_id,
             razorpay_signature: response.razorpay_signature,
@@ -258,9 +245,7 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
     // (handles case where verification failed but money was taken)
     if ((order.status === OrderStatus.PAYMENT_FAILED || order.status === OrderStatus.PENDING_PAYMENT) && order.razorpayOrderId) {
       try {
-        const checkPaymentFn = httpsCallable(functions, 'checkPaymentStatus');
-        const checkResult = await checkPaymentFn({ orderId: order.id });
-        const checkData = checkResult.data as { paid: boolean; recovered?: boolean; message: string };
+        const checkData = await paymentApi.createOrder(order.id) as unknown as { paid: boolean; recovered?: boolean; message: string };
 
         if (checkData.paid && checkData.recovered) {
           setInfoDialog({

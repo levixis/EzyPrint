@@ -117,13 +117,22 @@ describe('Registration Schema', () => {
     expect(result.errors.some((e: any) => e.message.includes('shop') || e.message.includes('Shop'))).toBe(true);
   });
 
-  test('accepts SHOP_OWNER with shopName and shopAddress', () => {
+  test('rejects SHOP_OWNER without referralCode', () => {
+    const result = validate(registerSchema, {
+      body: { ...validData.body, type: 'SHOP_OWNER', shopName: 'Test Shop', shopAddress: '123 Campus Road' },
+    });
+    expect(result.success).toBe(false);
+    expect(result.errors.some((e: any) => e.message.includes('referral') || e.message.includes('Referral'))).toBe(true);
+  });
+
+  test('accepts SHOP_OWNER with shopName, shopAddress, and referralCode', () => {
     const result = validate(registerSchema, {
       body: {
         ...validData.body,
         type: 'SHOP_OWNER',
         shopName: 'Test Shop',
         shopAddress: '123 Campus Road',
+        referralCode: 'VALIDCODE',
       },
     });
     expect(result.success).toBe(true);
@@ -145,12 +154,14 @@ describe('Create Order Schema', () => {
   const validOrder = {
     body: {
       shopId: 'cms123456789abcdefg',
-      fileName: 'thesis.pdf',
-      fileType: 'PDF',
-      copies: 3,
-      color: 'COLOR',
-      pages: 20,
-      doubleSided: true,
+      files: [{
+        fileName: 'thesis.pdf',
+        fileType: 'PDF',
+        copies: 3,
+        color: 'COLOR',
+        pageCount: 20,
+        doubleSided: true,
+      }],
     },
   };
 
@@ -160,28 +171,28 @@ describe('Create Order Schema', () => {
 
   test('rejects zero copies', () => {
     const result = validate(createOrderSchema, {
-      body: { ...validOrder.body, copies: 0 },
+      body: { ...validOrder.body, files: [{ ...validOrder.body.files[0], copies: 0 }] },
     });
     expect(result.success).toBe(false);
   });
 
   test('rejects negative pages', () => {
     const result = validate(createOrderSchema, {
-      body: { ...validOrder.body, pages: -5 },
+      body: { ...validOrder.body, files: [{ ...validOrder.body.files[0], pageCount: -5 }] },
     });
     expect(result.success).toBe(false);
   });
 
   test('rejects copies over 999', () => {
     const result = validate(createOrderSchema, {
-      body: { ...validOrder.body, copies: 1000 },
+      body: { ...validOrder.body, files: [{ ...validOrder.body.files[0], copies: 1000 }] },
     });
     expect(result.success).toBe(false);
   });
 
   test('rejects invalid color value', () => {
     const result = validate(createOrderSchema, {
-      body: { ...validOrder.body, color: 'RED' },
+      body: { ...validOrder.body, files: [{ ...validOrder.body.files[0], color: 'RED' }] },
     });
     expect(result.success).toBe(false);
   });
@@ -257,19 +268,19 @@ describe('Ticket Schema', () => {
 describe('Shop Update Schema', () => {
   test('accepts valid pricing update', () => {
     expect(validate(updateShopSchema, {
-      body: { bwPerPage: 2, colorPerPage: 5 },
+      body: { pricing: { bwPerPage: 2, colorPerPage: 5 } },
     }).success).toBe(true);
   });
 
   test('rejects negative pricing', () => {
     expect(validate(updateShopSchema, {
-      body: { bwPerPage: -1 },
+      body: { pricing: { bwPerPage: -1, colorPerPage: 5 } },
     }).success).toBe(false);
   });
 
   test('rejects pricing above max (1000)', () => {
     expect(validate(updateShopSchema, {
-      body: { colorPerPage: 1001 },
+      body: { pricing: { bwPerPage: 2, colorPerPage: 1001 } },
     }).success).toBe(false);
   });
 });
@@ -306,10 +317,10 @@ describe('Payment Verify Schema', () => {
   test('accepts all required fields', () => {
     expect(validate(verifyPaymentSchema, {
       body: {
-        orderId: 'order123',
-        razorpayPaymentId: 'pay_xxx',
-        razorpayOrderId: 'order_xxx',
-        razorpaySignature: 'sig_xxx',
+        orderId: 'ord_123',
+        razorpay_payment_id: 'pay_xxx',
+        razorpay_order_id: 'order_xxx',
+        razorpay_signature: 'sig_xxx',
       },
     }).success).toBe(true);
   });
@@ -317,9 +328,9 @@ describe('Payment Verify Schema', () => {
   test('rejects missing razorpaySignature', () => {
     expect(validate(verifyPaymentSchema, {
       body: {
-        orderId: 'order123',
-        razorpayPaymentId: 'pay_xxx',
-        razorpayOrderId: 'order_xxx',
+        orderId: 'ord_123',
+        razorpay_payment_id: 'pay_xxx',
+        razorpay_order_id: 'order_xxx',
       },
     }).success).toBe(false);
   });

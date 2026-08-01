@@ -12,6 +12,11 @@ export interface User {
   email?: string;
   phone?: string;
   shopId?: string;
+  shopName?: string;
+  isShopApproved?: boolean;
+  isShopArchived?: boolean;
+  isShopRejected?: boolean;
+  shopRejectionReason?: string | null;
   hasStudentPass?: boolean;
   studentPassActivatedAt?: string; // ISO date string — pass expires 30 days after this
   studentPassPaymentId?: string;
@@ -58,6 +63,8 @@ export interface ShopProfile {
   isOpen: boolean;
   isApproved: boolean; // Admin must approve before shop is visible to students
   isArchived?: boolean; // Admin can archive shops — hides from students but keeps data
+  isRejected?: boolean;
+  rejectionReason?: string | null;
   // Store Contact Info
   contactPhone?: string;
   contactPhoneAlt?: string;
@@ -172,6 +179,8 @@ export interface NotificationMessage {
 
 export enum PayoutStatus {
   PENDING = 'PENDING',
+  /** Approved and sent to the bank, not yet credited. Shown as "on its way". */
+  IN_TRANSIT = 'IN_TRANSIT',
   PAID = 'PAID',
   CONFIRMED = 'CONFIRMED',
   DISPUTED = 'DISPUTED',
@@ -270,6 +279,17 @@ export interface TicketStatusChange {
   note?: string;
 }
 
+export interface TicketAttachment {
+  id: string;
+  ticketId: string;
+  storageKey: string;
+  originalName: string;
+  mimeType: string;
+  sizeBytes?: number;
+  uploadId?: string;
+  createdAt: string;
+}
+
 export interface SupportTicket {
   id: string;
   raisedBy: string; // userId
@@ -284,7 +304,8 @@ export interface SupportTicket {
   category: TicketCategory;
   description: string;
   status: TicketStatus;
-  attachmentPaths?: string[]; // Firebase Storage paths — absent if no files were uploaded
+  attachmentPaths?: string[]; // Legacy
+  attachments?: TicketAttachment[];
   messages: TicketMessage[];
   statusHistory: TicketStatusChange[];
   createdAt: string;

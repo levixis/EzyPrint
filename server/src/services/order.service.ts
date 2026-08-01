@@ -1,5 +1,8 @@
 import { prisma } from '../utils/prisma';
 import { ApiError } from '../utils/ApiError';
+import { calculateOrderPrice } from './pricing.service';
+import { creditOrderEarning } from './settlement.service';
+import { enqueueShopEvent, publishQueued } from './realtime.service';
 import type { OrderStatus, PrintColor } from '@prisma/client';
 import crypto from 'crypto';
 
@@ -63,20 +66,10 @@ const VALID_TRANSITIONS: Record<string, OrderStatus[]> = {
 interface CreateOrderInput {
   userId: string;
   shopId: string;
-  fileName: string;
-  fileType: string;
-  fileStoragePath?: string;
-  fileSizeBytes?: number;
-  copies: number;
-  color: PrintColor;
-  pages: number;
-  doubleSided: boolean;
-  startPage?: number;
-  endPage?: number;
   specialInstructions?: string;
   userName?: string;
   isPremiumOrder?: boolean;
-  files?: Array<{
+  files: Array<{
     fileName: string;
     fileType: string;
     fileStoragePath?: string;
@@ -100,32 +93,47 @@ export async function createOrder(input: CreateOrderInput) {
   if (!shop.isOpen) throw ApiError.badRequest('Shop is currently closed');
   if (shop.isArchived) throw ApiError.badRequest('Shop is archived');
 
-  // Calculate pricing
-  const pricePerPage = input.color === 'COLOR' ? shop.colorPerPage : shop.bwPerPage;
-  const effectivePages = input.doubleSided ? Math.ceil(input.pages / 2) : input.pages;
-  const pageCost = effectivePages * input.copies * pricePerPage;
-  const baseFee = calculateBaseFee(pageCost);
-  const totalPrice = pageCost + baseFee;
+  if (!input.files || input.files.length === 0) {
+    throw ApiError.badRequest('At least one file is required');
+  }
+
+  // The Student Pass waives the base fee on small orders. It is read from the
+  // database, never from the request — the client cannot grant itself a
+  // discount by claiming to hold a pass.
+  const student = await prisma.user.findUnique({
+    where: { id: input.userId },
+    select: { hasStudentPass: true, studentPassActivatedAt: true },
+  });
+  const hasActivePass = isStudentPassActive(
+    student?.hasStudentPass,
+    student?.studentPassActivatedAt
+  );
+
+  const { pageCost, baseFee, totalPrice } = calculateOrderPrice(
+    input.files,
+    { bwPerPage: shop.bwPerPage, colorPerPage: shop.colorPerPage },
+    hasActivePass
+  );
 
   // Generate a 6-digit pickup code
   const pickupCode = crypto.randomInt(100000, 999999).toString();
 
-  // Create order with optional multi-file support
+  // Legacy fields fallback from first file
+  const firstFile = input.files[0];
+
   const order = await prisma.order.create({
     data: {
       userId: input.userId,
       shopId: input.shopId,
       shopName: shop.name,
-      fileName: input.fileName,
-      fileType: input.fileType,
-      fileStoragePath: input.fileStoragePath,
-      fileSizeBytes: input.fileSizeBytes,
-      copies: input.copies,
-      color: input.color,
-      pages: input.pages,
-      doubleSided: input.doubleSided,
-      startPage: input.startPage,
-      endPage: input.endPage,
+      fileName: firstFile.fileName,
+      fileType: firstFile.fileType,
+      fileStoragePath: firstFile.fileStoragePath,
+      fileSizeBytes: firstFile.fileSizeBytes,
+      copies: firstFile.copies,
+      color: firstFile.color,
+      pages: firstFile.pageCount,
+      doubleSided: firstFile.doubleSided,
       pageCost,
       baseFee,
       totalPrice,
@@ -134,39 +142,41 @@ export async function createOrder(input: CreateOrderInput) {
       userName: input.userName,
       isPremiumOrder: input.isPremiumOrder || false,
       status: 'PENDING_PAYMENT',
-      // Create associated files if multi-file order
-      ...(input.files && input.files.length > 0
-        ? {
-            files: {
-              create: input.files.map((f) => ({
-                fileName: f.fileName,
-                fileType: f.fileType,
-                fileStoragePath: f.fileStoragePath,
-                fileSizeBytes: f.fileSizeBytes,
-                pageCount: f.pageCount,
-                color: f.color,
-                copies: f.copies,
-                doubleSided: f.doubleSided,
-              })),
-            },
-          }
-        : {}),
+      files: {
+        create: input.files.map((f) => ({
+          fileName: f.fileName,
+          fileType: f.fileType,
+          fileStoragePath: f.fileStoragePath,
+          fileSizeBytes: f.fileSizeBytes,
+          pageCount: f.pageCount,
+          color: f.color,
+          copies: f.copies,
+          doubleSided: f.doubleSided,
+        })),
+      },
     },
     select: orderSelect,
   });
 
-  return order;
+  return {
+    order,
+    verifiedPrice: {
+      pageCost,
+      baseFee,
+      totalPrice,
+    }
+  };
 }
 
 /**
- * Base fee calculation — platform fee on top of page cost.
- * Matches the existing pricing utility from the frontend.
+ * A Student Pass lasts 30 days from activation.
+ * Mirrors `isStudentPassActive` in the frontend's utils/pricing.ts.
  */
-function calculateBaseFee(pageCost: number): number {
-  if (pageCost <= 5) return 2;
-  if (pageCost <= 20) return 3;
-  if (pageCost <= 50) return 5;
-  return Math.ceil(pageCost * 0.1); // 10% for larger orders
+const PASS_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
+
+function isStudentPassActive(hasPass?: boolean, activatedAt?: Date | null): boolean {
+  if (!hasPass || !activatedAt) return false;
+  return Date.now() < activatedAt.getTime() + PASS_DURATION_MS;
 }
 
 // ────────────────────────────────────────────────────────────
@@ -189,9 +199,9 @@ export async function getOrderById(orderId: string, requesterId: string, request
   if (!order) throw ApiError.notFound('Order not found');
 
   // Access control: student sees own, shop owner sees their shop's, admin sees all
-  if (requesterType === 'ADMIN') return order;
-  if (requesterType === 'STUDENT' && order.userId === requesterId) return order;
-  if (requesterType === 'SHOP_OWNER' && order.shop.ownerUserId === requesterId) return order;
+  if (requesterType === 'ADMIN' || (requesterType === 'STUDENT' && order.userId === requesterId) || (requesterType === 'SHOP_OWNER' && order.shop.ownerUserId === requesterId)) {
+    return formatOrder(order);
+  }
 
   throw ApiError.forbidden('You do not have access to this order');
 }
@@ -222,7 +232,7 @@ export async function listOrdersForStudent(userId: string, options?: {
   ]);
 
   return {
-    orders,
+    orders: orders.map(formatOrder),
     pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
   };
 }
@@ -260,7 +270,7 @@ export async function listOrdersForShop(ownerUserId: string, options?: {
   ]);
 
   return {
-    orders,
+    orders: orders.map(formatOrder),
     pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
   };
 }
@@ -297,7 +307,7 @@ export async function listAllOrders(options?: {
   ]);
 
   return {
-    orders,
+    orders: orders.map(formatOrder),
     pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
   };
 }
@@ -319,7 +329,7 @@ export async function updateOrderStatus(
 ) {
   const order = await prisma.order.findUnique({
     where: { id: orderId },
-    include: { shop: { select: { ownerUserId: true } } },
+    include: { shop: { select: { ownerUserId: true, financialVersion: true } } },
   });
 
   if (!order) throw ApiError.notFound('Order not found');
@@ -350,11 +360,75 @@ export async function updateOrderStatus(
     updateData.cancelledAt = new Date();
   }
 
-  const updated = await prisma.order.update({
-    where: { id: orderId },
-    data: updateData,
-    select: orderSelect,
+  const outboxIds: string[] = [];
+
+  const updated = await prisma.$transaction(async (tx) => {
+    // Compare-and-swap on the status we validated against. Two staff acting on
+    // the same order at once — one marking it Completed, the other Cancelled —
+    // would otherwise both pass validation and the last write would silently
+    // win. Now that completion moves money, that is a financial divergence, not
+    // just a confusing UI.
+    const applied = await tx.order.updateMany({
+      where: { id: orderId, status: order.status },
+      data: updateData,
+    });
+
+    if (applied.count === 0) {
+      throw ApiError.conflict(
+        'This order was updated by someone else. Refresh and try again.'
+      );
+    }
+
+    // Fulfilment is what earns the shop its money.
+    if (newStatus === 'COMPLETED') {
+      await creditOrderEarning(tx, {
+        id: order.id,
+        shopId: order.shopId,
+        pageCost: order.pageCost,
+      });
+    }
+
+    const row = await tx.order.findUnique({ where: { id: orderId }, select: orderSelect });
+
+    // Carries the shop's current version rather than a new one: an order status
+    // change does not itself move a balance, so it is not part of the balance
+    // sequence the client uses for gap detection. A COMPLETED transition
+    // separately emits ledger.credited with an incremented sequence.
+    const outboxId = await enqueueShopEvent(tx, {
+      shopId: order.shopId,
+      type: 'order.updated',
+      seq: order.shop.financialVersion,
+      data: { orderId, status: newStatus },
+    });
+    outboxIds.push(outboxId);
+
+    return row;
   });
 
-  return updated;
+  await publishQueued(outboxIds);
+
+  if (!updated) throw ApiError.notFound('Order not found');
+  return formatOrder(updated);
+}
+
+// ────────────────────────────────────────────────────────────
+// HELPERS
+// ────────────────────────────────────────────────────────────
+
+function formatOrder(order: any) {
+  return {
+    ...order,
+    shopName: order.shop?.name ?? order.shopName,
+    printOptions: {
+      copies: order.copies,
+      color: order.color,
+      pages: order.pages,
+      doubleSided: order.doubleSided,
+    },
+    priceDetails: {
+      pageCost: order.pageCost,
+      baseFee: order.baseFee,
+      totalPrice: order.totalPrice,
+    },
+  };
 }

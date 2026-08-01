@@ -2,11 +2,9 @@ import React, { useEffect, useState } from 'react';
 import { Capacitor } from '@capacitor/core';
 import { Button } from '../common/Button';
 import { useAppContext, isStudentPassActive, getStudentPassDaysRemaining, getStudentPassExpiryDate } from '../../contexts/AppContext';
-import { getFunctions, httpsCallable } from 'firebase/functions';
-import { app } from '../../firebase';
+import { paymentApi } from '../../lib/queries';
 
 const RAZORPAY_KEY_ID = import.meta.env.VITE_RAZORPAY_KEY_ID;
-const functions = getFunctions(app, 'asia-south1');
 const debugLog = (...args: unknown[]) => {
     void args;
 };
@@ -57,18 +55,12 @@ const StudentPassPage: React.FC = () => {
         setErrorMessage('');
 
         try {
-            const createPassOrderFn = httpsCallable(functions, 'createPassOrder');
-            const result = await createPassOrderFn({});
-            const data = result.data as {
-                razorpayOrderId: string;
-                amount: number;
-                currency: string;
-            };
+            const data = await paymentApi.createOrder('student_pass');
 
             setStatusMessage('Opening payment gateway...');
 
             const baseOptions: Record<string, unknown> = {
-                key: RAZORPAY_KEY_ID,
+                key: data.key || RAZORPAY_KEY_ID,
                 amount: data.amount,
                 currency: data.currency,
                 name: 'EzyPrint',
@@ -90,11 +82,11 @@ const StudentPassPage: React.FC = () => {
             const verifyAndUpgrade = async (response: { razorpay_order_id: string; razorpay_payment_id: string; razorpay_signature: string }) => {
                 setStatusMessage('Verifying payment...');
                 try {
-                    const verifyPassPaymentFn = httpsCallable(functions, 'verifyPassPayment');
-                    await verifyPassPaymentFn({
+                    await paymentApi.verify({
                         razorpay_order_id: response.razorpay_order_id,
                         razorpay_payment_id: response.razorpay_payment_id,
                         razorpay_signature: response.razorpay_signature,
+                        orderId: 'student_pass',
                     });
                     await upgradeToStudentPass();
                 } catch (verifyError: unknown) {

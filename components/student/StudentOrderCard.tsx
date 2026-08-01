@@ -4,6 +4,7 @@ import { Card } from '../common/Card';
 import { Button } from '../common/Button';
 import { useAppContext } from '../../contexts/AppContext';
 import { getOrderFiles, getOrderDisplayName } from '../../utils/orderHelpers';
+import { formatMoney } from '../../utils/money';
 
 const TicketForm = lazy(() => import('../tickets/TicketForm'));
 
@@ -130,12 +131,12 @@ const StudentOrderCard: React.FC<StudentOrderCardProps> = ({ order, onPayNow, on
               ({showInvoice ? 'Hide Invoice' : 'View Invoice'})
             </button>
           </span>
-          <span className="text-brand-primary text-lg">₹{priceDetails.totalPrice.toFixed(2)}</span>
+          <span className="text-brand-primary text-lg">{formatMoney(priceDetails.totalPrice)}</span>
         </div>
         {showInvoice && (
           <div className="mt-3 pt-2 border-t border-brand-primary/10 text-xs text-brand-lightText dark:text-gray-400 space-y-1 animation-fade-in">
-            <div className="flex justify-between"><span>Page Cost:</span> <span>₹{priceDetails.pageCost.toFixed(2)}</span></div>
-            <div className="flex justify-between"><span>Base Fee:</span> <span>₹{priceDetails.baseFee.toFixed(2)}</span></div>
+            <div className="flex justify-between"><span>Page Cost:</span> <span>{formatMoney(priceDetails.pageCost)}</span></div>
+            <div className="flex justify-between"><span>Base Fee:</span> <span>{formatMoney(priceDetails.baseFee)}</span></div>
           </div>
         )}
       </div>
@@ -145,7 +146,7 @@ const StudentOrderCard: React.FC<StudentOrderCardProps> = ({ order, onPayNow, on
         <div className={`my-2 p-3 ${status === OrderStatus.PAYMENT_FAILED ? 'bg-status-error/20 border-status-error' : 'bg-transparent'} rounded-lg border text-center flex flex-col gap-2`}>
           {status === OrderStatus.PAYMENT_FAILED && <p className="text-status-error font-semibold mb-2">Payment Failed. Please try again.</p>}
           <Button onClick={() => onPayNow(order)} variant="primary" size="md" fullWidth className="my-1" disabled={isProcessingPayment}>
-            {isProcessingPayment ? 'Processing...' : (status === OrderStatus.PENDING_PAYMENT ? `Pay Now ₹${priceDetails.totalPrice.toFixed(2)}` : `Retry Payment ₹${priceDetails.totalPrice.toFixed(2)}`)}
+            {isProcessingPayment ? 'Processing...' : (status === OrderStatus.PENDING_PAYMENT ? `Pay Now ${formatMoney(priceDetails.totalPrice)}` : `Retry Payment ${formatMoney(priceDetails.totalPrice)}`)}
           </Button>
           {onCancelOrder && (
             <Button onClick={() => onCancelOrder(order)} variant="ghost" size="sm" fullWidth className="text-status-error hover:bg-status-error/10 border border-transparent hover:border-status-error/20 mt-1">
@@ -224,7 +225,7 @@ const StudentOrderCard: React.FC<StudentOrderCardProps> = ({ order, onPayNow, on
           </div>
           {order.refundAmount != null && (
             <p className="text-sm text-gray-600 dark:text-gray-400">
-              Amount: <strong className="text-gray-900 dark:text-white">₹{order.refundAmount.toFixed(2)}</strong>
+              Amount: <strong className="text-gray-900 dark:text-white">{formatMoney(order.refundAmount)}</strong>
             </p>
           )}
           {order.refundedAt && (

@@ -118,6 +118,7 @@ export async function getTicketById(ticketId: string, userId: string, userType: 
         orderBy: { createdAt: 'asc' },
       },
       statusHistory: { orderBy: { createdAt: 'asc' } },
+      attachments: true,
     },
   });
 

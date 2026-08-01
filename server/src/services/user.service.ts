@@ -80,6 +80,7 @@ export async function listUsers(options: {
   limit?: number;
   type?: UserType;
   search?: string;
+  hasPass?: boolean;
 }) {
   const page = Math.max(1, options.page || 1);
   const limit = Math.min(100, Math.max(1, options.limit || 20));
@@ -96,6 +97,10 @@ export async function listUsers(options: {
       { name: { contains: options.search, mode: 'insensitive' } },
       { email: { contains: options.search, mode: 'insensitive' } },
     ];
+  }
+
+  if (options.hasPass !== undefined) {
+    where.hasStudentPass = options.hasPass;
   }
 
   const [users, total] = await Promise.all([

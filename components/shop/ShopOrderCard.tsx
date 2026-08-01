@@ -3,6 +3,7 @@ import { DocumentOrder, OrderStatus, PrintColor } from '../../types';
 import { Card } from '../common/Card';
 import { Button } from '../common/Button';
 import { getOrderFiles, getOrderDisplayName } from '../../utils/orderHelpers';
+import { formatMoney } from '../../utils/money';
 
 interface ShopOrderCardProps {
   order: DocumentOrder;
@@ -78,8 +79,8 @@ const ShopOrderCard: React.FC<ShopOrderCardProps> = ({ order, onSelectOrder }) =
           ) : (
             <p>{files.filter(f => f.color === PrintColor.COLOR).length} color, {files.filter(f => f.color !== PrintColor.COLOR).length} B&W</p>
           )}
-          <p><strong>Order Value:</strong> <span className="font-semibold text-gray-900 dark:text-white">₹{priceDetails.totalPrice.toFixed(2)}</span></p>
-          <p className="text-gray-500 dark:text-gray-400 italic">(Page Cost: ₹{priceDetails.pageCost.toFixed(2)}, Base Fee: ₹{priceDetails.baseFee.toFixed(2)})</p>
+          <p><strong>Order Value:</strong> <span className="font-semibold text-gray-900 dark:text-white">{formatMoney(priceDetails.totalPrice)}</span></p>
+          <p className="text-gray-500 dark:text-gray-400 italic">(Page Cost: {formatMoney(priceDetails.pageCost)}, Base Fee: {formatMoney(priceDetails.baseFee)})</p>
           {order.specialInstructions && (
             <p className="mt-1.5 flex items-center gap-1 text-amber-700 dark:text-amber-400 font-medium">
               <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-3.5 h-3.5">

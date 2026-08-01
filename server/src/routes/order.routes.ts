@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { authenticate, authorize } from '../middleware/auth';
-import { sensitiveLimiter } from '../middleware/rateLimiter';
+import { sensitiveLimiter, orderCreationLimiter } from '../middleware/rateLimiter';
 import { validate } from '../middleware/validate';
 import { createOrderSchema, updateOrderStatusSchema, listOrdersSchema } from '../validators/schemas';
 import * as orderController from '../controllers/order.controller';
@@ -12,10 +12,10 @@ const router = Router();
  */
 
 router.get('/admin/all', authenticate, authorize('ADMIN'), validate(listOrdersSchema), orderController.listAllOrders);
-router.post('/', authenticate, authorize('STUDENT'), validate(createOrderSchema), orderController.createOrder);
+router.post('/', authenticate, authorize('STUDENT'), orderCreationLimiter, validate(createOrderSchema), orderController.createOrder);
 router.get('/', authenticate, orderController.listOrders);
 router.get('/:orderId', authenticate, orderController.getOrder);
-router.patch('/:orderId/status', authenticate, authorize('SHOP_OWNER', 'ADMIN'), validate(updateOrderStatusSchema), orderController.updateStatus);
+router.patch('/:orderId/status', authenticate, authorize('SHOP_OWNER', 'ADMIN', 'STUDENT'), validate(updateOrderStatusSchema), orderController.updateStatus);
 
 /**
  * Payment endpoints at /api/v1/payments/

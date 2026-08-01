@@ -3,8 +3,7 @@
  * On web, this module is a no-op.
  */
 import { Capacitor } from '@capacitor/core';
-import { doc, arrayUnion } from 'firebase/firestore';
-import { db } from '../firebase';
+import * as api from '../lib/api';
 
 let pushRegistered = false;
 const debugLog = (...args: unknown[]) => {
@@ -21,7 +20,6 @@ const debugLog = (...args: unknown[]) => {
  * Call this AFTER the user is authenticated.
  */
 export async function registerPushNotifications(
-  userId: string,
   onNotificationReceived?: (title: string, body: string, data?: Record<string, string>) => void
 ): Promise<void> {
   // Only run on native platforms (Android/iOS)
@@ -70,14 +68,10 @@ export async function registerPushNotifications(
       PushNotifications.addListener('registration', async (token) => {
         debugLog('[Push] Device token:', token.value);
 
-        // Save token to user's Firestore document
+        // Save token to user record via REST API
         try {
-          const userRef = doc(db, 'users', userId);
-          const { setDoc } = await import('firebase/firestore');
-          await setDoc(userRef, {
-            fcmTokens: arrayUnion(token.value),
-          }, { merge: true });
-          debugLog('[Push] Token saved to Firestore');
+          await api.post('/users/me/push-token', { token: token.value });
+          debugLog('[Push] Token saved via API');
         } catch (err) {
           void err;
         }

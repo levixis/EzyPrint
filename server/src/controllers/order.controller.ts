@@ -6,12 +6,12 @@ import type { OrderStatus } from '@prisma/client';
 export async function createOrder(req: Request, res: Response, next: NextFunction) {
   try {
     if (!req.user) throw ApiError.unauthorized();
-    const order = await orderService.createOrder({
+    const result = await orderService.createOrder({
       ...req.body,
       userId: req.user.userId,
       userName: req.body.userName || req.user.email,
     });
-    res.status(201).json({ success: true, message: 'Order created', data: { order } });
+    res.status(201).json({ success: true, message: 'Order created', data: { orderId: result.order.id, verifiedPrice: result.verifiedPrice, files: result.order.files } });
   } catch (error) { next(error); }
 }
 
@@ -63,7 +63,7 @@ export async function updateStatus(req: Request, res: Response, next: NextFuncti
       req.user.userType,
       shopNotes
     );
-    res.json({ success: true, message: `Order status updated to ${status}`, data: { order } });
+    res.json({ success: true, message: `Order status updated to ${status}`, data: order });
   } catch (error) { next(error); }
 }
 

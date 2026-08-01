@@ -5,7 +5,7 @@ import { initMobile } from './utils/mobile';
 import { UserType, AppView, ShopProfile } from './types';
 import Header from './components/layout/Header';
 import { useAppContext } from './contexts/AppContext';
-import { enableNetwork, db } from './firebase';
+// Firebase removed — data is fetched via REST API polling
 import { Spinner } from './components/common/Spinner';
 import { ThemeProvider } from './contexts/ThemeContext';
 
@@ -59,7 +59,7 @@ const ShopLoadingFallback: React.FC = () => {
             ⚠️ Taking longer than expected. This can happen for new shops.
           </p>
           <button
-            onClick={() => { setRetryCount(c => c + 1); setTimedOut(false); enableNetwork(db); }}
+            onClick={() => { setRetryCount(c => c + 1); setTimedOut(false); window.location.reload(); }}
             className="px-4 py-2 text-sm font-medium text-brand-primary bg-brand-primary/10 hover:bg-brand-primary/20 rounded-lg transition-colors"
           >
             🔄 Retry ({retryCount})
@@ -153,13 +153,24 @@ const App: React.FC = () => {
 
 // Internal component to use hooks inside Provider if needed, but mostly just structured cleanly.
 const AppContent: React.FC = () => {
-  const { currentUser, logoutUser, isLoadingAuth, pendingFirebaseProfileCreationUser, isLoadingShops, getShopById, currentView, navigateTo, goBack, archivedShopForCurrentUser } = useAppContext();
+  const { currentUser, logoutUser, isLoadingAuth, pendingProfileCreationType, isLoadingShops, getShopById, currentView, navigateTo, goBack, archivedShopForCurrentUser, refreshCurrentUser } = useAppContext();
 
   // Track whether we've done the initial redirect after auth resolves
   const hasRedirected = useRef(false);
 
   // Valid views for each user type - these views don't require redirect
   const staticPages: AppView[] = ['privacy', 'terms', 'refund', 'shipping', 'contact'];
+
+  // Auto-poll for shop approval status if pending
+  useEffect(() => {
+    let interval: NodeJS.Timeout;
+    if (currentUser?.type === 'SHOP_OWNER' && currentUser.isShopApproved === false && !currentUser.isShopRejected) {
+      interval = setInterval(() => {
+        refreshCurrentUser();
+      }, 10000); // Check every 10 seconds
+    }
+    return () => clearInterval(interval);
+  }, [currentUser, refreshCurrentUser]);
 
   // Initialize mobile platform features (status bar, splash screen, etc.)
   useEffect(() => { initMobile(); }, []);
@@ -204,7 +215,7 @@ const AppContent: React.FC = () => {
       hasRedirected.current = false;
     }
 
-    if (!currentUser || pendingFirebaseProfileCreationUser) {
+    if (!currentUser || pendingProfileCreationType) {
       // Not logged in - only redirect if on a protected view
       if (!['landing', 'login', ...staticPages].includes(currentView)) {
         navigateTo('landing');
@@ -228,7 +239,7 @@ const AppContent: React.FC = () => {
       }
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentUser, isLoadingAuth, pendingFirebaseProfileCreationUser, isLoadingShops]);
+  }, [currentUser, isLoadingAuth, pendingProfileCreationType, isLoadingShops]);
 
   const handleLogout = () => {
     logoutUser();
@@ -237,8 +248,10 @@ const AppContent: React.FC = () => {
 
 
   const renderContent = () => {
-    // Show spinner while auth is resolving
-    if (isLoadingAuth) {
+    // Show spinner while auth is resolving — but NOT on the login view,
+    // since LoginPage handles its own loading state internally.
+    // Unmounting LoginPage here destroys its form state (email, password, step).
+    if (isLoadingAuth && currentView !== 'login') {
       return (
         <div className="flex flex-col items-center justify-center min-h-[70vh]">
           <Spinner size="lg" />
@@ -288,6 +301,74 @@ const AppContent: React.FC = () => {
                   </p>
                   <p className="text-xs text-gray-500 dark:text-gray-500">
                     Please contact admin support for assistance.
+                  </p>
+                  <button
+                    onClick={() => { logoutUser(); navigateTo('landing'); }}
+                    className="w-full px-4 py-2 text-sm text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300 transition-colors border border-gray-200 dark:border-zinc-700 rounded-lg"
+                  >
+                    Sign Out
+                  </button>
+                </div>
+              </div>
+            );
+          }
+          // Shop is rejected — show rejection reason
+          if (currentUser.isShopRejected) {
+            return (
+              <div className="flex flex-col items-center justify-center min-h-[70vh] text-center px-4">
+                <div className="max-w-md w-full bg-white dark:bg-zinc-900 rounded-2xl shadow-lg border border-red-200 dark:border-red-900/50 p-8 space-y-5">
+                  <div className="w-20 h-20 mx-auto bg-red-100 dark:bg-red-900/30 rounded-full flex items-center justify-center">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-10 h-10 text-red-600 dark:text-red-400">
+                      <path fillRule="evenodd" d="M12 2.25c-5.385 0-9.75 4.365-9.75 9.75s4.365 9.75 9.75 9.75 9.75-4.365 9.75-9.75S17.385 2.25 12 2.25Zm-1.72 6.97a.75.75 0 1 0-1.06 1.06L10.94 12l-1.72 1.72a.75.75 0 1 0 1.06 1.06L12 13.06l1.72 1.72a.75.75 0 1 0 1.06-1.06L13.06 12l1.72-1.72a.75.75 0 1 0-1.06-1.06L12 10.94l-1.72-1.72Z" clipRule="evenodd" />
+                    </svg>
+                  </div>
+                  <h2 className="text-2xl font-bold text-gray-900 dark:text-white">Shop Application Rejected</h2>
+                  <p className="text-sm text-gray-600 dark:text-gray-400">
+                    Unfortunately, your shop <strong className="text-gray-800 dark:text-gray-200">"{currentUser.shopName || 'your shop'}"</strong> was not approved by the admin.
+                  </p>
+                  <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800/50 rounded-lg p-4 space-y-2">
+                    <p className="text-xs text-red-700 dark:text-red-300 font-medium">Reason for rejection:</p>
+                    <p className="text-sm text-red-600 dark:text-red-400 text-left">
+                      {currentUser.shopRejectionReason || 'No specific reason provided.'}
+                    </p>
+                  </div>
+                  <p className="text-xs text-gray-500 dark:text-gray-500">
+                    If you believe this is a mistake, please contact support.
+                  </p>
+                  <button
+                    onClick={() => { logoutUser(); navigateTo('landing'); }}
+                    className="w-full px-4 py-2 text-sm text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300 transition-colors border border-gray-200 dark:border-zinc-700 rounded-lg"
+                  >
+                    Sign Out
+                  </button>
+                </div>
+              </div>
+            );
+          }
+          // Shop exists but is NOT approved yet — show a clear pending approval screen
+          if (currentUser.isShopApproved === false) {
+            return (
+              <div className="flex flex-col items-center justify-center min-h-[70vh] text-center px-4">
+                <div className="max-w-md w-full bg-white dark:bg-zinc-900 rounded-2xl shadow-lg border border-gray-200 dark:border-zinc-700 p-8 space-y-5">
+                  <div className="w-20 h-20 mx-auto bg-blue-100 dark:bg-blue-900/30 rounded-full flex items-center justify-center">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-10 h-10 text-blue-600 dark:text-blue-400">
+                      <path fillRule="evenodd" d="M12 2.25c-5.385 0-9.75 4.365-9.75 9.75s4.365 9.75 9.75 9.75 9.75-4.365 9.75-9.75S17.385 2.25 12 2.25ZM12.75 6a.75.75 0 0 0-1.5 0v6c0 .414.336.75.75.75h4.5a.75.75 0 0 0 0-1.5h-3.75V6Z" clipRule="evenodd" />
+                    </svg>
+                  </div>
+                  <h2 className="text-2xl font-bold text-gray-900 dark:text-white">Shop Pending Approval</h2>
+                  <p className="text-sm text-gray-600 dark:text-gray-400">
+                    Your shop <strong className="text-gray-800 dark:text-gray-200">"{currentUser.shopName || 'your shop'}"</strong> has been registered successfully and is awaiting admin approval.
+                  </p>
+                  <div className="bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800/50 rounded-lg p-4 space-y-2">
+                    <p className="text-xs text-blue-700 dark:text-blue-300 font-medium">What happens next?</p>
+                    <ul className="text-xs text-blue-600 dark:text-blue-400 space-y-1 text-left list-disc list-inside">
+                      <li>An admin will review your shop details</li>
+                      <li>Once approved, you'll have full access to your dashboard</li>
+                      <li>You'll be able to manage orders, set pricing, and more</li>
+                    </ul>
+                  </div>
+                  <p className="text-xs text-gray-500 dark:text-gray-500">
+                    This usually takes a few hours. Please check back soon!
                   </p>
                   <button
                     onClick={() => { logoutUser(); navigateTo('landing'); }}

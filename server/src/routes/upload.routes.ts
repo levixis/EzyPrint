@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { authenticate } from '../middleware/auth';
+import { blockPathTraversal } from '../middleware/security';
 import { uploadSingle, uploadMultiple } from '../middleware/upload';
 import * as uploadController from '../controllers/upload.controller';
 
@@ -24,19 +25,18 @@ router.post('/multiple', authenticate, uploadMultiple, uploadController.uploadMu
  * Get a download URL for a file by storage key.
  * The storageKey is URL-encoded (e.g., orders%2F123-abc-file.pdf).
  */
-router.get('/url/:storageKey', authenticate, uploadController.getDownloadUrl);
+router.get('/url/:storageKey', authenticate, blockPathTraversal, uploadController.getDownloadUrl);
 
 /**
- * GET /api/v1/uploads/download/:folder/:fileName
+ * GET /api/v1/uploads/download/:storageKey
  * Serve the actual file (local mode). S3 mode uses pre-signed URLs directly.
- * Split into folder + fileName to avoid Express 5 wildcard issues.
  */
-router.get('/download/:folder/:fileName', authenticate, uploadController.downloadFile);
+router.get('/download/:storageKey', authenticate, blockPathTraversal, uploadController.downloadFile);
 
 /**
  * DELETE /api/v1/uploads/:storageKey
  * Delete a file from storage by storage key (URL-encoded).
  */
-router.delete('/:storageKey', authenticate, uploadController.deleteFileHandler);
+router.delete('/:storageKey', authenticate, blockPathTraversal, uploadController.deleteFileHandler);
 
 export default router;

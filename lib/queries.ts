@@ -1,0 +1,433 @@
+/**
+ * lib/queries.ts — All REST API endpoint functions grouped by domain.
+ *
+ * Replaces:
+ * - Firestore getDoc/getDocs/setDoc/updateDoc/addDoc/onSnapshot
+ * - Firebase Storage upload/download/delete
+ * - Cloud Functions httpsCallable
+ *
+ * Every function returns typed data using the API client from lib/api.ts.
+ */
+
+import * as api from './api';
+import type {
+  User, ShopProfile, DocumentOrder, NotificationMessage,
+  SupportTicket, ShopPayout, ShopPricing, PayoutMethod,
+  OrderStatus, TicketCategory, TicketStatus, PrintColor,
+  ReactivationRequest, RefundRequest,
+  ShopLedgerEntry, ShopAggregate, BankDetails, PaymentConfiguration,
+} from '../types';
+
+// ──────────────────────────────────────────────
+// AUTH
+// ──────────────────────────────────────────────
+
+export interface AuthTokens {
+  user: User;
+  tokens: {
+    accessToken: string;
+    refreshToken: string;
+    accessTokenExpiresIn?: string;
+  };
+}
+
+export const authApi = {
+  register: (data: {
+    email: string; password: string; name: string;
+    type: 'STUDENT' | 'SHOP_OWNER';
+    shopName?: string; shopAddress?: string; referralCode?: string;
+  }) => api.post<AuthTokens>('/auth/register', data),
+
+  login: (email: string, password: string) =>
+    api.post<AuthTokens>('/auth/login', { email, password }),
+
+  googleAuth: (data: { idToken: string; userType?: 'STUDENT' | 'SHOP_OWNER'; shopName?: string; shopAddress?: string; referralCode?: string; }) =>
+    api.post<AuthTokens | { isNewUser: true; email: string; name: string }>('/auth/google', data),
+
+  refresh: (refreshToken: string) =>
+    api.post<{ tokens: { accessToken: string; refreshToken: string } }>('/auth/refresh', { refreshToken }),
+
+  me: () => api.get<{ user: User }>('/auth/me').then(r => r.user),
+
+  logout: () => api.post('/auth/logout'),
+
+  logoutAll: () => api.post('/auth/logout-all'),
+};
+
+// ──────────────────────────────────────────────
+// USERS
+// ──────────────────────────────────────────────
+
+export const userApi = {
+  getProfile: () => api.get<User>('/users/me'),
+
+  updateProfile: (data: Partial<Pick<User, 'name' | 'phone' | 'preferredLanguage' | 'profilePhotoUrl'>>) =>
+    api.patch<User>('/users/me', data),
+
+  listUsers: (params?: { type?: string; limit?: number; offset?: number }) => {
+    const query = new URLSearchParams();
+    if (params?.type) query.set('type', params.type);
+    if (params?.limit) query.set('limit', String(params.limit));
+    if (params?.offset) query.set('offset', String(params.offset));
+    const qs = query.toString();
+    return api.get<{ users: User[], pagination: any }>(`/users${qs ? `?${qs}` : ''}`).then(r => r.users);
+  },
+};
+
+// ──────────────────────────────────────────────
+// SHOPS
+// ──────────────────────────────────────────────
+
+const mapShopProfile = (shop: any): ShopProfile => {
+  if (!shop) return shop;
+  // Handle backend sending flat bwPerPage/colorPerPage vs nested customPricing
+  if (shop.bwPerPage !== undefined && shop.colorPerPage !== undefined && !shop.customPricing) {
+    return {
+      ...shop,
+      customPricing: {
+        bwPerPage: shop.bwPerPage,
+        colorPerPage: shop.colorPerPage,
+      },
+    };
+  }
+  return shop;
+};
+
+export const shopApi = {
+  list: (params?: { approved?: boolean; limit?: number }) => {
+    const query = new URLSearchParams();
+    if (params?.approved !== undefined) query.set('approved', String(params.approved));
+    if (params?.limit) query.set('limit', String(params.limit));
+    const qs = query.toString();
+    return api.get<{ shops: any[] }>(`/shops${qs ? `?${qs}` : ''}`).then(r => (r.shops || []).map(mapShopProfile));
+  },
+
+  getById: (shopId: string) =>
+    api.get<{ shop: any }>(`/shops/${shopId}`).then(r => mapShopProfile(r.shop)),
+
+  update: (shopId: string, data: {
+    pricing?: ShopPricing;
+    isOpen?: boolean;
+    payoutMethods?: PayoutMethod[];
+    contactPhone?: string;
+    contactPhoneAlt?: string;
+    contactEmail?: string;
+    whatsappNumber?: string;
+  }) => api.patch<{ shop: any }>(`/shops/${shopId}`, data).then(r => mapShopProfile(r.shop)),
+
+  approve: (shopId: string) =>
+    api.patch(`/shops/${shopId}/approve`, { approved: true }),
+
+  reject: (shopId: string, rejectionReason?: string) =>
+    api.patch(`/shops/${shopId}/approve`, { approved: false, rejectionReason }),
+
+  archive: (shopId: string) =>
+    api.patch(`/shops/${shopId}/archive`, { archived: true }),
+
+  unarchive: (shopId: string) =>
+    api.patch(`/shops/${shopId}/archive`, { archived: false }),
+
+  getAggregate: (shopId: string) =>
+    api.get<{ aggregate: ShopAggregate }>(`/shops/${shopId}/aggregate`).then(r => r.aggregate),
+};
+
+// ──────────────────────────────────────────────
+// ORDERS
+// ──────────────────────────────────────────────
+
+export const orderApi = {
+  create: (data: {
+    shopId: string;
+    specialInstructions?: string;
+    files: {
+      fileName: string; fileType: string; fileSizeBytes: number;
+      pageCount: number; color: PrintColor; copies: number; doubleSided: boolean;
+    }[];
+  }) => api.post<{ orderId: string; verifiedPrice: DocumentOrder['priceDetails']; files: { id: string }[] }>('/orders', data),
+
+  list: (params?: { limit?: number; offset?: number }) => {
+    const query = new URLSearchParams();
+    if (params?.limit) query.set('limit', String(params.limit));
+    if (params?.offset) query.set('offset', String(params.offset));
+    const qs = query.toString();
+    return api.get<{ orders: DocumentOrder[] }>(`/orders${qs ? `?${qs}` : ''}`).then(r => r.orders);
+  },
+
+  listAll: (params?: { limit?: number; offset?: number }) => {
+    const query = new URLSearchParams();
+    if (params?.limit) query.set('limit', String(params.limit));
+    if (params?.offset) query.set('offset', String(params.offset));
+    const qs = query.toString();
+    return api.get<{ orders: DocumentOrder[] }>(`/orders/admin/all${qs ? `?${qs}` : ''}`).then(r => r.orders);
+  },
+
+  getById: (orderId: string) =>
+    api.get<{ order: DocumentOrder }>(`/orders/${orderId}`).then(r => r.order),
+
+  updateStatus: (orderId: string, status: OrderStatus, details?: {
+    shopNotes?: string; paymentAttemptedAt?: string;
+  }) => api.patch<DocumentOrder>(`/orders/${orderId}/status`, { status, ...details }),
+
+  requestRefund: (orderId: string, reason: string) =>
+    refundApi.create(orderId, reason),
+};
+
+// ──────────────────────────────────────────────
+// PAYMENTS
+// ──────────────────────────────────────────────
+
+export const paymentApi = {
+  createOrder: (orderId: string) =>
+    api.post<{ razorpayOrderId: string; amount: number; currency: string; key: string }>(
+      '/payments/create-order', { orderId }
+    ),
+
+  verify: (data: {
+    razorpay_order_id: string;
+    razorpay_payment_id: string;
+    razorpay_signature: string;
+    orderId: string;
+  }) => api.post<{ verified: boolean }>('/payments/verify', data),
+
+  reconcile: () =>
+    api.post<{ reconciled: number }>('/payments/reconcile'),
+};
+
+// ──────────────────────────────────────────────
+// UPLOADS (File Storage — replaces Firebase Storage)
+// ──────────────────────────────────────────────
+
+export const uploadApi = {
+  /** Upload a single file */
+  uploadSingle: (file: File, metadata?: Record<string, string>) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    if (metadata) {
+      formData.append('metadata', JSON.stringify(metadata));
+    }
+    return api.upload<{ storageKey: string; url: string }>('/uploads/single', formData);
+  },
+
+  /** Upload multiple files */
+  uploadMultiple: (files: File[], metadata?: Record<string, string>) => {
+    const formData = new FormData();
+    files.forEach(file => formData.append('files', file));
+    if (metadata) {
+      formData.append('metadata', JSON.stringify(metadata));
+    }
+    return api.upload<{ storageKeys: string[]; urls: string[] }>('/uploads/multiple', formData);
+  },
+
+  /** Get a presigned download URL */
+  getDownloadUrl: (storageKey: string) =>
+    api.get<{ url: string }>(`/uploads/url/${encodeURIComponent(storageKey)}`),
+
+  /** Download a file as Blob */
+  downloadFile: (storageKey: string) =>
+    api.downloadBlob(`/uploads/download/${encodeURIComponent(storageKey)}`),
+
+  /** Delete a file */
+  deleteFile: (storageKey: string) =>
+    api.del(`/uploads/${encodeURIComponent(storageKey)}`),
+};
+
+// ──────────────────────────────────────────────
+// NOTIFICATIONS
+// ──────────────────────────────────────────────
+
+export const notificationApi = {
+  list: (params?: { limit?: number }) => {
+    const query = new URLSearchParams();
+    if (params?.limit) query.set('limit', String(params.limit));
+    const qs = query.toString();
+    return api.get<{ notifications: NotificationMessage[] }>(`/notifications${qs ? `?${qs}` : ''}`).then(r => r.notifications);
+  },
+
+  markAsRead: (notificationId: string) =>
+    api.patch(`/notifications/${notificationId}/read`),
+
+  markAllAsRead: () =>
+    api.patch('/notifications/read-all'),
+};
+
+// ──────────────────────────────────────────────
+// TICKETS
+// ──────────────────────────────────────────────
+
+export const ticketApi = {
+  create: (data: {
+    subject: string;
+    category: TicketCategory;
+    description: string;
+    relatedOrderId?: string;
+  }) => api.post<{ ticket: { id: string } }>('/tickets', data).then(r => ({ ticketId: r.ticket.id })),
+
+  list: () => api.get<{ tickets: SupportTicket[] }>('/tickets').then(r => r.tickets),
+
+  getById: (ticketId: string) =>
+    api.get<{ ticket: SupportTicket }>(`/tickets/${ticketId}`).then(r => r.ticket),
+
+  addMessage: (ticketId: string, message: string) =>
+    api.post(`/tickets/${ticketId}/messages`, { message }),
+
+  updateStatus: (ticketId: string, status: TicketStatus, note?: string) =>
+    api.patch(`/tickets/${ticketId}/status`, { status, note }),
+};
+
+// ──────────────────────────────────────────────
+// PAYOUTS (Ledger-based)
+// ──────────────────────────────────────────────
+
+export const payoutApi = {
+  getBalance: (shopId: string) =>
+    api.get<{ pendingBalance: number; ledgerBalance: number; debtAmount: number }>(
+      `/payouts/balance/${shopId}`
+    ),
+
+  getLedger: (shopId: string, params?: { limit?: number; offset?: number }) => {
+    const query = new URLSearchParams();
+    if (params?.limit) query.set('limit', String(params.limit));
+    if (params?.offset) query.set('offset', String(params.offset));
+    const qs = query.toString();
+    return api.get<{ entries: ShopLedgerEntry[]; pagination: any; currentBalance: number; ledgerBalance: number }>(`/payouts/ledger/${shopId}${qs ? `?${qs}` : ''}`);
+  },
+
+  request: (data: { shopId: string; amount: number; shopOwnerNote?: string }) =>
+    api.post<ShopPayout>('/payouts/request', data),
+
+  /** Approve and initiate the transfer. Moves the payout to IN_TRANSIT. */
+  approve: (payoutId: string, otp: string, adminNote?: string) =>
+    api.post(`/payouts/${payoutId}/approve`, { otp, adminNote }),
+
+  /** Confirm an in-transit payout has landed in the shop's bank account. */
+  markPaid: (payoutId: string, otp: string, adminNote?: string) =>
+    api.post(`/payouts/${payoutId}/mark-paid`, { otp, adminNote }),
+
+  reject: (payoutId: string, otp: string, adminNote?: string) =>
+    api.post(`/payouts/${payoutId}/reject`, { otp, adminNote }),
+
+  cancel: (payoutId: string, otp: string) =>
+    api.post(`/payouts/${payoutId}/cancel`, { otp }),
+
+  confirm: (payoutId: string) =>
+    api.post(`/payouts/${payoutId}/confirm`),
+
+  dispute: (payoutId: string, shopOwnerNote: string) =>
+    api.post(`/payouts/${payoutId}/dispute`, { shopOwnerNote }),
+
+  createManual: (data: {
+    shopId: string; shopName: string; amount: number;
+    adminNote?: string; otp: string;
+  }) => api.post<ShopPayout>('/payouts/manual', data),
+
+  list: (params?: { shopId?: string; limit?: number }) => {
+    const query = new URLSearchParams();
+    if (params?.shopId) query.set('shopId', params.shopId);
+    if (params?.limit) query.set('limit', String(params.limit));
+    const qs = query.toString();
+    return api.get<ShopPayout[]>(`/payouts${qs ? `?${qs}` : ''}`);
+  },
+};
+
+// ──────────────────────────────────────────────
+// REFUND REQUESTS
+// ──────────────────────────────────────────────
+
+export const refundApi = {
+  create: (orderId: string, reason: string) =>
+    api.post('/refunds', { orderId, reason }),
+
+  respond: (requestId: string, approved: boolean, shopResponse?: string) =>
+    api.post(`/refunds/${requestId}/respond`, { approved, shopResponse }),
+
+  escalate: (requestId: string) =>
+    api.post(`/refunds/${requestId}/escalate`),
+
+  resolve: (requestId: string, action: 'APPROVE' | 'DENY', otp: string, adminNote?: string) =>
+    api.post(`/refunds/${requestId}/resolve`, { action, otp, adminNote }),
+
+  syncHistory: (orderId: string) =>
+    api.get<{ success: boolean; count: number; refunds: RefundRequest[] }>(
+      `/refunds/history/${orderId}`
+    ),
+
+  list: () => api.get<RefundRequest[]>('/refunds'),
+};
+
+// ──────────────────────────────────────────────
+// BANK DETAILS & PAYMENT CONFIG
+// ──────────────────────────────────────────────
+
+export const bankApi = {
+  get: (shopId: string) =>
+    api.get<BankDetails | null>(`/shops/${shopId}/bank-details`),
+
+  save: (shopId: string, details: BankDetails) =>
+    api.post(`/shops/${shopId}/bank-details`, details),
+
+  verify: (shopId: string) =>
+    api.post(`/shops/${shopId}/bank-details/verify`),
+
+  getPaymentConfig: (shopId: string) =>
+    api.get<PaymentConfiguration | null>(`/shops/${shopId}/payment-config`),
+};
+
+// ──────────────────────────────────────────────
+// REACTIVATION REQUESTS
+// ──────────────────────────────────────────────
+
+export const reactivationApi = {
+  submit: (shopId: string, shopName: string) =>
+    api.post<{ success: boolean; message?: string }>('/reactivation/submit', { shopId, shopName }),
+
+  resolve: (requestId: string, action: 'approve' | 'reject', otp: string, rejectionReason?: string) =>
+    api.post<{ success: boolean; message?: string }>(`/reactivation/${requestId}/resolve`, { action, otp, rejectionReason }),
+
+  list: () => api.get<ReactivationRequest[]>('/reactivation'),
+};
+
+// ──────────────────────────────────────────────
+// ADMIN ACTIONS
+// ──────────────────────────────────────────────
+
+export const adminApi = {
+  requestOTP: (actionId: string) =>
+    api.post<{ success: boolean; message?: string }>('/admin/otp', { actionId }),
+
+  executeAction: (action: string, otp: string, targetUid?: string, targetShopId?: string) =>
+    api.post<{ success: boolean; message?: string }>('/admin/action', { action, otp, targetUid, targetShopId }),
+
+  getStudentPassHolders: () =>
+    api.get<{ users: { id: string; name?: string; email?: string; studentPassActivatedAt?: string; studentPassPaymentId?: string }[] }>('/users?type=STUDENT&hasPass=true').then(r => r.users),
+
+  checkReturningShopOwner: (email: string) =>
+    api.post<{
+      exists: boolean; hasActiveAccount?: boolean; hasArchivedShop?: boolean;
+      isOwnerOrphaned?: boolean; oldUserId?: string; shop?: any;
+    }>('/admin/check-returning-shop', { email }).then(r => ({
+      ...r,
+      shop: r.shop ? mapShopProfile(r.shop) : undefined
+    })),
+};
+
+// ──────────────────────────────────────────────
+// REFERRALS (ADMIN ONLY)
+// ──────────────────────────────────────────────
+
+export interface ReferralCode {
+  id: string;
+  code: string;
+  createdBy: string;
+  usedBy?: string;
+  usedAt?: string;
+  expiresAt?: string;
+  createdAt: string;
+  creator?: { name: string | null; email: string | null };
+  user?: { name: string | null; email: string | null; shop?: { name: string } | null };
+}
+
+export const referralApi = {
+  list: () => api.get<{ codes: ReferralCode[] }>('/referrals').then(r => r.codes),
+  create: (daysValid: number = 7) => api.post<{ code: ReferralCode }>('/referrals', { daysValid }).then(r => r.code),
+  delete: (codeId: string) => api.del<{ success: boolean; message: string }>(`/referrals/${codeId}`),
+};

@@ -6,8 +6,7 @@ import { Card } from '../common/Card';
 import { Input } from '../common/Input';
 import { Spinner } from '../common/Spinner';
 import { UserType } from '../../types';
-import { signOut } from 'firebase/auth';
-import { auth } from '../../firebase';
+// Firebase removed — logout handled via AppContext
 
 const EzyPrintLogoIconLarge: React.FC = () => (
   <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-16 h-16 text-brand-primary mb-4 mx-auto">
@@ -41,15 +40,16 @@ type EmailSubMode = 'signin' | 'signup';
 const LoginPage: React.FC = () => {
   const {
     signInWithGoogle,
-    signUpWithEmailPassword,
     signInWithEmailAndPassword,
-    completeStudentProfileCreation,
+    signUpWithEmailPassword,
+    isLoadingAuth,
+    pendingFirebaseProfileCreationUser,
     completeShopOwnerProfileCreation,
+    completeStudentProfileCreation,
     checkReturningShopOwner,
     submitReactivationRequest,
-    isLoadingAuth,
     currentUser,
-    pendingFirebaseProfileCreationUser,
+    logoutUser,
   } = useAppContext();
 
   const [step, setStep] = useState<LoginStep>('pathSelection');
@@ -62,6 +62,7 @@ const LoginPage: React.FC = () => {
 
   const [shopName, setShopName] = useState('');
   const [shopAddress, setShopAddress] = useState('');
+  const [referralCode, setReferralCode] = useState('');
 
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
@@ -84,7 +85,7 @@ const LoginPage: React.FC = () => {
       setError(result.message || "Profile creation failed.");
       setStep(failureStep);
     } else {
-      clearSessionStorageAuthFlow(); // Clear on successful profile creation
+      clearSessionStorageAuthFlow(); 
       if (successStep) setStep(successStep);
     }
   };
@@ -159,7 +160,7 @@ const LoginPage: React.FC = () => {
         if (authMode !== 'email') setAuthMode('email');
         if (currentIntendedType === UserType.STUDENT) {
           if (step !== 'processing') setStep('processing');
-          completeStudentProfileCreation(authUser, nameForProfile)
+          completeStudentProfileCreation(nameForProfile)
             .then(result => handleProfileCreationResult(result, null, 'emailAuth'))
             .catch(err => handleProfileCreationError(err, 'emailAuth'));
         } else if (currentIntendedType === UserType.SHOP_OWNER) {
@@ -228,6 +229,14 @@ const LoginPage: React.FC = () => {
     if (emailSubMode === 'signup' && !nameForProfile.trim()) { setError("Full name is required for sign up."); return; }
     if (!email.trim() || !password.trim()) { setError("Email and password are required."); return; }
 
+    if (emailSubMode === 'signup') {
+      if (password.length < 8) { setError("Password must be at least 8 characters."); return; }
+      if (!/[A-Z]/.test(password)) { setError("Password must include at least one uppercase letter."); return; }
+      if (!/[a-z]/.test(password)) { setError("Password must include at least one lowercase letter."); return; }
+      if (!/[0-9]/.test(password)) { setError("Password must include at least one number."); return; }
+      if (!/[^A-Za-z0-9]/.test(password)) { setError("Password must include at least one special character."); return; }
+    }
+
     sessionStorage.setItem(SESSION_STORAGE_INTENDED_TYPE_KEY, userType);
     sessionStorage.setItem(SESSION_STORAGE_AUTH_METHOD_KEY, 'email');
     setIntendedUserTypeForSignup(userType);
@@ -249,13 +258,15 @@ const LoginPage: React.FC = () => {
     sessionStorage.setItem(SESSION_STORAGE_AUTH_METHOD_KEY, 'email'); // Still useful for refresh
     setAuthMethodForSignup('email');
     setIntendedUserTypeForSignup(null);
-    setStep('processing');
+    // Keep step as 'emailAuth' (not 'processing') to prevent the useEffect
+    // guard from resetting the form when isLoadingAuth toggles
     const result = await signInWithEmailAndPassword(email, password);
     if (!result.success) {
+      // Show the actual backend error (e.g. "Invalid email or password")
+      // Don't assume the account doesn't exist — they may just have the wrong password
       setError(result.message || "Sign in failed. Please check your credentials.");
-      setAuthMode('email'); // Ensure we stay on email mode
       setStep('emailAuth');
-      setEmailSubMode('signin'); // Ensure we stay on sign-in sub mode
+      // Stay on sign-in mode so user can retry with correct password
     }
   };
 
@@ -264,7 +275,7 @@ const LoginPage: React.FC = () => {
     if (!nameForProfile.trim()) { setError("Name cannot be empty."); return; }
     if (pendingFirebaseProfileCreationUser) {
       setStep('processing');
-      const result = await completeStudentProfileCreation(pendingFirebaseProfileCreationUser, nameForProfile);
+      const result = await completeStudentProfileCreation(nameForProfile);
       handleProfileCreationResult(result, null, 'confirmGoogleUserName');
     } else {
       setError("Authentication session lost. Please try signing in again.");
@@ -281,12 +292,14 @@ const LoginPage: React.FC = () => {
     if (!shopName.trim() || !shopAddress.trim()) {
       setError("Please enter shop name and address."); return;
     }
+    if (!referralCode.trim()) {
+      setError("A valid referral code is required."); return;
+    }
 
     if (pendingFirebaseProfileCreationUser) {
       setStep('processing');
       const result = await completeShopOwnerProfileCreation(
-        pendingFirebaseProfileCreationUser,
-        { shopName, shopAddress },
+        { shopName, shopAddress, referralCode },
         nameForProfile
       );
       handleProfileCreationResult(result, null, 'shopOwnerDetails');
@@ -317,7 +330,7 @@ const LoginPage: React.FC = () => {
       clearSessionStorageAuthFlow();
       if (pendingFirebaseProfileCreationUser) {
         setStep('processing');
-        await signOut(auth);
+        await logoutUser();
       }
       setIntendedUserTypeForSignup(null);
       setAuthMethodForSignup(null);
@@ -505,6 +518,7 @@ const LoginPage: React.FC = () => {
             </p>
             <Input label="Shop Name" id="shopName" type="text" value={shopName} onChange={(e) => setShopName(e.target.value)} placeholder="My Awesome Print Shop" required />
             <Input label="Shop Address (Short)" id="shopAddress" type="text" value={shopAddress} onChange={(e) => setShopAddress(e.target.value)} placeholder="Main Street, Near Campus" required />
+            <Input label="Referral Code" id="referralCode" type="text" value={referralCode} onChange={(e) => setReferralCode(e.target.value.toUpperCase())} placeholder="EZY-XXXXXX" required />
             <Button type="submit" variant="primary" size="lg" fullWidth>
               Register Shop & Login
             </Button>
@@ -526,7 +540,7 @@ const LoginPage: React.FC = () => {
               An active shop owner account with this email already exists. Please sign out and sign in with your existing credentials.
             </p>
             <Button
-              onClick={async () => { await signOut(auth); handleCancelAndReset(false); setEmailSubMode('signin'); }}
+              onClick={async () => { await logoutUser(); handleCancelAndReset(false); setEmailSubMode('signin'); }}
               variant="primary" size="lg" fullWidth
             >
               Sign Out & Sign In
@@ -591,7 +605,7 @@ const LoginPage: React.FC = () => {
 
             <Button
               type="button" variant="ghost" size="sm"
-              onClick={async () => { await signOut(auth); handleCancelAndReset(false); }} fullWidth className="!text-xs"
+              onClick={async () => { await logoutUser(); handleCancelAndReset(false); }} fullWidth className="!text-xs"
             >
               Sign Out
             </Button>

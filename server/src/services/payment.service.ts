@@ -15,6 +15,27 @@ import { env } from '../config/env';
  *      retries payment during the reconciliation gap window.
  */
 
+/**
+ * How long a payment-creation claim is honoured before another request may take
+ * it over. Long enough to cover a slow Razorpay round trip, short enough that a
+ * crashed request does not leave an order unpayable for long.
+ */
+const PAYMENT_CLAIM_TTL_MS = 60 * 1000;
+
+/**
+ * Constant-time comparison of two hex digests.
+ *
+ * `===` on a signature short-circuits at the first differing character, leaking
+ * through response timing how much of a guess was correct.
+ */
+function signaturesMatch(expected: string, received: string): boolean {
+  const a = Buffer.from(expected, 'utf8');
+  const b = Buffer.from(received, 'utf8');
+  // timingSafeEqual throws on length mismatch, and length alone is not secret.
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
 // ── Razorpay Client (lazy-initialized) ──
 let razorpayClient: InstanceType<typeof Razorpay> | null = null;
 
@@ -40,7 +61,7 @@ interface CreatePaymentResult {
   amount: number;      // in paise (₹1 = 100 paise)
   currency: string;
   orderId: string;     // our internal order ID
-  keyId: string;       // Razorpay key ID for frontend
+  key: string;       // Razorpay key ID for frontend
 }
 
 /**
@@ -60,17 +81,14 @@ export async function createPaymentOrder(
   if (!order) throw ApiError.notFound('Order not found');
   if (order.userId !== userId) throw ApiError.forbidden('This is not your order');
 
-  // ── Upgrade C: Idempotency on order-creation ──
-  // If a Razorpay order already exists for this order, return it.
-  // This prevents the double-charge scenario where a student retries
-  // payment while reconciliation hasn't caught up yet.
+  // Fast path: a Razorpay order already exists, so hand back the same one.
   if (order.razorpayOrderId && order.status === 'PENDING_PAYMENT') {
     return {
       razorpayOrderId: order.razorpayOrderId,
-      amount: Math.round(order.totalPrice * 100),
+      amount: order.totalPrice,
       currency: 'INR',
-      orderId: orderId,
-      keyId: env.RAZORPAY_KEY_ID,
+      orderId,
+      key: env.RAZORPAY_KEY_ID,
     };
   }
 
@@ -78,38 +96,113 @@ export async function createPaymentOrder(
     throw ApiError.badRequest(`Order is in ${order.status} status, not PENDING_PAYMENT`);
   }
 
-  const amountInPaise = Math.round(order.totalPrice * 100);
-  if (amountInPaise < 100) {
+  if (order.totalPrice < 100) {
     throw ApiError.badRequest('Minimum order amount is ₹1');
+  }
+
+  // ── Claim the right to create, atomically, BEFORE calling Razorpay ──
+  //
+  // The read above cannot be trusted on its own: two taps on "Pay" produce two
+  // requests that both see razorpayOrderId as null, both call Razorpay, and both
+  // create a real order. The second write then overwrites the first's
+  // razorpayOrderId, so a payment against the orphaned order arrives on a
+  // webhook that matches no row — the student is charged with nothing to show.
+  //
+  // Setting paymentAttemptedAt from null (or from a stale value) is a
+  // compare-and-swap: exactly one concurrent request can win it, and only the
+  // winner is allowed to talk to Razorpay.
+  const staleClaimCutoff = new Date(Date.now() - PAYMENT_CLAIM_TTL_MS);
+  const claim = await prisma.order.updateMany({
+    where: {
+      id: orderId,
+      status: 'PENDING_PAYMENT',
+      razorpayOrderId: null,
+      // Reclaimable if a previous attempt died before recording its result,
+      // otherwise a crash would strand the order permanently unpayable.
+      OR: [
+        { paymentAttemptedAt: null },
+        { paymentAttemptedAt: { lt: staleClaimCutoff } },
+      ],
+    },
+    data: { paymentAttemptedAt: new Date() },
+  });
+
+  if (claim.count === 0) {
+    // Lost the race. Either the winner has already recorded its Razorpay order
+    // (return it — this is the genuine idempotent hit), or it is still in
+    // flight and the client should retry in a moment.
+    const current = await prisma.order.findUnique({ where: { id: orderId } });
+    if (current?.razorpayOrderId) {
+      return {
+        razorpayOrderId: current.razorpayOrderId,
+        amount: current.totalPrice,
+        currency: 'INR',
+        orderId,
+        key: env.RAZORPAY_KEY_ID,
+      };
+    }
+    throw ApiError.conflict('A payment is already being set up for this order. Please try again in a moment.');
   }
 
   const razorpay = getRazorpay();
 
-  const rpOrder = await razorpay.orders.create({
-    amount: amountInPaise,
-    currency: 'INR',
-    receipt: orderId,
-    notes: {
-      orderId: orderId,
-      userId: userId,
-      shopId: order.shopId,
-    },
+  let rpOrder: { id: string };
+  try {
+    rpOrder = await razorpay.orders.create({
+      amount: order.totalPrice,
+      currency: 'INR',
+      receipt: orderId,
+      notes: {
+        orderId,
+        userId,
+        shopId: order.shopId,
+      },
+    });
+  } catch (error) {
+    // Release the claim so the student can retry immediately rather than
+    // waiting out the stale-claim TTL.
+    await prisma.order.updateMany({
+      where: { id: orderId, razorpayOrderId: null },
+      data: { paymentAttemptedAt: null },
+    });
+    throw error;
+  }
+
+  // Guarded write: the unique constraint on razorpayOrderId is the DB-level
+  // backstop, and `razorpayOrderId: null` here means we never clobber a value
+  // another request somehow recorded first.
+  const recorded = await prisma.order.updateMany({
+    where: { id: orderId, razorpayOrderId: null },
+    data: { razorpayOrderId: rpOrder.id },
   });
 
-  await prisma.order.update({
-    where: { id: orderId },
-    data: {
-      razorpayOrderId: rpOrder.id,
-      paymentAttemptedAt: new Date(),
-    },
-  });
+  if (recorded.count === 0) {
+    // Should be unreachable given the claim above. If it happens, the Razorpay
+    // order we just created is orphaned — log it loudly so it can be reconciled
+    // rather than silently returning an ID the DB does not know about.
+    console.error(
+      `⚠️ Orphaned Razorpay order ${rpOrder.id} for EzyPrint order ${orderId} — ` +
+      `another request recorded a different Razorpay order first.`
+    );
+    const current = await prisma.order.findUnique({ where: { id: orderId } });
+    if (current?.razorpayOrderId) {
+      return {
+        razorpayOrderId: current.razorpayOrderId,
+        amount: current.totalPrice,
+        currency: 'INR',
+        orderId,
+        key: env.RAZORPAY_KEY_ID,
+      };
+    }
+    throw ApiError.internal('Could not attach the payment to this order.');
+  }
 
   return {
     razorpayOrderId: rpOrder.id,
-    amount: amountInPaise,
+    amount: order.totalPrice,
     currency: 'INR',
-    orderId: orderId,
-    keyId: env.RAZORPAY_KEY_ID,
+    orderId,
+    key: env.RAZORPAY_KEY_ID,
   };
 }
 
@@ -162,9 +255,9 @@ export async function verifyPayment(
     .update(body)
     .digest('hex');
 
-  if (expectedSignature !== razorpaySignature) {
-    await prisma.order.update({
-      where: { id: orderId },
+  if (!signaturesMatch(expectedSignature, razorpaySignature)) {
+    await prisma.order.updateMany({
+      where: { id: orderId, status: 'PENDING_PAYMENT' },
       data: {
         status: 'PAYMENT_FAILED',
         paymentVerifiedVia: 'signature_mismatch',
@@ -173,14 +266,20 @@ export async function verifyPayment(
     throw ApiError.badRequest('Payment verification failed — signature mismatch');
   }
 
-  const updatedOrder = await prisma.order.update({
-    where: { id: orderId },
+  // Guarded on the status read above. The webhook path may have committed the
+  // same transition in the meantime; an unguarded update would overwrite what it
+  // wrote instead of deferring to it.
+  await prisma.order.updateMany({
+    where: { id: orderId, status: 'PENDING_PAYMENT' },
     data: {
       status: 'PENDING_APPROVAL',
       razorpayPaymentId,
       paymentVerifiedVia: 'signature',
     },
   });
+
+  const updatedOrder = await prisma.order.findUnique({ where: { id: orderId } });
+  if (!updatedOrder) throw ApiError.notFound('Order not found');
 
   return updatedOrder;
 }
@@ -215,7 +314,7 @@ export async function handleWebhook(
     .update(rawBody)
     .digest('hex');
 
-  if (expectedSignature !== signature) {
+  if (!signaturesMatch(expectedSignature, signature)) {
     throw ApiError.unauthorized('Invalid webhook signature');
   }
 
@@ -227,29 +326,29 @@ export async function handleWebhook(
     throw ApiError.badRequest('Webhook payload missing event.id');
   }
 
-  // Step 2: Check idempotency — has this event already been processed?
-  const existing = await prisma.webhookEvent.findUnique({
-    where: { eventId },
-  });
-
-  if (existing?.processed) {
-    // Already processed — return 200 idempotently
-    return { received: true, status: 'already_processed' };
-  }
-
-  // Step 3: Log the raw event (even if processing fails later)
+  // Step 2/3: Record the event, idempotently.
+  //
+  // Razorpay double-delivers on occasion. A findUnique-then-create would let two
+  // concurrent deliveries both see "not present" and both insert, and the loser's
+  // unique-constraint violation would surface as a 500 that prompts yet another
+  // retry. An upsert collapses the check and the insert into one statement, so
+  // the duplicate is absorbed instead of erroring.
   const rpOrderId = event.payload?.payment?.entity?.order_id || null;
 
-  if (!existing) {
-    await prisma.webhookEvent.create({
-      data: {
-        source: 'razorpay',
-        eventId,
-        eventType,
-        razorpayOrderId: rpOrderId,
-        payload: event,
-      },
-    });
+  const record = await prisma.webhookEvent.upsert({
+    where: { eventId },
+    create: {
+      source: 'razorpay',
+      eventId,
+      eventType,
+      razorpayOrderId: rpOrderId,
+      payload: event,
+    },
+    update: {}, // already recorded — leave the original payload untouched
+  });
+
+  if (record.processed) {
+    return { received: true, status: 'already_processed' };
   }
 
   // Step 4+5: Process and mark as processed in a single transaction
@@ -381,7 +480,7 @@ export async function reconcilePayments(thresholdMinutes: number = 15) {
   });
 
   if (stuckOrders.length === 0) {
-    return { reconciled: 0, checked: 0 };
+    return { reconciled: 0, checked: 0, retriedWebhooks: 0 };
   }
 
   const razorpay = getRazorpay();

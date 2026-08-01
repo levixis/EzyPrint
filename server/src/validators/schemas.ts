@@ -48,7 +48,6 @@ const phone = z
   .regex(/^[0-9]{10}$/, 'Phone must be 10 digits')
   .optional();
 
-const cuid = z.string().min(20).max(30);
 
 const pagination = {
   page: z.coerce.number().int().positive().optional().default(1),
@@ -69,14 +68,15 @@ export const registerSchema = z.object({
     }),
     shopName: z.string().min(1).max(200).optional(),
     shopAddress: z.string().min(1).max(500).optional(),
+    referralCode: z.string().min(1).max(50).optional(),
   }).refine(
     (data) => {
       if (data.type === 'SHOP_OWNER') {
-        return !!data.shopName && !!data.shopAddress;
+        return !!data.shopName && !!data.shopAddress && !!data.referralCode;
       }
       return true;
     },
-    { message: 'Shop name and address are required for SHOP_OWNER registration' }
+    { message: 'Shop name, address, and referral code are required for SHOP_OWNER registration' }
   ),
 });
 
@@ -90,7 +90,10 @@ export const loginSchema = z.object({
 export const googleAuthSchema = z.object({
   body: z.object({
     idToken: z.string().min(1, 'Google ID token is required'),
-    userType: z.enum(['STUDENT', 'SHOP_OWNER']).optional().default('STUDENT'),
+    userType: z.enum(['STUDENT', 'SHOP_OWNER']).optional(),
+    shopName: z.string().min(1).max(200).optional(),
+    shopAddress: z.string().min(1).max(500).optional(),
+    referralCode: z.string().min(1).max(50).optional(),
   }),
 });
 
@@ -130,8 +133,10 @@ export const listUsersSchema = z.object({
 
 export const updateShopSchema = z.object({
   body: z.object({
-    bwPerPage: z.number().min(0, 'Price cannot be negative').max(1000).optional(),
-    colorPerPage: z.number().min(0, 'Price cannot be negative').max(1000).optional(),
+    pricing: z.object({
+      bwPerPage: z.number().min(0).max(1000),
+      colorPerPage: z.number().min(0).max(1000),
+    }).optional(),
     isOpen: z.boolean().optional(),
     contactPhone: z.string().max(20).optional(),
     contactPhoneAlt: z.string().max(20).optional(),
@@ -142,9 +147,7 @@ export const updateShopSchema = z.object({
 
 export const archiveShopSchema = z.object({
   body: z.object({
-    action: z.enum(['archive', 'unarchive'], {
-      errorMap: () => ({ message: "Action must be 'archive' or 'unarchive'" }),
-    }),
+    archived: z.boolean(),
   }),
 });
 
@@ -155,16 +158,16 @@ export const archiveShopSchema = z.object({
 export const createOrderSchema = z.object({
   body: z.object({
     shopId: z.string().min(1, 'Shop ID is required'),
-    fileName: z.string().min(1, 'File name is required').max(500),
-    fileType: z.string().min(1).max(50),
-    fileStoragePath: z.string().max(1000).optional(),
-    fileSizeBytes: z.number().int().positive().optional(),
-    copies: z.number().int().min(1, 'At least 1 copy').max(999, 'Max 999 copies'),
-    color: z.enum(['BLACK_WHITE', 'COLOR']),
-    pages: z.number().int().min(1, 'At least 1 page').max(9999, 'Max 9999 pages'),
-    doubleSided: z.boolean(),
-    startPage: z.number().int().positive().optional(),
-    endPage: z.number().int().positive().optional(),
+    files: z.array(z.object({
+      fileName: z.string().min(1).max(500),
+      fileType: z.string().min(1).max(50),
+      fileStoragePath: z.string().max(1000).optional(),
+      fileSizeBytes: z.number().int().positive().optional(),
+      copies: z.number().int().min(1).max(999),
+      color: z.enum(['BLACK_WHITE', 'COLOR']),
+      pageCount: z.number().int().min(1).max(9999),
+      doubleSided: z.boolean(),
+    })).min(1, 'At least one file is required'),
     specialInstructions: z.string().max(1000).optional(),
     userName: z.string().max(200).optional(),
     isPremiumOrder: z.boolean().optional(),
@@ -207,9 +210,9 @@ export const createPaymentOrderSchema = z.object({
 export const verifyPaymentSchema = z.object({
   body: z.object({
     orderId: z.string().min(1),
-    razorpayPaymentId: z.string().min(1, 'razorpayPaymentId is required'),
-    razorpayOrderId: z.string().min(1, 'razorpayOrderId is required'),
-    razorpaySignature: z.string().min(1, 'razorpaySignature is required'),
+    razorpay_payment_id: z.string().min(1, 'razorpay_payment_id is required'),
+    razorpay_order_id: z.string().min(1, 'razorpay_order_id is required'),
+    razorpay_signature: z.string().min(1, 'razorpay_signature is required'),
   }),
 });
 
@@ -223,6 +226,7 @@ export const createTicketSchema = z.object({
     description: z.string().min(1, 'Description is required').max(5000),
     category: z.enum(['ORDER_ISSUE', 'PAYMENT_ISSUE', 'DELIVERY_ISSUE', 'OTHER']),
     orderId: z.string().optional(),
+    relatedOrderId: z.string().optional(),
     shopId: z.string().optional(),
   }),
 });
@@ -237,5 +241,116 @@ export const ticketStatusSchema = z.object({
   body: z.object({
     status: z.enum(['OPEN', 'IN_REVIEW', 'RESOLVED', 'CLOSED']),
     note: z.string().max(1000).optional(),
+  }),
+});
+
+// ────────────────────────────────────────────────────────────
+// PAYOUT, REFUND, AND BANK SCHEMAS
+// ────────────────────────────────────────────────────────────
+
+export const requestPayoutSchema = z.object({
+  body: z.object({
+    // Paise. Integer because money is never fractional at the smallest unit.
+    amount: z.number().int('Amount must be a whole number of paise').positive('Amount must be greater than 0'),
+    shopOwnerNote: z.string().max(1000).optional(),
+  }),
+});
+
+export const actionPayoutSchema = z.object({
+  body: z.object({
+    adminNote: z.string().max(1000).optional(),
+  }),
+});
+
+export const manualPayoutSchema = z.object({
+  body: z.object({
+    shopId: z.string().min(1, 'Shop ID is required'),
+    amount: z.number().int('Amount must be a whole number of paise').positive('Amount must be positive'),
+    adminNote: z.string().max(1000).optional(),
+  }),
+});
+
+export const requestRefundSchema = z.object({
+  body: z.object({
+    orderId: z.string().min(1, 'Order ID is required'),
+    reason: z.string().min(1, 'Reason is required').max(1000),
+  }),
+});
+
+export const respondRefundSchema = z.object({
+  body: z.object({
+    approved: z.boolean(),
+    shopResponse: z.string().max(1000).optional(),
+  }),
+});
+
+export const resolveRefundSchema = z.object({
+  body: z.object({
+    action: z.enum(['APPROVE', 'DENY']),
+    // Resolving a refund issues a real Razorpay refund, so it is gated behind a
+    // one-time code like every other money-moving admin action.
+    otp: z.string().regex(/^\d{6}$/, 'Enter the 6-digit verification code'),
+    adminNote: z.string().max(1000).optional(),
+    refundAmount: z.number().int('Amount must be a whole number of paise').positive().optional(),
+  }),
+});
+
+export const saveBankDetailsSchema = z.object({
+  body: z.object({
+    accountHolderName: z.string().min(1, 'Account holder name is required').max(200),
+    bankName: z.string().min(1, 'Bank name is required').max(200),
+    accountNumber: z.string().min(5, 'Account number is too short').max(50),
+    ifscCode: z.string().regex(/^[A-Z]{4}0[A-Z0-9]{6}$/, 'Invalid IFSC Code format'),
+    accountType: z.enum(['SAVINGS', 'CURRENT']),
+    upiId: z.string().max(100).optional(),
+  }),
+});
+
+// ────────────────────────────────────────────────────────────
+// OTP-GATED ACTIONS
+// ────────────────────────────────────────────────────────────
+
+/**
+ * Identifiers a one-time code may be issued for.
+ *
+ * Either a known constant, or a scoped `<kind>_<id>` for actions that target a
+ * specific record. Constrained because the value is echoed into the subject and
+ * body of the HTML email that delivers the code.
+ */
+export const otpActionId = z
+  .string()
+  .min(1)
+  .max(80)
+  .regex(
+    /^(DELETE_USER|ARCHIVE_USER|DELETE_OWN_ACCOUNT|ARCHIVE_OWN_SHOP|(refund|payout|reactivation)_[A-Za-z0-9_-]{1,60})$/,
+    'Unrecognized action'
+  );
+
+export const requestOtpSchema = z.object({
+  actionId: otpActionId,
+});
+
+/** Body shape for any endpoint gated behind a one-time code. */
+export const otpGuardedSchema = z.object({
+  body: z.object({
+    otp: z.string().regex(/^\d{6}$/, 'Enter the 6-digit verification code'),
+    adminNote: z.string().max(1000).optional(),
+  }),
+});
+
+export const manualPayoutWithOtpSchema = z.object({
+  body: z.object({
+    shopId: z.string().min(1, 'Shop ID is required'),
+    amount: z.number().int().positive('Amount must be positive'),
+    adminNote: z.string().max(1000).optional(),
+    otp: z.string().regex(/^\d{6}$/, 'Enter the 6-digit verification code'),
+  }),
+});
+
+export const resolveReactivationSchema = z.object({
+  body: z.object({
+    action: z.enum(['approve', 'reject']),
+    otp: z.string().regex(/^\d{6}$/, 'Enter the 6-digit verification code'),
+    rejectionReason: z.string().max(1000).optional(),
   }),
 });

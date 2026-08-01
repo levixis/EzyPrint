@@ -27,13 +27,13 @@ import { ApiError } from '../utils/ApiError';
  */
 export async function register(req: Request, res: Response, next: NextFunction) {
   try {
-    const { email, password, name, type, shopName, shopAddress } = req.body;
+    const { email, password, name, type, shopName, shopAddress, referralCode } = req.body;
 
     // Zod schema (validate middleware) already validates all fields.
     // No manual checks needed here.
 
     const result = await registerWithEmail(
-      { email, password, name, type, shopName, shopAddress },
+      { email, password, name, type, shopName, shopAddress, referralCode },
       req.headers['user-agent'],
       req.ip
     );
@@ -56,16 +56,7 @@ export async function login(req: Request, res: Response, next: NextFunction) {
   try {
     const { email, password } = req.body;
 
-    if (!email || !password) {
-      throw ApiError.badRequest('Email and password are required');
-    }
-
-    const result = await loginWithEmail(
-      email,
-      password,
-      req.headers['user-agent'],
-      req.ip
-    );
+    const result = await loginWithEmail(email, password, req.headers['user-agent'], req.ip);
 
     res.json({
       success: true,
@@ -79,28 +70,39 @@ export async function login(req: Request, res: Response, next: NextFunction) {
 
 /**
  * POST /api/v1/auth/google
- * Body: { idToken, userType? }
+ * Body: { idToken, userType?, shopName?, shopAddress?, referralCode? }
  *
  * The frontend sends the Google ID token obtained from Google Sign-In SDK.
  * We verify it server-side and create/find the user.
  */
 export async function googleAuth(req: Request, res: Response, next: NextFunction) {
   try {
-    const { idToken, userType } = req.body;
+    const { idToken, userType, shopName, shopAddress, referralCode } = req.body;
 
     if (!idToken) {
       throw ApiError.badRequest('Google ID token is required');
     }
 
-    const validTypes = ['STUDENT', 'SHOP_OWNER'];
-    const type = validTypes.includes(userType) ? userType : 'STUDENT';
-
     const result = await loginWithGoogle(
       idToken,
-      type,
+      userType,
+      shopName,
+      shopAddress,
+      referralCode,
       req.headers['user-agent'],
       req.ip
     );
+
+    if ('isNewUser' in result) {
+      res.json({
+        success: true,
+        data: {
+          isNewUser: true,
+          ...result.googleUser,
+        },
+      });
+      return;
+    }
 
     res.json({
       success: true,

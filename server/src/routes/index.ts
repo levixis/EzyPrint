@@ -10,6 +10,11 @@ import ticketRoutes from './ticket.routes';
 import notificationRoutes from './notification.routes';
 import uploadRoutes from './upload.routes';
 import paymentRoutes from './payment.routes';
+import adminRoutes from './admin.routes';
+import referralRoutes from './referral.routes';
+import reactivationRoutes from './reactivation.routes';
+import refundRoutes from './refund.routes';
+import realtimeRoutes from './realtime.routes';
 
 const router = Router();
 
@@ -28,6 +33,8 @@ const router = Router();
  *   /api/v1/payouts/*       → Payout management + ledger
  *   /api/v1/tickets/*       → Support ticket system
  *   /api/v1/notifications/* → In-app notifications
+ *   /api/v1/referrals/*     → Referral system
+ *   /api/v1/realtime/*      → Pusher channel auth + balance snapshot
  */
 router.use('/health', healthRoutes);
 router.use('/auth', authRoutes);
@@ -39,5 +46,10 @@ router.use('/tickets', ticketRoutes);
 router.use('/notifications', notificationRoutes);
 router.use('/uploads', uploadRoutes);
 router.use('/payments', paymentRoutes);
+router.use('/admin', adminRoutes);
+router.use('/referrals', referralRoutes);
+router.use('/reactivation', reactivationRoutes);
+router.use('/refunds', refundRoutes);
+router.use('/realtime', realtimeRoutes);
 
 export default router;

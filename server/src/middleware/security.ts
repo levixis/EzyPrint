@@ -7,39 +7,53 @@ import { Request, Response, NextFunction } from 'express';
  * The client is untrusted. Every check here assumes a hostile client.
  */
 
-/**
- * Sanitize string inputs — strip potential XSS vectors.
- * Runs on every request body recursively.
- */
-function sanitizeValue(value: unknown): unknown {
+/** Characters that terminate a string in C-style consumers, and are never
+ *  meaningful in user-entered text. */
+const NULL_BYTES = /\0/g;
+
+function stripNullBytes(value: unknown): unknown {
   if (typeof value === 'string') {
-    return value
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/javascript:/gi, '')
-      .replace(/on\w+=/gi, '')    // onclick=, onerror=, etc.
-      .replace(/data:text\/html/gi, '');
+    return value.replace(NULL_BYTES, '');
   }
   if (Array.isArray(value)) {
-    return value.map(sanitizeValue);
+    return value.map(stripNullBytes);
   }
   if (typeof value === 'object' && value !== null) {
-    const sanitized: Record<string, unknown> = {};
+    const cleaned: Record<string, unknown> = {};
     for (const [key, val] of Object.entries(value)) {
-      sanitized[key] = sanitizeValue(val);
+      cleaned[key] = stripNullBytes(val);
     }
-    return sanitized;
+    return cleaned;
   }
   return value;
 }
 
 /**
- * Middleware: Sanitize all request body strings to prevent stored XSS.
- * Works recursively on nested objects and arrays.
+ * Middleware: strip null bytes from request bodies.
+ *
+ * This deliberately does NOT HTML-encode input. The previous version rewrote
+ * `<` and `>` to entities on every string of every request, which:
+ *
+ *   - corrupted stored data — a shop named "AT&T Print" was saved mangled, and
+ *     React escaped it again on render so users saw the entity text; and
+ *   - bought nothing, because the only consumer is a React frontend that
+ *     escapes text nodes by default, and there is no `dangerouslySetInnerHTML`
+ *     anywhere in it.
+ *
+ * A blocklist of `javascript:` / `on\w+=` substrings is not a sanitizer either;
+ * it is bypassable and reads as protection that is not there. Real defences
+ * are: Zod validation on shape and length (already applied per route), React's
+ * escaping at render, and explicit escaping wherever a value is interpolated
+ * into HTML — see `escapeHtml` in email.service.ts.
  */
 export function sanitizeBody(req: Request, _res: Response, next: NextFunction) {
+  // Skip webhook routes and raw buffers to preserve the exact bytes the HMAC
+  // was computed over.
+  if (req.originalUrl && req.originalUrl.includes('/webhook')) return next();
+  if (Buffer.isBuffer(req.body)) return next();
+
   if (req.body && typeof req.body === 'object') {
-    req.body = sanitizeValue(req.body);
+    req.body = stripNullBytes(req.body);
   }
   next();
 }

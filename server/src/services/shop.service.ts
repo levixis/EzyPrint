@@ -16,6 +16,8 @@ const shopSelect = {
   isApproved: true,
   isArchived: true,
   isVerified: true,
+  isRejected: true,
+  rejectionReason: true,
   contactPhone: true,
   contactPhoneAlt: true,
   contactEmail: true,
@@ -54,6 +56,8 @@ export async function listShopsForStudents(options?: { onlyOpen?: boolean }) {
       bwPerPage: true,
       colorPerPage: true,
       isOpen: true,
+      isApproved: true,
+      isArchived: true,
       contactPhone: true,
       contactEmail: true,
       whatsappNumber: true,
@@ -128,12 +132,14 @@ export async function updateShopSettings(
     contactPhoneAlt?: string;
     contactEmail?: string;
     whatsappNumber?: string;
-  }
+    payoutMethods?: any[];
+  },
+  isAdmin: boolean = false
 ) {
-  // Verify ownership
+  // Verify ownership (or bypass if admin)
   const shop = await prisma.shop.findUnique({ where: { id: shopId } });
   if (!shop) throw ApiError.notFound('Shop not found');
-  if (shop.ownerUserId !== ownerUserId) {
+  if (shop.ownerUserId !== ownerUserId && !isAdmin) {
     throw ApiError.forbidden('You do not own this shop');
   }
 
@@ -145,9 +151,42 @@ export async function updateShopSettings(
     throw ApiError.badRequest('Color price per page cannot be negative');
   }
 
+  const { payoutMethods, ...shopData } = data;
+
+  if (payoutMethods !== undefined) {
+    return prisma.$transaction(async (tx) => {
+      const updatedShop = await tx.shop.update({
+        where: { id: shopId },
+        data: shopData,
+        select: shopSelect,
+      });
+
+      await tx.payoutMethod.deleteMany({ where: { shopId } });
+      
+      if (payoutMethods.length > 0) {
+        await tx.payoutMethod.createMany({
+          data: payoutMethods.map((pm: any) => ({
+            id: pm.id || undefined,
+            shopId,
+            type: pm.type,
+            accountHolderName: pm.accountHolderName,
+            accountNumber: pm.accountNumber,
+            ifscCode: pm.ifscCode,
+            bankName: pm.bankName,
+            upiId: pm.upiId,
+            isPrimary: pm.isPrimary,
+            nickname: pm.nickname
+          }))
+        });
+      }
+
+      return updatedShop;
+    });
+  }
+
   return prisma.shop.update({
     where: { id: shopId },
-    data,
+    data: shopData,
     select: shopSelect,
   });
 }
@@ -166,7 +205,21 @@ export async function approveShop(shopId: string) {
 
   return prisma.shop.update({
     where: { id: shopId },
-    data: { isApproved: true, isArchived: false },
+    data: { isApproved: true, isArchived: false, isRejected: false, rejectionReason: null },
+    select: shopSelect,
+  });
+}
+
+/**
+ * Admin rejects a shop application.
+ */
+export async function rejectShop(shopId: string, rejectionReason?: string) {
+  const shop = await prisma.shop.findUnique({ where: { id: shopId } });
+  if (!shop) throw ApiError.notFound('Shop not found');
+
+  return prisma.shop.update({
+    where: { id: shopId },
+    data: { isApproved: false, isRejected: true, isOpen: false, rejectionReason: rejectionReason || 'Your shop application has been rejected by admin.' },
     select: shopSelect,
   });
 }
@@ -203,11 +256,11 @@ export async function unarchiveShop(shopId: string) {
 /**
  * Get or compute aggregate stats for a shop dashboard.
  */
-export async function getShopAggregate(shopId: string, ownerUserId: string) {
-  // Verify the shop exists and the user owns it
+export async function getShopAggregate(shopId: string, ownerUserId: string, isAdmin: boolean = false) {
+  // Verify the shop exists and the user owns it (or is admin)
   const shop = await prisma.shop.findUnique({ where: { id: shopId } });
   if (!shop) throw ApiError.notFound('Shop not found');
-  if (shop.ownerUserId !== ownerUserId) {
+  if (shop.ownerUserId !== ownerUserId && !isAdmin) {
     throw ApiError.forbidden('You do not own this shop');
   }
 
@@ -226,7 +279,10 @@ export async function getShopAggregate(shopId: string, ownerUserId: string) {
     }),
   ]);
 
-  const activeStatuses = ['PENDING_PAYMENT', 'PENDING_APPROVAL', 'PRINTING', 'READY_FOR_PICKUP'];
+  const validOrderStatuses = ['PENDING_APPROVAL', 'PRINTING', 'READY_FOR_PICKUP', 'COMPLETED', 'REFUNDED'];
+  const revenueStatuses = ['PENDING_APPROVAL', 'PRINTING', 'READY_FOR_PICKUP', 'COMPLETED'];
+  const activeStatuses = ['PENDING_APPROVAL', 'PRINTING', 'READY_FOR_PICKUP'];
+
   let totalOrders = 0;
   let activeOrders = 0;
   let completedOrders = 0;
@@ -234,9 +290,14 @@ export async function getShopAggregate(shopId: string, ownerUserId: string) {
   let totalBaseFees = 0;
 
   for (const stat of orderStats) {
-    totalOrders += stat._count;
-    totalRevenue += stat._sum.totalPrice || 0;
-    totalBaseFees += stat._sum.baseFee || 0;
+    if (validOrderStatuses.includes(stat.status)) {
+      totalOrders += stat._count;
+    }
+
+    if (revenueStatuses.includes(stat.status)) {
+      totalRevenue += stat._sum.totalPrice || 0;
+      totalBaseFees += stat._sum.baseFee || 0;
+    }
 
     if (stat.status === 'COMPLETED') {
       completedOrders = stat._count;

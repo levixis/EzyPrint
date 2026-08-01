@@ -44,7 +44,7 @@ export function generateAccessToken(payload: TokenPayload): string {
  */
 export function verifyAccessToken(token: string): TokenPayload {
   try {
-    return jwt.verify(token, env.JWT_ACCESS_SECRET) as TokenPayload;
+    return jwt.verify(token, env.JWT_ACCESS_SECRET, { algorithms: ['HS256'] }) as TokenPayload;
   } catch {
     throw ApiError.unauthorized('Invalid or expired access token');
   }
@@ -126,10 +126,8 @@ export async function rotateRefreshToken(
     throw ApiError.unauthorized('Invalid refresh token');
   }
 
-  // Token already revoked — possible replay attack!
-  // In production, you'd revoke ALL tokens for this user as a security measure.
+  // Token already revoked — replay attack. Revoke every session for this user.
   if (storedToken.isRevoked) {
-    // Revoke all tokens for this user (breach detection)
     await prisma.refreshToken.updateMany({
       where: { userId: storedToken.userId },
       data: { isRevoked: true },
@@ -139,18 +137,36 @@ export async function rotateRefreshToken(
 
   // Token expired
   if (storedToken.expiresAt < new Date()) {
-    await prisma.refreshToken.update({
+    await prisma.refreshToken.updateMany({
       where: { id: storedToken.id },
       data: { isRevoked: true },
     });
     throw ApiError.unauthorized('Refresh token expired');
   }
 
-  // Revoke the old token
-  await prisma.refreshToken.update({
-    where: { id: storedToken.id },
+  // ── Claim the token, atomically ──
+  //
+  // `isRevoked: false` in the WHERE makes this a compare-and-swap. A plain
+  // update would succeed for both of two concurrent requests carrying the same
+  // token — an UPDATE ... SET isRevoked = true does not care what the previous
+  // value was — so a stolen token and the legitimate client refreshing at the
+  // same moment would BOTH receive valid new sessions, and reuse detection
+  // would not fire until a third, sequential use. Exactly one caller can win
+  // this claim; anyone else is treated as a replay.
+  const claimed = await prisma.refreshToken.updateMany({
+    where: { id: storedToken.id, isRevoked: false },
     data: { isRevoked: true },
   });
+
+  if (claimed.count === 0) {
+    // Someone else consumed this token between our read and our write. That is
+    // the concurrent-reuse case: assume compromise and drop every session.
+    await prisma.refreshToken.updateMany({
+      where: { userId: storedToken.userId },
+      data: { isRevoked: true },
+    });
+    throw ApiError.unauthorized('Refresh token reuse detected — all sessions revoked');
+  }
 
   // Generate new token pair
   const payload: TokenPayload = {

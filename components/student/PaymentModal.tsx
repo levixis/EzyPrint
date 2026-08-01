@@ -6,11 +6,10 @@ import { Modal } from '../common/Modal';
 import { Button } from '../common/Button';
 import { Spinner } from '../common/Spinner';
 import { useAppContext } from '../../contexts/AppContext';
-import { getFunctions, httpsCallable } from 'firebase/functions';
-import { app } from '../../firebase';
+import { paymentApi } from '../../lib/queries';
+import { formatMoney } from '../../utils/money';
 
 const RAZORPAY_KEY_ID = import.meta.env.VITE_RAZORPAY_KEY_ID;
-const functions = getFunctions(app, 'asia-south1');
 const debugLog = (...args: unknown[]) => {
     void args;
 };
@@ -65,19 +64,12 @@ const PaymentModal: React.FC<PaymentModalProps> = ({ isOpen, onClose, order, onP
         setStatusMessage('Creating secure order...');
 
         try {
-            const createOrderFn = httpsCallable(functions, 'createOrder');
-            const result = await createOrderFn({ orderId: order.id });
-            const data = result.data as {
-                razorpayOrderId: string;
-                amount: number;
-                currency: string;
-                verifiedPrice: { pageCost: number; baseFee: number; totalPrice: number };
-            };
+            const data = await paymentApi.createOrder(order.id);
 
             setStatusMessage('Opening payment gateway...');
 
             const baseOptions = {
-                key: RAZORPAY_KEY_ID,
+                key: data.key || RAZORPAY_KEY_ID,
                 amount: data.amount,
                 currency: data.currency,
                 name: 'EzyPrint',
@@ -92,8 +84,7 @@ const PaymentModal: React.FC<PaymentModalProps> = ({ isOpen, onClose, order, onP
                 try {
                     const response = await openNativeRazorpay(baseOptions);
                     setStatusMessage('Verifying payment...');
-                    const verifyPaymentFn = httpsCallable(functions, 'verifyPayment');
-                    await verifyPaymentFn({
+                    await paymentApi.verify({
                         razorpay_order_id: response.razorpay_order_id,
                         razorpay_payment_id: response.razorpay_payment_id,
                         razorpay_signature: response.razorpay_signature,
@@ -113,8 +104,7 @@ const PaymentModal: React.FC<PaymentModalProps> = ({ isOpen, onClose, order, onP
                     handler: async function (response: { razorpay_order_id: string; razorpay_payment_id: string; razorpay_signature: string }) {
                         setStatusMessage('Verifying payment...');
                         try {
-                            const verifyPaymentFn = httpsCallable(functions, 'verifyPayment');
-                            await verifyPaymentFn({
+                            await paymentApi.verify({
                                 razorpay_order_id: response.razorpay_order_id,
                                 razorpay_payment_id: response.razorpay_payment_id,
                                 razorpay_signature: response.razorpay_signature,
@@ -214,14 +204,14 @@ const PaymentModal: React.FC<PaymentModalProps> = ({ isOpen, onClose, order, onP
                     {files.length === 1 ? (
                         <>
                             <span>{files[0].pageCount}pg × {files[0].copies}cp</span>
-                            <span className="text-center">Print ₹{order.priceDetails.pageCost.toFixed(2)}</span>
-                            <span className="text-right">Fee ₹{order.priceDetails.baseFee.toFixed(2)}</span>
+                            <span className="text-center">Print {formatMoney(order.priceDetails.pageCost)}</span>
+                            <span className="text-right">Fee {formatMoney(order.priceDetails.baseFee)}</span>
                         </>
                     ) : (
                         <>
                             <span>{order.printOptions.pages}pg total</span>
-                            <span className="text-center">Print ₹{order.priceDetails.pageCost.toFixed(2)}</span>
-                            <span className="text-right">Fee ₹{order.priceDetails.baseFee.toFixed(2)}</span>
+                            <span className="text-center">Print {formatMoney(order.priceDetails.pageCost)}</span>
+                            <span className="text-right">Fee {formatMoney(order.priceDetails.baseFee)}</span>
                         </>
                     )}
                 </div>
@@ -237,7 +227,7 @@ const PaymentModal: React.FC<PaymentModalProps> = ({ isOpen, onClose, order, onP
                 <div className="space-y-2">
                     <div className="flex justify-between items-center px-1 mb-1">
                         <span className="text-sm font-medium text-gray-700 dark:text-gray-300">Total</span>
-                        <span className="text-2xl font-bold text-gray-900 dark:text-white">₹{order.priceDetails.totalPrice.toFixed(2)}</span>
+                        <span className="text-2xl font-bold text-gray-900 dark:text-white">{formatMoney(order.priceDetails.totalPrice)}</span>
                     </div>
                     <Button
                         onClick={openRazorpayCheckout}
@@ -249,7 +239,7 @@ const PaymentModal: React.FC<PaymentModalProps> = ({ isOpen, onClose, order, onP
                         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-5 h-5 mr-2">
                             <path fillRule="evenodd" d="M12 1.5a5.25 5.25 0 0 0-5.25 5.25v3a3 3 0 0 0-3 3v6.75a3 3 0 0 0 3 3h10.5a3 3 0 0 0 3-3v-6.75a3 3 0 0 0-3-3v-3c0-2.9-2.35-5.25-5.25-5.25Zm3.75 8.25v-3a3.75 3.75 0 1 0-7.5 0v3h7.5Z" clipRule="evenodd" />
                         </svg>
-                        Pay ₹{order.priceDetails.totalPrice.toFixed(2)}
+                        Pay {formatMoney(order.priceDetails.totalPrice)}
                     </Button>
                     <button
                         onClick={onClose}

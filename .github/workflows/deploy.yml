@@ -1,8 +1,17 @@
-name: Deploy EzyPrint
+# ⚠️ DEPRECATED — legacy Firebase pipeline, retained for reference only.
+#
+# EzyPrint has migrated off Firebase to Express + Prisma + Neon (backend on
+# Railway, frontend on Vercel). This workflow deploys the OLD Cloud Functions,
+# which still contain their own copy of the ledger and settlement logic. Running
+# it would put a second, divergent implementation live against the same Razorpay
+# account as the new backend.
+#
+# The automatic `push` trigger has been removed so it can never fire on a merge
+# to main. Delete this file once the Railway/Vercel pipeline is in place.
+name: "[DEPRECATED] Firebase Deploy — do not run"
 
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
 
 jobs:
   deploy:

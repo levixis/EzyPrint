@@ -24,12 +24,13 @@ export async function updateProfile(req: Request, res: Response, next: NextFunct
 
 export async function listUsers(req: Request, res: Response, next: NextFunction) {
   try {
-    const { page, limit, type, search } = req.query;
+    const { page, limit, type, search, hasPass } = req.query;
     const result = await userService.listUsers({
       page: page ? parseInt(page as string, 10) : undefined,
       limit: limit ? parseInt(limit as string, 10) : undefined,
       type: type as UserType | undefined,
       search: search as string,
+      hasPass: hasPass === 'true' ? true : hasPass === 'false' ? false : undefined,
     });
     res.json({ success: true, data: result });
   } catch (error) { next(error); }

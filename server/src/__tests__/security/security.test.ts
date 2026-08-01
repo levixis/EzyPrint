@@ -1,11 +1,12 @@
 /**
  * Unit Tests — Security Middleware
  *
- * Tests the XSS sanitization, path traversal blocking, and other
- * security measures that protect the application.
+ * Tests request body cleaning, HTML escaping at the email sink, path
+ * traversal blocking, and other server-side protections.
  */
 
 import { sanitizeBody, blockPathTraversal } from '../../middleware/security';
+import { escapeHtml } from '../../services/email.service';
 import { Request, Response, NextFunction } from 'express';
 
 // Mock Express objects
@@ -26,49 +27,38 @@ function mockNext(): NextFunction {
 // XSS SANITIZATION
 // ────────────────────────────────────────────────────────────
 
-describe('XSS Sanitization (sanitizeBody)', () => {
-  test('strips HTML tags from strings', () => {
-    const req = mockReq({ name: '<script>alert(1)</script>' });
+describe('Request body cleaning (sanitizeBody)', () => {
+  // This middleware deliberately does NOT HTML-encode input. It used to, which
+  // corrupted stored data ("AT&T Print" was saved mangled, and React escaped it
+  // again on render so users saw entity text) while adding nothing — the only
+  // consumer is a React frontend that escapes text nodes by default and has no
+  // dangerouslySetInnerHTML anywhere. XSS defence lives in Zod validation, React's
+  // escaping, and explicit escapeHtml at the one HTML sink (email templates).
+
+  test('leaves user text exactly as entered', () => {
+    const req = mockReq({ name: 'AT&T Print > Fast <Campus>' });
     const next = mockNext();
     sanitizeBody(req as Request, mockRes() as Response, next);
-    expect(req.body.name).toBe('&lt;script&gt;alert(1)&lt;/script&gt;');
+    expect(req.body.name).toBe('AT&T Print > Fast <Campus>');
     expect(next).toHaveBeenCalled();
   });
 
-  test('strips javascript: protocol', () => {
-    const req = mockReq({ url: 'javascript:alert(1)' });
+  test('strips null bytes, which are never meaningful in user text', () => {
+    const req = mockReq({ name: 'shop\u0000name' });
     sanitizeBody(req as Request, mockRes() as Response, mockNext());
-    expect(req.body.url).not.toContain('javascript:');
+    expect(req.body.name).toBe('shopname');
   });
 
-  test('strips onclick handlers', () => {
-    const req = mockReq({ field: 'onclick=alert(1)' });
+  test('cleans nested objects recursively', () => {
+    const req = mockReq({ user: { address: { city: 'Mum\u0000bai' } } });
     sanitizeBody(req as Request, mockRes() as Response, mockNext());
-    expect(req.body.field).not.toContain('onclick=');
+    expect(req.body.user.address.city).toBe('Mumbai');
   });
 
-  test('strips onerror handlers', () => {
-    const req = mockReq({ field: 'onerror=fetch("evil.com")' });
+  test('cleans arrays', () => {
+    const req = mockReq({ tags: ['a\u0000b', 'safe'] });
     sanitizeBody(req as Request, mockRes() as Response, mockNext());
-    expect(req.body.field).not.toContain('onerror=');
-  });
-
-  test('sanitizes nested objects recursively', () => {
-    const req = mockReq({
-      user: {
-        name: '<img src=x onerror=alert(1)>',
-        address: { city: '<b>Mumbai</b>' },
-      },
-    });
-    sanitizeBody(req as Request, mockRes() as Response, mockNext());
-    expect(req.body.user.name).not.toContain('<img');
-    expect(req.body.user.address.city).toBe('&lt;b&gt;Mumbai&lt;/b&gt;');
-  });
-
-  test('sanitizes arrays', () => {
-    const req = mockReq({ tags: ['<script>x</script>', 'safe'] });
-    sanitizeBody(req as Request, mockRes() as Response, mockNext());
-    expect(req.body.tags[0]).not.toContain('<script>');
+    expect(req.body.tags[0]).toBe('ab');
     expect(req.body.tags[1]).toBe('safe');
   });
 
@@ -85,6 +75,31 @@ describe('XSS Sanitization (sanitizeBody)', () => {
     const next = mockNext();
     sanitizeBody(req as Request, mockRes() as Response, next);
     expect(next).toHaveBeenCalled();
+  });
+
+  test('skips webhook routes so the HMAC payload is untouched', () => {
+    const req: any = { body: { raw: 'a\u0000b' }, params: {}, originalUrl: '/api/v1/payments/webhook' };
+    sanitizeBody(req as Request, mockRes() as Response, mockNext());
+    expect(req.body.raw).toBe('a\u0000b');
+  });
+});
+
+// ────────────────────────────────────────────────────────────
+// HTML ESCAPING AT THE EMAIL SINK
+// ────────────────────────────────────────────────────────────
+
+describe('escapeHtml', () => {
+  test('escapes the characters that break out of an HTML context', () => {
+    expect(escapeHtml('<script>alert("x")</script>'))
+      .toBe('&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;');
+  });
+
+  test('escapes ampersands first so entities are not double-decoded', () => {
+    expect(escapeHtml('AT&T <b>')).toBe('AT&amp;T &lt;b&gt;');
+  });
+
+  test('leaves ordinary text alone', () => {
+    expect(escapeHtml('DELETE_USER')).toBe('DELETE_USER');
   });
 });
 

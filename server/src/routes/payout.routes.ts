@@ -5,6 +5,12 @@ import { z } from 'zod';
 import * as ledgerService from '../services/ledger.service';
 import { ApiError } from '../utils/ApiError';
 import type { Request, Response, NextFunction } from 'express';
+import { requestPayoutSchema, otpGuardedSchema, manualPayoutWithOtpSchema } from '../validators/schemas';
+import * as otpService from '../services/otp.service';
+import * as realtimeService from '../services/realtime.service';
+import { sensitiveLimiter } from '../middleware/rateLimiter';
+import { prisma } from '../utils/prisma';
+import type { Prisma } from '@prisma/client';
 
 const router = Router();
 
@@ -30,8 +36,6 @@ const ledgerQuerySchema = z.object({
 
 /**
  * GET /api/v1/payouts/ledger/:shopId
- * Get ledger entries for a shop.
- * Shop owner sees their own; admin sees any shop's.
  */
 router.get(
   '/ledger/:shopId',
@@ -45,7 +49,6 @@ router.get(
       const shopId = req.params.shopId as string;
       const { page, limit, type } = req.query;
 
-      // Admin can view any shop's ledger; shop owner must own it
       const ownerUserId = req.user.userType === 'ADMIN'
         ? (await getShopOwnerId(shopId))
         : req.user.userId;
@@ -65,7 +68,6 @@ router.get(
 
 /**
  * GET /api/v1/payouts/balance/:shopId
- * Get current balance summary for a shop.
  */
 router.get(
   '/balance/:shopId',
@@ -74,22 +76,48 @@ router.get(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       if (!req.user) throw ApiError.unauthorized();
-
       const shopId = req.params.shopId as string;
       const balance = await ledgerService.getShopBalance(shopId, req.user.userId, req.user.userType);
-
       res.json({ success: true, data: { balance } });
-    } catch (error) {
-      next(error);
-    }
+    } catch (error) { next(error); }
   }
 );
 
 /**
- * Helper: get shop owner ID for admin access to any shop's ledger.
+ * Queue a `payout.updated` event for a shop, from inside the transaction that
+ * changes the payout's status.
+ *
+ * Enqueuing here rather than after the commit is what makes the notification
+ * inseparable from the state change: if the transaction rolls back the outbox
+ * row goes with it, and if it commits the dispatcher will deliver even when
+ * Pusher is unreachable at this instant.
+ *
+ * `seq` carries the shop's current `financialVersion` *without* incrementing
+ * it. A payout status change moves no money — the balance already moved when
+ * the reservation was written at request time — so claiming a new balance
+ * sequence number would make the client see a gap where a ledger event went
+ * missing and trigger a pointless snapshot refetch. Reading the value needs no
+ * compare-and-swap precisely because nothing is written back.
  */
+async function enqueuePayoutEvent(
+  tx: Prisma.TransactionClient,
+  shopId: string,
+  data: { payoutId: string; status: string; amount: number }
+): Promise<string> {
+  const shop = await tx.shop.findUnique({
+    where: { id: shopId },
+    select: { financialVersion: true },
+  });
+
+  return realtimeService.enqueueShopEvent(tx, {
+    shopId,
+    type: 'payout.updated',
+    seq: shop?.financialVersion ?? 0,
+    data,
+  });
+}
+
 async function getShopOwnerId(shopId: string): Promise<string> {
-  const { prisma } = await import('../utils/prisma');
   const shop = await prisma.shop.findUnique({
     where: { id: shopId },
     select: { ownerUserId: true },
@@ -97,5 +125,330 @@ async function getShopOwnerId(shopId: string): Promise<string> {
   if (!shop) throw ApiError.notFound('Shop not found');
   return shop.ownerUserId;
 }
+
+// Basic CRUD for payouts
+router.get('/', authenticate, authorize('ADMIN', 'SHOP_OWNER'), async (req, res, next) => {
+  try {
+    const limit = Number(req.query.limit) || 20;
+    const shopId = req.query.shopId as string;
+    
+    const whereClause: any = {};
+    if (req.user?.userType === 'SHOP_OWNER') {
+      const shop = await prisma.shop.findUnique({ where: { ownerUserId: req.user.userId } });
+      whereClause.shopId = shop?.id;
+    } else if (shopId) {
+      whereClause.shopId = shopId;
+    }
+
+    const payouts = await prisma.payout.findMany({
+      where: whereClause,
+      take: limit,
+      orderBy: { createdAt: 'desc' }
+    });
+    
+    res.json({ success: true, data: payouts });
+  } catch (error) { next(error); }
+});
+
+router.post('/request', authenticate, authorize('SHOP_OWNER'), validate(requestPayoutSchema), async (req, res, next) => {
+  try {
+    const { amount, shopOwnerNote } = req.body;
+    const shop = await prisma.shop.findUnique({ where: { ownerUserId: req.user?.userId } });
+    if (!shop) throw ApiError.notFound('Shop not found');
+    
+    const outboxIds: string[] = [];
+
+    const result = await prisma.$transaction(async (tx) => {
+      const payout = await tx.payout.create({
+        data: { shopId: shop.id, shopName: shop.name, amount: Number(amount), shopOwnerNote, status: 'PENDING' }
+      });
+      
+      await ledgerService.createLedgerEntry({
+        shopId: shop.id,
+        type: 'PAYOUT',
+        amount: Number(amount),
+        description: 'Payout request reservation',
+        counterparty: 'PLATFORM',
+        createdBy: 'SHOP',
+        eventId: `payout:${payout.id}:reservation`
+      }, tx, outboxIds);
+
+      return payout;
+    });
+
+    await realtimeService.publishQueued(outboxIds);
+
+    res.json({ success: true, data: result });
+  } catch (error) { next(error); }
+});
+
+router.post('/:id/approve', authenticate, authorize('ADMIN'), sensitiveLimiter, validate(otpGuardedSchema), async (req, res, next) => {
+  try {
+    if (!req.user) throw ApiError.unauthorized();
+    const { adminNote, otp } = req.body;
+    const payoutId = req.params.id as string;
+
+    // Step-up verification. Approving a payout moves real money, so it must not
+    // rest on session auth alone.
+    await otpService.consumeOtp(req.user.userId, `payout_${payoutId}`, otp);
+
+    const outboxIds: string[] = [];
+
+    const result = await prisma.$transaction(async (tx) => {
+      // IN_TRANSIT, not PAID: approval means the transfer has been initiated,
+      // not that the funds have landed. Collapsing the two is what makes a shop
+      // owner think money is missing when their bank hasn't credited it yet.
+      const updated = await tx.payout.updateMany({
+        where: { id: payoutId, status: 'PENDING' },
+        data: { status: 'IN_TRANSIT', adminNote },
+      });
+      if (updated.count === 0) throw ApiError.badRequest('Payout not found or invalid state');
+
+      const payout = await tx.payout.findUnique({ where: { id: payoutId } });
+      if (!payout) throw ApiError.notFound('Payout not found');
+
+      const entryUpdate = await tx.ledgerEntry.updateMany({
+        where: { eventId: `payout:${payout.id}:reservation`, status: 'PENDING' },
+        data: { status: 'SETTLED', settledAt: new Date() },
+      });
+      // Without this check the payout could be marked approved while the ledger
+      // recorded nothing — money out the door with no corresponding entry.
+      if (entryUpdate.count === 0) {
+        throw ApiError.badRequest('Reservation ledger entry not found or already settled');
+      }
+
+      outboxIds.push(await enqueuePayoutEvent(tx, payout.shopId, {
+        payoutId: payout.id,
+        status: 'IN_TRANSIT',
+        amount: payout.amount,
+      }));
+
+      return payout;
+    });
+
+    await realtimeService.publishQueued(outboxIds);
+
+    res.json({ success: true, data: result });
+  } catch (error) { next(error); }
+});
+
+/**
+ * Admin marks an in-transit payout as landed in the shop's bank account.
+ */
+router.post('/:id/mark-paid', authenticate, authorize('ADMIN'), sensitiveLimiter, validate(otpGuardedSchema), async (req, res, next) => {
+  try {
+    if (!req.user) throw ApiError.unauthorized();
+    const { adminNote, otp } = req.body;
+    const payoutId = req.params.id as string;
+
+    await otpService.consumeOtp(req.user.userId, `payout_${payoutId}`, otp);
+
+    const outboxIds: string[] = [];
+
+    const result = await prisma.$transaction(async (tx) => {
+      // IN_TRANSIT in the where clause is the state guard: two admins marking
+      // the same payout paid means the second updateMany matches nothing and
+      // fails, rather than stamping a second paidAt over the first.
+      const updated = await tx.payout.updateMany({
+        where: { id: payoutId, status: 'IN_TRANSIT' },
+        data: { status: 'PAID', paidAt: new Date(), ...(adminNote ? { adminNote } : {}) },
+      });
+      if (updated.count === 0) throw ApiError.badRequest('Payout is not in transit');
+
+      const payout = await tx.payout.findUnique({ where: { id: payoutId } });
+      if (!payout) throw ApiError.notFound('Payout not found');
+
+      outboxIds.push(await enqueuePayoutEvent(tx, payout.shopId, {
+        payoutId: payout.id,
+        status: 'PAID',
+        amount: payout.amount,
+      }));
+
+      return payout;
+    });
+
+    await realtimeService.publishQueued(outboxIds);
+
+    res.json({ success: true, data: result });
+  } catch (error) { next(error); }
+});
+
+router.post('/:id/reject', authenticate, authorize('ADMIN'), sensitiveLimiter, validate(otpGuardedSchema), async (req, res, next) => {
+  try {
+    if (!req.user) throw ApiError.unauthorized();
+    const { adminNote, otp } = req.body;
+
+    await otpService.consumeOtp(req.user.userId, `payout_${req.params.id}`, otp);
+
+    const outboxIds: string[] = [];
+
+    const result = await prisma.$transaction(async (tx) => {
+      const payout = await tx.payout.findUnique({ where: { id: req.params.id as string } });
+      if (!payout) throw ApiError.notFound('Payout not found');
+      
+      const updated = await tx.payout.updateMany({
+        where: { id: payout.id, status: 'PENDING' },
+        data: { status: 'REJECTED', adminNote }
+      });
+      if (updated.count === 0) throw ApiError.badRequest('Payout status changed concurrently');
+
+      const entryUpdate = await tx.ledgerEntry.updateMany({ where: { eventId: `payout:${payout.id}:reservation`, status: 'PENDING' }, data: { status: 'VOID' } });
+      if (entryUpdate.count === 0) throw ApiError.badRequest('Reservation ledger entry not found or invalid state');
+      
+      await ledgerService.createLedgerEntry({
+        shopId: payout.shopId,
+        type: 'PAYOUT_REJECT_REFUND',
+        amount: payout.amount,
+        description: 'Payout request rejected refund',
+        counterparty: 'PLATFORM',
+        createdBy: 'ADMIN',
+        eventId: `payout:${payout.id}:rejected`
+      }, tx, outboxIds);
+
+      return payout;
+    });
+
+    await realtimeService.publishQueued(outboxIds);
+
+    res.json({ success: true, data: result });
+  } catch (error) { next(error); }
+});
+
+router.post('/:id/cancel', authenticate, authorize('SHOP_OWNER', 'ADMIN'), sensitiveLimiter, validate(otpGuardedSchema), async (req, res, next) => {
+  try {
+    if (!req.user) throw ApiError.unauthorized();
+    const { otp } = req.body;
+
+    await otpService.consumeOtp(req.user.userId, `payout_${req.params.id}`, otp);
+
+    const outboxIds: string[] = [];
+
+    const result = await prisma.$transaction(async (tx) => {
+      const payout = await tx.payout.findUnique({ where: { id: req.params.id as string } });
+      if (!payout) throw ApiError.notFound('Payout not found');
+      
+      if (req.user?.userType === 'SHOP_OWNER') {
+        const shop = await tx.shop.findUnique({ where: { ownerUserId: req.user.userId } });
+        if (!shop || shop.id !== payout.shopId) throw ApiError.forbidden('Payout does not belong to your shop');
+      }
+      
+      const updated = await tx.payout.updateMany({
+        where: { id: payout.id, status: 'PENDING' },
+        data: { status: 'CANCELLED' }
+      });
+      if (updated.count === 0) throw ApiError.badRequest('Payout status changed concurrently');
+
+      const entryUpdate = await tx.ledgerEntry.updateMany({ where: { eventId: `payout:${payout.id}:reservation`, status: 'PENDING' }, data: { status: 'VOID' } });
+      if (entryUpdate.count === 0) throw ApiError.badRequest('Reservation ledger entry not found or invalid state');
+      if (entryUpdate.count > 0) {
+        
+        await ledgerService.createLedgerEntry({
+          shopId: payout.shopId,
+          type: 'PAYOUT_CANCEL_REFUND',
+          amount: payout.amount,
+          description: 'Payout request cancelled refund',
+          counterparty: 'PLATFORM',
+          createdBy: req.user?.userType === 'ADMIN' ? 'ADMIN' : 'SHOP',
+          eventId: `payout:${payout.id}:cancelled`
+        }, tx, outboxIds);
+      }
+
+      return updated;
+    });
+
+    await realtimeService.publishQueued(outboxIds);
+
+    res.json({ success: true, data: result });
+  } catch (error) { next(error); }
+});
+
+router.post('/:id/confirm', authenticate, authorize('SHOP_OWNER'), async (req, res, next) => {
+  try {
+    if (!req.user) throw ApiError.unauthorized();
+
+    const payout = await prisma.payout.findUnique({ where: { id: req.params.id as string } });
+    if (!payout) throw ApiError.notFound('Payout not found');
+    
+    const shop = await prisma.shop.findUnique({ where: { ownerUserId: req.user.userId } });
+    if (!shop || shop.id !== payout.shopId) throw ApiError.forbidden('Payout does not belong to your shop');
+    
+    const updated = await prisma.payout.updateMany({
+      where: { id: req.params.id as string, status: 'PAID' },
+      data: { status: 'CONFIRMED', confirmedAt: new Date() }
+    });
+    if (updated.count === 0) throw ApiError.badRequest('Payout not found or invalid state');
+    res.json({ success: true, data: updated });
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post('/:id/dispute', authenticate, authorize('SHOP_OWNER'), async (req, res, next) => {
+  try {
+    if (!req.user) throw ApiError.unauthorized();
+    const { shopOwnerNote } = req.body;
+
+    const payout = await prisma.payout.findUnique({ where: { id: req.params.id as string } });
+    if (!payout) throw ApiError.notFound('Payout not found');
+    
+    const shop = await prisma.shop.findUnique({ where: { ownerUserId: req.user.userId } });
+    if (!shop || shop.id !== payout.shopId) throw ApiError.forbidden('Payout does not belong to your shop');
+    
+    const updated = await prisma.payout.updateMany({
+      where: { id: req.params.id as string, status: 'PAID' },
+      data: { status: 'DISPUTED', shopOwnerNote }
+    });
+    if (updated.count === 0) throw ApiError.badRequest('Payout not found or invalid state');
+    res.json({ success: true, data: updated });
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.post('/manual', authenticate, authorize('ADMIN'), sensitiveLimiter, validate(manualPayoutWithOtpSchema), async (req, res, next) => {
+  try {
+    if (!req.user) throw ApiError.unauthorized();
+    const { shopId, amount, adminNote, otp } = req.body;
+
+    await otpService.consumeOtp(req.user.userId, `payout_${shopId}`, otp);
+
+    // shopName is denormalized onto the payout and is required by the schema.
+    // Taking it from the request body let a caller record a payout against one
+    // shop under another shop's name.
+    const shop = await prisma.shop.findUnique({ where: { id: shopId }, select: { name: true } });
+    if (!shop) throw ApiError.notFound('Shop not found');
+
+    const outboxIds: string[] = [];
+
+    const result = await prisma.$transaction(async (tx) => {
+      const payout = await tx.payout.create({
+        data: {
+          shopId,
+          shopName: shop.name,
+          amount: Number(amount),
+          adminNote,
+          status: 'PAID',
+          paidAt: new Date()
+        }
+      });
+
+      await ledgerService.createLedgerEntry({
+        shopId,
+        type: 'MANUAL_PAYOUT_DEDUCTION',
+        amount: Number(amount),
+        description: 'Manual payout',
+        counterparty: 'PLATFORM',
+        createdBy: 'ADMIN',
+        eventId: `payout:${payout.id}:manual`
+      }, tx, outboxIds);
+
+      return payout;
+    });
+
+    await realtimeService.publishQueued(outboxIds);
+
+    res.json({ success: true, data: result });
+  } catch (error) { next(error); }
+});
 
 export default router;

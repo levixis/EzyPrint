@@ -9,6 +9,7 @@ import { errorHandler, notFoundHandler } from './middleware/errorHandler';
 import routes from './routes';
 import { prisma } from './utils/prisma';
 import { sanitizeBody, additionalSecurityHeaders } from './middleware/security';
+import { startScheduler, stopScheduler } from './services/scheduler.service';
 
 /**
  * EzyPrint Backend Server
@@ -27,6 +28,14 @@ import { sanitizeBody, additionalSecurityHeaders } from './middleware/security';
  */
 
 const app = express();
+
+// ── Proxy trust ──
+// Railway and Vercel terminate TLS at an edge proxy, so the client address
+// arrives in X-Forwarded-For. Without this, req.ip is the proxy's address and
+// every rate limiter collapses into a single global bucket — 20 bad logins
+// would lock out the whole user base. Set to the exact hop count rather than
+// `true`, since blanket trust lets a client spoof X-Forwarded-For.
+app.set('trust proxy', env.TRUST_PROXY_HOPS);
 
 // ── Security Headers ──
 app.use(helmet());
@@ -47,7 +56,12 @@ app.use(
 app.use(morgan(env.isDev ? 'dev' : 'combined'));
 
 // ── Body Parsing ──
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({
+  limit: '10mb',
+  verify: (req: any, res, buf) => {
+    req.rawBody = buf;
+  }
+}));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // ── Security: XSS Sanitization + Extra Headers ──
@@ -88,12 +102,21 @@ const startServer = async () => {
       `);
     });
 
+    // ── Background jobs ──
+    // Settlement sweep, Razorpay reconciliation and real-time outbox dispatch.
+    // Each takes a Postgres advisory lock, so running more than one instance is
+    // safe.
+    startScheduler();
+
     // ── Graceful Shutdown ──
     // When Railway/Render sends SIGTERM (container restart, deploy, etc.),
     // we stop accepting new connections but let in-flight requests finish.
     // This prevents webhook processing from being killed mid-transaction.
     const shutdown = async (signal: string) => {
       console.log(`\n🛑 ${signal} received — shutting down gracefully...`);
+
+      // Stop background jobs before draining, so no new work starts mid-drain.
+      stopScheduler();
 
       // Stop accepting new connections, wait for in-flight to finish
       server.close(async () => {

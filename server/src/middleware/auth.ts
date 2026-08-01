@@ -42,7 +42,7 @@ export const authenticate = (
     }
 
     const token = authHeader.split(' ')[1];
-    const decoded = jwt.verify(token, env.JWT_ACCESS_SECRET) as JwtPayload;
+    const decoded = jwt.verify(token, env.JWT_ACCESS_SECRET, { algorithms: ['HS256'] }) as JwtPayload;
 
     req.user = decoded;
     next();
@@ -52,6 +52,28 @@ export const authenticate = (
     } else {
       next(ApiError.unauthorized('Invalid or expired token'));
     }
+  }
+};
+
+/**
+ * Optional Auth middleware — verifies JWT if present, but doesn't block if missing.
+ */
+export const optionalAuthenticate = (
+  req: Request,
+  _res: Response,
+  next: NextFunction
+): void => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (authHeader?.startsWith('Bearer ')) {
+      const token = authHeader.split(' ')[1];
+      const decoded = jwt.verify(token, env.JWT_ACCESS_SECRET, { algorithms: ['HS256'] }) as JwtPayload;
+      req.user = decoded;
+    }
+    next();
+  } catch (error) {
+    // If token is invalid/expired, we just ignore it and treat as unauthenticated
+    next();
   }
 };
 
