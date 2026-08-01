@@ -56,12 +56,29 @@ const getFileIcon = (fileName: string): string => {
   return '📎';
 };
 
+/**
+ * What can be shown without leaving the conversation.
+ *
+ * Support attachments are overwhelmingly screenshots, and sending someone to a
+ * new tab to look at one loses the thread they were reading it against.
+ * Anything the browser cannot render inline still opens externally rather than
+ * showing a broken frame.
+ */
+const previewKind = (fileName: string): 'image' | 'pdf' | null => {
+  const ext = fileName.split('.').pop()?.toLowerCase() || '';
+  if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg'].includes(ext)) return 'image';
+  if (ext === 'pdf') return 'pdf';
+  return null;
+};
+
 const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) => {
   const { addNotification, addTicketMessage, updateTicketStatus, currentUser, tickets, orders, allOrders, shopInitiateRefund, escalateTicketToAdmin, refundRequests } = useAppContext();
   const [replyText, setReplyText] = useState('');
   /** Files chosen but not yet sent. Each keeps the upload id minted at pick time. */
   const [pendingFiles, setPendingFiles] = useState<{ file: File; uploadId: string }[]>([]);
   const [attachError, setAttachError] = useState('');
+  /** The attachment being previewed in place, if any. */
+  const [preview, setPreview] = useState<{ url: string; fileName: string } | null>(null);
   const [isSending, setIsSending] = useState(false);
   const [isUpdatingStatus, setIsUpdatingStatus] = useState(false);
   const [isPreApproveModalOpen, setIsPreApproveModalOpen] = useState(false);
@@ -127,6 +144,20 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [(liveTicket.messages ?? []).length]);
+
+  // Escape closes the preview before it closes the ticket, so dismissing an
+  // image does not also dismiss the conversation behind it.
+  useEffect(() => {
+    if (!preview) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        setPreview(null);
+      }
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [preview]);
 
   // Resolve attachment storage paths to download URLs
   useEffect(() => {
@@ -346,6 +377,11 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
                             href={att.url}
                             target="_blank"
                             rel="noopener noreferrer"
+                            onClick={(e) => {
+                              if (!previewKind(att.fileName)) return;
+                              e.preventDefault();
+                              setPreview({ url: att.url, fileName: att.fileName });
+                            }}
                             className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-brand-primary bg-brand-primary/10 hover:bg-brand-primary/20 rounded-lg transition-colors flex-shrink-0"
                           >
                             <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-3.5 h-3.5">
@@ -637,6 +673,13 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
                           href={att.error ? undefined : att.url}
                           target="_blank"
                           rel="noopener noreferrer"
+                          onClick={(e) => {
+                            // Images and PDFs open over the conversation; a new
+                            // tab would lose the thread they illustrate.
+                            if (att.error || !previewKind(att.fileName)) return;
+                            e.preventDefault();
+                            setPreview({ url: att.url, fileName: att.fileName });
+                          }}
                           className={`mt-2 flex items-center gap-2 px-2.5 py-2 rounded-lg text-xs transition-colors ${
                             isCurrentUser
                               ? 'bg-white/15 hover:bg-white/25'
@@ -646,7 +689,7 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
                           <span className="text-base shrink-0">{getFileIcon(att.fileName)}</span>
                           <span className="truncate flex-1 min-w-0">{att.fileName}</span>
                           <span className={`shrink-0 font-semibold ${isCurrentUser ? 'text-white/80' : 'text-brand-primary'}`}>
-                            {att.error ? 'Unavailable' : 'View'}
+                            {att.error ? 'Unavailable' : previewKind(att.fileName) ? 'Preview' : 'Open'}
                           </span>
                         </a>
                       ))}
@@ -753,6 +796,60 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
           </div>
         </div>
       </div>
+      {/* Attachment preview — sits above the ticket rather than replacing it,
+          so closing it returns to the exact spot in the conversation. */}
+      {preview && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Preview of ${preview.fileName}`}
+          className="fixed inset-0 z-[100] bg-black/80 backdrop-blur-sm flex flex-col"
+          onClick={() => setPreview(null)}
+        >
+          <div className="flex items-center justify-between gap-3 px-4 py-3 text-white shrink-0">
+            <span className="text-sm font-medium truncate">{preview.fileName}</span>
+            <div className="flex items-center gap-2 shrink-0">
+              <a
+                href={preview.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={(e) => e.stopPropagation()}
+                className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-white/15 hover:bg-white/25 transition-colors"
+              >
+                Open original
+              </a>
+              <button
+                type="button"
+                aria-label="Close preview"
+                onClick={() => setPreview(null)}
+                className="w-8 h-8 flex items-center justify-center rounded-lg bg-white/15 hover:bg-white/25 transition-colors text-lg leading-none"
+              >
+                ✕
+              </button>
+            </div>
+          </div>
+
+          <div
+            className="flex-1 min-h-0 px-4 pb-4 flex items-center justify-center"
+            // Clicks on the file itself must not dismiss it — only the backdrop.
+            onClick={(e) => e.stopPropagation()}
+          >
+            {previewKind(preview.fileName) === 'image' ? (
+              <img
+                src={preview.url}
+                alt={preview.fileName}
+                className="max-w-full max-h-full object-contain rounded-lg"
+              />
+            ) : (
+              <iframe
+                src={preview.url}
+                title={preview.fileName}
+                className="w-full h-full rounded-lg bg-white"
+              />
+            )}
+          </div>
+        </div>
+      )}
     </Modal>
   );
 };

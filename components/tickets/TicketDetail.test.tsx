@@ -177,3 +177,59 @@ describe('Reply attachments', () => {
     expect(message).toBe('Attached 1 file');
   });
 });
+
+/**
+ * Previewing an attachment in place.
+ *
+ * Opening a screenshot in a new tab loses the conversation it was sent to
+ * illustrate, which for a support thread is most of its value.
+ */
+describe('Attachment preview', () => {
+  const withAttachment = (fileName: string) => ({
+    ...bareTicket,
+    statusHistory: [],
+    messages: [
+      { id: 'm1', senderId: 'usr_2', senderName: 'Support', senderType: UserType.ADMIN, message: 'see this', createdAt: new Date().toISOString() },
+    ],
+    attachments: [
+      { id: 'a1', storageKey: 'tickets/x/' + fileName, originalName: fileName, messageId: 'm1' },
+    ],
+  } as unknown as SupportTicket);
+
+  test('an image offers a preview rather than a bare link', async () => {
+    renderDetail(withAttachment('screenshot.png'));
+    expect(await screen.findByText('Preview')).toBeDefined();
+  });
+
+  test('a format the browser cannot render still opens externally', async () => {
+    renderDetail(withAttachment('notes.docx'));
+    expect(await screen.findByText('Open')).toBeDefined();
+    expect(screen.queryByText('Preview')).toBeNull();
+  });
+
+  test('clicking an image opens it over the conversation, not in a new tab', async () => {
+    renderDetail(withAttachment('screenshot.png'));
+    await userEvent.click(await screen.findByText('Preview'));
+
+    // The conversation is still mounted behind the overlay.
+    expect(screen.getByRole('dialog', { name: /Preview of screenshot.png/ })).toBeDefined();
+    expect(screen.getAllByText(/see this/).length).toBeGreaterThan(0);
+  });
+
+  test('the preview can be dismissed without closing the ticket', async () => {
+    renderDetail(withAttachment('screenshot.png'));
+    await userEvent.click(await screen.findByText('Preview'));
+    await userEvent.click(screen.getByLabelText('Close preview'));
+
+    expect(screen.queryByRole('dialog', { name: /Preview of/ })).toBeNull();
+    expect(screen.getAllByText(/see this/).length).toBeGreaterThan(0);
+  });
+
+  test('the original is still reachable from inside the preview', async () => {
+    renderDetail(withAttachment('screenshot.png'));
+    await userEvent.click(await screen.findByText('Preview'));
+
+    const original = screen.getByText('Open original') as HTMLAnchorElement;
+    expect(original.getAttribute('target')).toBe('_blank');
+  });
+});
