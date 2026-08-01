@@ -12,6 +12,19 @@
   <link rel="icon" type="image/png" href="/favicon.png">
   <title>EzyPrint - Modern Printing Solutions</title>
   <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+  <!--
+    Loaded here rather than on demand so `window.google` exists before anyone
+    clicks Sign in with Google.
+
+    Loading it inside the click handler meant requestAccessToken() ran from the
+    script's `load` event, which is not a user-gesture context. Chrome allows
+    the popup anyway; Firefox and Safari block it, so the first sign-in attempt
+    failed with "Failed to open popup window". The id matches what
+    signInWithGoogle looks for, so it reuses this tag instead of injecting a
+    second one.
+  -->
+  <script id="google-gsi-script" src="https://accounts.google.com/gsi/client" async></script>
+  <meta name="mobile-web-app-capable" content="yes">
 </head>
 
 <body class="bg-brand-bg font-sans text-brand-text">

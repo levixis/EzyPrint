@@ -728,10 +728,19 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
             }
           };
 
+          // The script is preloaded in index.html, so this is the normal path:
+          // requestAccessToken() runs synchronously inside the click, which is
+          // the only way Firefox and Safari will allow the popup.
           if ((window as any).google) {
             initGoogle();
           } else {
-            script.addEventListener('load', initGoogle);
+            // Clicked before the preload finished. Opening the popup from the
+            // load event would lose the user-gesture context and be blocked, so
+            // say so plainly rather than surfacing "popup blocked" — which
+            // sends people into their browser settings for no reason.
+            script.addEventListener('load', () => reject(
+              new Error('Google Sign-In just finished loading. Please tap the button again.')
+            ), { once: true });
             script.addEventListener('error', () => reject(new Error('Failed to load Google Identity Services')));
           }
         });
