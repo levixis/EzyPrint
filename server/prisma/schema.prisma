@@ -1,0 +1,780 @@
+// EzyPrint Database Schema
+// Mapped 1:1 from the existing types.ts — every Firestore collection
+// becomes a proper relational table with foreign keys and indexes.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  // Pooled connection (Neon PgBouncer, the `-pooler` host) — used at runtime.
+  url       = env("DATABASE_URL")
+  // Direct connection (no PgBouncer) — used by `prisma migrate` only.
+  // PgBouncer in transaction mode cannot hold the session-level advisory locks
+  // migrations take, so DDL run through the pooler fails or deadlocks.
+  directUrl = env("DIRECT_URL")
+}
+
+// ─────────────────────────────────────────────────────────────
+// ENUMS — PostgreSQL native enums for type safety
+// ─────────────────────────────────────────────────────────────
+
+enum UserType {
+  STUDENT
+  SHOP_OWNER
+  ADMIN
+}
+
+enum PrintColor {
+  BLACK_WHITE
+  COLOR
+}
+
+enum OrderStatus {
+  PENDING_PAYMENT
+  PENDING_APPROVAL
+  PRINTING
+  READY_FOR_PICKUP
+  COMPLETED
+  CANCELLED
+  PAYMENT_FAILED
+  REFUNDED
+}
+
+/// Payout lifecycle.
+///
+/// IN_TRANSIT sits between approval and arrival: the transfer has been
+/// initiated but the shop's bank has not credited it yet. Without it, a shop
+/// owner sees "paid" and an unchanged bank balance, and reports missing money.
+enum PayoutStatus {
+  IN_TRANSIT
+  PENDING
+  PAID
+  CONFIRMED
+  DISPUTED
+  REJECTED
+  CANCELLED
+}
+
+enum PayoutMethodType {
+  BANK_ACCOUNT
+  UPI
+}
+
+enum BankAccountType {
+  SAVINGS
+  CURRENT
+}
+
+enum TicketCategory {
+  ORDER_ISSUE
+  PAYMENT_ISSUE
+  DELIVERY_ISSUE
+  OTHER
+}
+
+enum TicketStatus {
+  OPEN
+  IN_REVIEW
+  RESOLVED
+  CLOSED
+}
+
+enum LedgerEntryType {
+  ORDER_EARNING
+  REFUND_DEDUCTION
+  PAYOUT
+  MANUAL_PAYOUT_DEDUCTION
+  PAYOUT_CANCEL_REFUND
+  PAYOUT_REJECT_REFUND
+  CLAWBACK
+  ADJUSTMENT
+}
+
+enum LedgerEntryStatus {
+  PENDING
+  SETTLED
+  VOID
+}
+
+enum LedgerCounterparty {
+  PLATFORM
+  SHOP
+  STUDENT
+}
+
+enum LedgerCreatedBy {
+  SYSTEM
+  ADMIN
+  SHOP
+}
+
+enum NotificationType {
+  success
+  info
+  warning
+  error
+}
+
+enum RefundRequestStatus {
+  PENDING_SHOP
+  APPROVED_BY_SHOP
+  REJECTED_BY_SHOP
+  ESCALATED_TO_ADMIN
+  AUTO_ESCALATED
+  PROCESSING_REFUND
+  RESOLVED_REFUNDED
+  REFUND_SETTLED_OFFLINE
+  RESOLVED_DENIED
+}
+
+enum ReactivationRequestStatus {
+  pending
+  approved
+  rejected
+}
+
+// ─────────────────────────────────────────────────────────────
+// MODELS
+// ─────────────────────────────────────────────────────────────
+
+/// Core user model — students, shop owners, and admins
+model User {
+  id        String   @id @default(cuid())
+  type      UserType
+  name      String?
+  email     String?  @unique
+  phone     String?
+  password  String?  // bcrypt hash — null for Google OAuth users
+
+  // Google OAuth fields
+  googleId  String?  @unique
+  profilePhotoUrl String?
+
+  // Student Pass
+  hasStudentPass         Boolean   @default(false)
+  studentPassActivatedAt DateTime?
+  studentPassPaymentId   String?
+
+  // Push notification tokens
+  fcmTokens String[] @default([])
+
+  // Preferences
+  preferredLanguage String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // ── Relations ──
+  shop              Shop?          @relation("ShopOwner")
+  orders            Order[]
+  notifications     Notification[]
+  ticketsRaised     Ticket[]       @relation("TicketRaiser")
+  ticketMessages    TicketMessage[]
+  bankAccessLogs    BankAccessLog[]
+  refundRequests    RefundRequest[] @relation("RefundStudent")
+  reactivationRequests ReactivationRequest[]
+  refreshTokens     RefreshToken[]
+
+  @@index([type])
+  @@index([email])
+  @@map("users")
+}
+
+/// Refresh tokens for JWT rotation — stored server-side for revocation
+model RefreshToken {
+  id          String   @id @default(cuid())
+  userId      String
+  tokenHash   String   @unique  // SHA-256 hash of the actual token
+  expiresAt   DateTime
+  deviceInfo  String?           // User-Agent or device identifier
+  ip          String?
+  isRevoked   Boolean  @default(false)
+
+  createdAt   DateTime @default(now())
+
+  // ── Relations ──
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+/// Print shop profile — owned by a SHOP_OWNER user
+model Shop {
+  id           String  @id @default(cuid())
+  ownerUserId  String  @unique
+  name         String
+  address      String
+
+  // Pricing
+  bwPerPage    Int   @default(100)
+  colorPerPage Int   @default(300)
+
+  // Status
+  isOpen       Boolean @default(false)
+  isApproved   Boolean @default(false)
+  isArchived   Boolean @default(false)
+  isVerified   Boolean @default(false)
+  isRejected   Boolean @default(false)
+  rejectionReason String?
+
+  // Contact info
+  contactPhone    String?
+  contactPhoneAlt String?
+  contactEmail    String?
+  whatsappNumber  String?
+
+  // Ledger balances (denormalized for fast reads)
+  pendingBalance   Int    @default(0)
+  ledgerBalance    Int    @default(0)
+  debtAmount       Int    @default(0)
+  lastSettlementAt DateTime?
+  financialVersion Int      @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // ── Relations ──
+  owner              User                  @relation("ShopOwner", fields: [ownerUserId], references: [id], onDelete: Cascade)
+  orders             Order[]
+  payoutMethods      PayoutMethod[]
+  bankDetails        BankDetails?
+  payouts            Payout[]
+  ledgerEntries      LedgerEntry[]
+  aggregate          ShopAggregate?
+  tickets            Ticket[]              @relation("ShopTickets")
+  refundRequests     RefundRequest[]
+  reactivationRequests ReactivationRequest[]
+
+  @@index([isOpen, isApproved, isArchived])
+  @@index([ownerUserId])
+  @@map("shops")
+}
+
+/// Document print order — placed by a student at a shop
+model Order {
+  id        String      @id @default(cuid())
+  userId    String
+  shopId    String
+  status    OrderStatus @default(PENDING_PAYMENT)
+
+  // Legacy single-file fields (backward compat)
+  fileName        String
+  fileType        String
+  fileStoragePath String?
+  fileSizeBytes   Int?
+  isFileDeleted   Boolean @default(false)
+
+  // Denormalized shop name (for display when shop is deleted)
+  shopName    String?
+  deletedShop Boolean @default(false)
+
+  // Print options (embedded — these don't need their own table)
+  copies      Int          @default(1)
+  color       PrintColor   @default(BLACK_WHITE)
+  pages       Int          @default(1)
+  doubleSided Boolean      @default(false)
+  startPage   Int?
+  endPage     Int?
+
+  // Pricing breakdown
+  pageCost   Int @default(0)
+  baseFee    Int @default(0)
+  totalPrice Int @default(0)
+
+  // Order metadata
+  shopNotes           String?
+  pickupCode          String?
+  specialInstructions String?
+  userName            String?
+  isPremiumOrder      Boolean @default(false)
+
+  // Payment tracking
+  // razorpayOrderId is unique so the database itself rejects a second Razorpay
+  // order being attached to any EzyPrint order. Postgres permits many NULLs in
+  // a unique index, so unpaid orders are unaffected.
+  razorpayOrderId   String? @unique
+  razorpayPaymentId String?
+  paymentAttemptedAt DateTime?
+  paymentVerifiedVia String?
+
+  // Refund tracking
+  refundId                   String?
+  refundStatus               String?
+  refundAmount               Int?
+  refundedAt                 DateTime?
+  refundError                String?
+  refundInitiatedBy          String?
+  refundReason               String?
+  refundProcessingStartedAt  DateTime?
+
+  // Lifecycle timestamps
+  uploadedAt  DateTime  @default(now())
+  cancelledAt DateTime?
+  completedAt DateTime?
+
+  // Ledger link
+  ledgerEntryId String?
+
+  // ── Relations ──
+  user           User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  shop           Shop           @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  files          OrderFile[]
+  refundRequest  RefundRequest?
+
+  @@index([userId])
+  @@index([shopId])
+  @@index([status])
+  @@index([shopId, status])
+  @@index([status, paymentAttemptedAt])  // reconciliation sweep for stuck payments
+  @@map("orders")
+}
+
+/// Individual file within a multi-file order
+model OrderFile {
+  id            String     @id @default(cuid())
+  uploadId      String?    @unique // Idempotency key for file uploads
+  orderId       String
+  fileName      String
+  fileType      String
+  fileStoragePath String?
+  fileSizeBytes Int?
+  isFileDeleted Boolean    @default(false)
+  pageCount     Int        @default(1)
+  color         PrintColor @default(BLACK_WHITE)
+  copies        Int        @default(1)
+  doubleSided   Boolean    @default(false)
+
+  createdAt DateTime @default(now())
+
+  // ── Relations ──
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@map("order_files")
+}
+
+/// In-app notification for a user
+model Notification {
+  id               String           @id @default(cuid())
+  recipientUserId  String
+  message          String
+  type             NotificationType @default(info)
+  read             Boolean          @default(false)
+
+  // Optional targeting metadata
+  orderId        String?
+  targetUserType UserType?
+  targetShopId   String?
+
+  createdAt DateTime @default(now())
+
+  // ── Relations ──
+  recipient User @relation(fields: [recipientUserId], references: [id], onDelete: Cascade)
+
+  @@index([recipientUserId, read])
+  @@index([recipientUserId, createdAt])
+  @@map("notifications")
+}
+
+/// Shop payout method (bank account or UPI)
+model PayoutMethod {
+  id                String          @id @default(cuid())
+  shopId            String
+  type              PayoutMethodType
+  accountHolderName String?
+  accountNumber     String?
+  ifscCode          String?
+  bankName          String?
+  upiId             String?
+  isPrimary         Boolean         @default(false)
+  nickname          String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // ── Relations ──
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@index([shopId])
+  @@map("payout_methods")
+}
+
+/// Sensitive bank details — restricted access, separate from PayoutMethod
+model BankDetails {
+  id                String          @id @default(cuid())
+  shopId            String          @unique
+  accountHolderName String
+  bankName          String
+  accountNumber     String          // Stored encrypted or plain, masked in UI
+  ifscCode          String
+  accountType       BankAccountType @default(SAVINGS)
+  upiId             String?
+
+  isVerified Boolean   @default(false)
+  verifiedAt DateTime?
+  verifiedBy String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // ── Relations ──
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@map("bank_details")
+}
+
+/// Audit log for bank detail access
+model BankAccessLog {
+  id        String   @id @default(cuid())
+  shopId    String?
+  targetId  String?
+  userId    String
+  userRole  UserType
+  action    String   // VIEW, EDIT, VERIFY
+  success   Boolean  @default(true)
+  ip        String?
+
+  createdAt DateTime @default(now())
+
+  // ── Relations ──
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("bank_access_logs")
+}
+
+/// Shop payout record — tracks money paid out to shops
+model Payout {
+  id             String       @id @default(cuid())
+  shopId         String
+  shopName       String
+  amount         Int
+  status         PayoutStatus @default(PENDING)
+  payoutOrderIds String[]     @default([])
+  adminNote      String?
+  shopOwnerNote  String?
+
+  createdAt   DateTime  @default(now())
+  paidAt      DateTime?
+  confirmedAt DateTime?
+
+  // ── Relations ──
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@index([shopId])
+  @@index([status])
+  @@index([shopId, status])
+  @@map("payouts")
+}
+
+/// Support ticket raised by users
+model Ticket {
+  id             String         @id @default(cuid())
+  raisedBy       String
+  raisedByType   UserType
+  raisedByName   String
+  raisedByEmail  String?
+  shopId         String?
+  shopName       String?
+  deletedShop    Boolean        @default(false)
+  relatedOrderId String?
+  subject        String
+  category       TicketCategory
+  description    String
+  status         TicketStatus   @default(OPEN)
+  attachmentPaths String[]      @default([])
+
+  // Timestamps for tracking response times
+  adminLastRepliedAt  DateTime?
+  raiserLastRepliedAt DateTime?
+  shopLastRepliedAt   DateTime?
+  attachmentsCleanedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // ── Relations ──
+  raiser        User            @relation("TicketRaiser", fields: [raisedBy], references: [id], onDelete: Cascade)
+  shop          Shop?           @relation("ShopTickets", fields: [shopId], references: [id], onDelete: SetNull)
+  messages      TicketMessage[]
+  statusHistory TicketStatusChange[]
+  attachments   TicketAttachment[]
+
+  @@index([raisedBy])
+  @@index([shopId])
+  @@index([status])
+  @@map("tickets")
+}
+
+/// Individual message within a support ticket
+model TicketMessage {
+  id         String   @id @default(cuid())
+  ticketId   String
+  senderId   String
+  senderName String
+  senderType UserType
+  message    String
+
+  createdAt DateTime @default(now())
+
+  // ── Relations ──
+  ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  sender User   @relation(fields: [senderId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId])
+  @@map("ticket_messages")
+}
+
+/// Status change audit trail for tickets
+model TicketStatusChange {
+  id            String       @id @default(cuid())
+  ticketId      String
+  from          TicketStatus
+  to            TicketStatus
+  changedBy     String
+  changedByName String
+  note          String?
+
+  createdAt DateTime @default(now())
+
+  // ── Relations ──
+  ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId])
+  @@map("ticket_status_changes")
+}
+
+/// Durable attachment records for tickets
+model TicketAttachment {
+  id              String   @id @default(cuid())
+  uploadId        String?  @unique // Idempotency key for file uploads
+  ticketId        String
+  storageKey      String
+  originalName    String
+  mimeType        String
+  sizeBytes       Int?
+  
+  createdAt       DateTime @default(now())
+
+  // ── Relations ──
+  ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId])
+  @@map("ticket_attachments")
+}
+
+/// Financial ledger entry for a shop — double-entry style
+model LedgerEntry {
+  id           String             @id @default(cuid())
+  eventId      String?            @unique // Deterministic dedup key
+  shopId       String
+  orderId      String?
+  type         LedgerEntryType
+  status       LedgerEntryStatus  @default(PENDING)
+  amount       Int
+  counterparty LedgerCounterparty
+  description  String
+  createdBy    LedgerCreatedBy    @default(SYSTEM)
+
+  createdAt DateTime  @default(now())
+  settledAt DateTime?
+
+  /// When this entry becomes withdrawable.
+  ///
+  /// Stamped when the entry is created rather than computed when the settlement
+  /// sweep runs, so the dashboard can promise the shop owner an exact date the
+  /// moment they earn the money instead of showing a vague rolling window.
+  availableAt DateTime?
+
+  // ── Relations ──
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@index([shopId])
+  @@index([shopId, type, status])
+  @@index([shopId, status])
+  @@index([status, availableAt])  // drives the settlement sweep
+  @@map("ledger_entries")
+}
+
+/// Outbox for real-time events (Pusher).
+///
+/// Rows are written inside the same transaction as the ledger write they
+/// describe, so an event can never announce money movement that later rolled
+/// back, and a committed movement can never fail to be announced. A dispatcher
+/// publishes them after commit; the request path also publishes immediately for
+/// latency, leaving the dispatcher as the crash-recovery sweep.
+model RealtimeOutbox {
+  id      String @id @default(cuid())
+  channel String
+  event   String
+  payload Json
+
+  /// Shop.financialVersion at write time — monotonic per shop, so a client can
+  /// discard events that arrive out of order and detect gaps.
+  seq Int
+
+  publishedAt DateTime?
+  attempts    Int       @default(0)
+  lastError   String?
+
+  createdAt DateTime @default(now())
+
+  @@index([publishedAt, createdAt])
+  @@map("realtime_outbox")
+}
+
+/// Pre-computed shop aggregate stats (denormalized for dashboard performance)
+model ShopAggregate {
+  id                String @id @default(cuid())
+  shopId            String @unique
+  totalOrders       Int    @default(0)
+  activeOrders      Int    @default(0)
+  completedOrders   Int    @default(0)
+  totalRevenue      Int  @default(0)
+  totalBaseFees     Int  @default(0)
+  totalPaidOut      Int  @default(0)
+  pendingPayouts    Int  @default(0)
+  pendingPayoutCount Int   @default(0)
+
+  updatedAt DateTime @updatedAt
+
+  // ── Relations ──
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@map("shop_aggregates")
+}
+
+/// Reactivation request for archived shops
+model ReactivationRequest {
+  id              String                     @id @default(cuid())
+  shopId          String
+  ownerUid        String
+  ownerEmail      String
+  ownerName       String
+  shopName        String
+  status          ReactivationRequestStatus  @default(pending)
+  rejectionReason String?
+  resolvedBy      String?
+
+  requestedAt DateTime @default(now())
+  resolvedAt  DateTime?
+
+  // ── Relations ──
+  shop  Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  owner User @relation(fields: [ownerUid], references: [id], onDelete: Cascade)
+
+  @@index([shopId])
+  @@index([status])
+  @@map("reactivation_requests")
+}
+
+/// Refund request — student requests, shop/admin resolves
+model RefundRequest {
+  id               String              @id @default(cuid())
+  orderId          String              @unique
+  studentId        String
+  shopId           String
+  reason           String
+  status           RefundRequestStatus @default(PENDING_SHOP)
+  refundAmount     Int?
+  razorpayRefundId String?
+
+  // Response tracking
+  shopResponse   String?
+  adminNote      String?
+  resolvedBy     String?
+
+  // Timestamps
+  studentRequestedAt DateTime @default(now())
+  shopRespondedAt    DateTime?
+  adminResolvedAt    DateTime?
+
+  // ── Relations ──
+  order   Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  student User  @relation("RefundStudent", fields: [studentId], references: [id], onDelete: Cascade)
+  shop    Shop  @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@index([studentId])
+  @@index([shopId])
+  @@index([status])
+  @@map("refund_requests")
+}
+
+/// Webhook event log — Upgrade A: idempotent, auditable webhook processing.
+///
+/// Every incoming Razorpay webhook is logged here BEFORE any business logic runs.
+/// The unique eventId constraint prevents double-processing.
+/// If the server crashes mid-processing, unprocessed events can be replayed
+/// via the reconciliation job (Upgrade B).
+model WebhookEvent {
+  id              String   @id @default(cuid())
+  source          String   // 'razorpay'
+  eventId         String   @unique // Razorpay's event.id — dedup key
+  eventType       String   // 'payment.captured', 'payment.failed', etc.
+  razorpayOrderId String?  // For quick lookups during reconciliation
+  payload         Json     // Full raw webhook payload
+  processed       Boolean  @default(false)
+  processingError String?  // Error message if processing failed
+  processedAt     DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([processed, createdAt])
+  @@index([razorpayOrderId])
+  @@map("webhook_events")
+}
+
+/// Earnings report metadata (the actual report files are stored in S3/R2)
+model EarningsReport {
+  id            String @id @default(cuid())
+  type          String
+  startDate     String
+  endDate       String
+  totalOrders   Int    @default(0)
+  totalRevenue  Int  @default(0)
+  totalBaseFees Int  @default(0)
+  totalPageCosts Int @default(0)
+  storagePath   String
+  downloadUrl   String
+  generatedBy   String
+
+  generatedAt DateTime @default(now())
+
+  @@map("earnings_reports")
+}
+
+/// Referral codes generated by admins for shop owner registration
+model ReferralCode {
+  id        String    @id @default(cuid())
+  code      String    @unique
+  createdBy String    // Admin User ID
+  usedBy    String?   @unique // Shop Owner User ID
+  usedAt    DateTime?
+  expiresAt DateTime? // Optional expiration date
+  
+  createdAt DateTime  @default(now())
+
+  @@index([code, usedBy])
+  @@map("referral_codes")
+}
+
+/// OTP tokens for sensitive admin/account actions (delete, archive, etc.)
+model AdminOtp {
+  id             String   @id @default(cuid())
+  userId         String
+  otp            String
+  actionId       String
+  expiresAt      DateTime
+  failedAttempts Int      @default(0)
+  lockUntil      DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, actionId])
+  @@index([userId])
+  @@map("admin_otps")
+}

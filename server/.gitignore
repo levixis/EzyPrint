@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Prisma
+# NOTE: prisma/migrations/ MUST stay tracked — `prisma migrate deploy` has
+# nothing to apply without it, so the production database cannot be built.
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Uploaded files (local dev storage)
+uploads/

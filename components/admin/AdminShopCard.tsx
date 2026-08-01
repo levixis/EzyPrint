@@ -4,7 +4,8 @@ import { Card } from '../common/Card';
 import { Button } from '../common/Button';
 import { AccountOtpModal } from '../common/AccountOtpModal';
 import { useAppContext } from '../../contexts/AppContext';
-import { db, doc, onSnapshot } from '../../firebase';
+import { shopApi } from '../../lib/queries';
+import { formatMoney } from '../../utils/money';
 
 interface AdminShopCardProps {
   shop: ShopProfile;
@@ -34,12 +35,16 @@ const AdminShopCard: React.FC<AdminShopCardProps> = ({ shop, orders, payouts, on
   }, [shop.id, getPaymentConfig]);
 
   useEffect(() => {
-    const aggregateRef = doc(db, 'shopAggregates', shop.id);
-    const unsubscribe = onSnapshot(aggregateRef, (docSnap) => {
-      setShopAggregate(docSnap.exists() ? ({ shopId: docSnap.id, ...docSnap.data() } as ShopAggregate) : null);
-    });
-
-    return () => unsubscribe();
+    let cancelled = false;
+    const fetchAggregate = async () => {
+      try {
+        const agg = await shopApi.getAggregate(shop.id);
+        if (!cancelled) setShopAggregate(agg);
+      } catch { /* ignore */ }
+    };
+    fetchAggregate();
+    const interval = setInterval(fetchAggregate, 30000);
+    return () => { cancelled = true; clearInterval(interval); };
   }, [shop.id]);
 
   useEffect(() => () => {
@@ -69,7 +74,7 @@ const AdminShopCard: React.FC<AdminShopCardProps> = ({ shop, orders, payouts, on
   const totalRevenue = shopAggregate?.totalRevenue ?? paidOrders.reduce((sum, o) => sum + o.priceDetails.pageCost, 0);
   // Total paid out via confirmed/paid payouts
   const totalPaidOut = shopAggregate?.totalPaidOut ?? payouts
-    .filter(p => p.shopId === shop.id && (p.status === PayoutStatus.CONFIRMED || p.status === PayoutStatus.PAID))
+    .filter(p => p.shopId === shop.id && (p.status === PayoutStatus.CONFIRMED || p.status === PayoutStatus.PAID || p.status === PayoutStatus.IN_TRANSIT))
     .reduce((sum, p) => sum + p.amount, 0);
   // Use canonical ledgerBalance from shop doc when available (accounts for debt, refunds, pending)
   // Fall back to the naive formula only if no ledger data exists
@@ -88,8 +93,11 @@ const AdminShopCard: React.FC<AdminShopCardProps> = ({ shop, orders, payouts, on
   };
 
   const handleReject = async () => {
+    const reason = window.prompt("Enter rejection reason (optional):", "Your shop application has been rejected by admin.");
+    if (reason === null) return; // User cancelled
+
     setIsProcessing(true);
-    await rejectShop(shop.id);
+    await rejectShop(shop.id, reason);
     setIsProcessing(false);
   };
 
@@ -135,12 +143,12 @@ const AdminShopCard: React.FC<AdminShopCardProps> = ({ shop, orders, payouts, on
   };
 
   return (
-    <Card className={`bg-white dark:bg-zinc-900 shadow-lg border hover:shadow-xl transition-all duration-300 ${!shop.isApproved ? 'border-amber-300 dark:border-amber-700' : shop.isArchived ? 'border-gray-300 dark:border-zinc-600 opacity-75' : 'border-gray-200 dark:border-zinc-700 hover:border-brand-primary/30'}`} noPadding>
+    <Card className={`bg-white dark:bg-zinc-900 shadow-lg border hover:shadow-xl transition-all duration-300 ${shop.isArchived ? 'border-gray-300 dark:border-zinc-600 opacity-75' : !shop.isApproved ? 'border-amber-300 dark:border-amber-700' : 'border-gray-200 dark:border-zinc-700 hover:border-brand-primary/30'}`} noPadding>
       <div className="p-5">
         {/* Header */}
         <div className="flex items-start justify-between mb-4">
           <div className="flex items-center gap-3">
-            <div className={`w-12 h-12 rounded-xl flex items-center justify-center shadow-md ${!shop.isApproved ? 'bg-gradient-to-br from-amber-400 to-orange-500' : shop.isArchived ? 'bg-gradient-to-br from-gray-400 to-gray-500' : 'bg-gradient-to-br from-indigo-500 to-purple-600'}`}>
+            <div className={`w-12 h-12 rounded-xl flex items-center justify-center shadow-md ${shop.isArchived ? 'bg-gradient-to-br from-gray-400 to-gray-500' : !shop.isApproved ? 'bg-gradient-to-br from-amber-400 to-orange-500' : 'bg-gradient-to-br from-indigo-500 to-purple-600'}`}>
               <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-6 h-6 text-white">
                 <path d="M5.223 2.25h13.554a.75.75 0 0 1 .678.427l2.443 5.145a.75.75 0 0 1 .072.323v.5c0 1.59-.81 2.994-2.04 3.815v8.29a.75.75 0 0 1-.75.75H4.82a.75.75 0 0 1-.75-.75v-8.29a4.41 4.41 0 0 1-2.04-3.815v-.5a.75.75 0 0 1 .072-.323l2.443-5.145a.75.75 0 0 1 .678-.427Z" />
               </svg>
@@ -150,13 +158,13 @@ const AdminShopCard: React.FC<AdminShopCardProps> = ({ shop, orders, payouts, on
               <p className="text-xs text-gray-500 dark:text-gray-400">{shop.address}</p>
             </div>
           </div>
-          {!shop.isApproved ? (
-            <span className="px-2.5 py-1 rounded-full text-xs font-semibold bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400 animate-pulse">
-              ⏳ Pending Approval
-            </span>
-          ) : shop.isArchived ? (
+          {shop.isArchived ? (
             <span className="px-2.5 py-1 rounded-full text-xs font-semibold bg-gray-200 dark:bg-zinc-700 text-gray-600 dark:text-gray-400">
               📦 Archived
+            </span>
+          ) : !shop.isApproved ? (
+            <span className="px-2.5 py-1 rounded-full text-xs font-semibold bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400 animate-pulse">
+              ⏳ Pending Approval
             </span>
           ) : (
             <span className={`px-2.5 py-1 rounded-full text-xs font-semibold ${shop.isOpen ? 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400' : 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400'}`}>
@@ -183,7 +191,7 @@ const AdminShopCard: React.FC<AdminShopCardProps> = ({ shop, orders, payouts, on
               <p className="text-xs text-gray-500 dark:text-gray-400">Total Orders</p>
             </div>
             <div className="bg-green-50 dark:bg-green-900/20 rounded-lg p-3 text-center">
-              <p className="text-2xl font-bold text-green-600 dark:text-green-400">₹{totalRevenue.toFixed(0)}</p>
+              <p className="text-2xl font-bold text-green-600 dark:text-green-400">{formatMoney(totalRevenue)}</p>
               <p className="text-xs text-gray-500 dark:text-gray-400">Revenue</p>
             </div>
             <div className="bg-amber-50 dark:bg-amber-900/20 rounded-lg p-3 text-center">
@@ -191,7 +199,7 @@ const AdminShopCard: React.FC<AdminShopCardProps> = ({ shop, orders, payouts, on
               <p className="text-xs text-gray-500 dark:text-gray-400">Active Orders</p>
             </div>
             <div className="bg-rose-50 dark:bg-rose-900/20 rounded-lg p-3 text-center">
-              <p className="text-2xl font-bold text-rose-600 dark:text-rose-400">₹{pendingAmount.toFixed(0)}</p>
+              <p className="text-2xl font-bold text-rose-600 dark:text-rose-400">{formatMoney(pendingAmount)}</p>
               <p className="text-xs text-gray-500 dark:text-gray-400">Pending Due</p>
             </div>
           </div>
@@ -199,8 +207,8 @@ const AdminShopCard: React.FC<AdminShopCardProps> = ({ shop, orders, payouts, on
 
         {/* Pricing */}
         <div className="flex gap-2 text-xs text-gray-500 dark:text-gray-400 mb-4">
-          <span className="bg-gray-100 dark:bg-zinc-800 px-2 py-1 rounded">B&W: ₹{shop.customPricing.bwPerPage}/pg</span>
-          <span className="bg-gray-100 dark:bg-zinc-800 px-2 py-1 rounded">Color: ₹{shop.customPricing.colorPerPage}/pg</span>
+          <span className="bg-gray-100 dark:bg-zinc-800 px-2 py-1 rounded">B&W: {shop.customPricing ? `${formatMoney(shop.customPricing.bwPerPage)}/pg` : 'N/A'}</span>
+          <span className="bg-gray-100 dark:bg-zinc-800 px-2 py-1 rounded">Color: {shop.customPricing ? `${formatMoney(shop.customPricing.colorPerPage)}/pg` : 'N/A'}</span>
         </div>
 
         {/* Contact Info */}
@@ -266,7 +274,7 @@ const AdminShopCard: React.FC<AdminShopCardProps> = ({ shop, orders, payouts, on
 
       {/* Actions */}
       <div className="p-4 border-t border-gray-200 dark:border-zinc-700 bg-gray-50 dark:bg-zinc-800/50">
-        {!shop.isApproved ? (
+        {(!shop.isApproved && !shop.isArchived) ? (
           /* Pending shop — Approve / Reject */
           <div className="flex gap-2">
             <Button
@@ -300,7 +308,7 @@ const AdminShopCard: React.FC<AdminShopCardProps> = ({ shop, orders, payouts, on
             </Button>
           </div>
         ) : (
-          /* Approved shop — archive + payout + delete */
+          /* Approved OR Archived shop — archive + payout + delete */
           <div className="space-y-2">
             {!shop.isArchived && (
               <Button

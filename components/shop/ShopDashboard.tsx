@@ -1,5 +1,5 @@
 
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useAppContext } from '../../contexts/AppContext';
 import { LedgerEntryStatus, LedgerEntryType, OrderStatus, PayoutMethod, PayoutStatus, ShopAggregate, ShopLedgerEntry, ShopPricing } from '../../types';
 import ShopOrderList from './ShopOrderList';
@@ -9,13 +9,15 @@ import { Card } from '../common/Card';
 import { Button } from '../common/Button';
 import TicketForm from '../tickets/TicketForm';
 import TicketList from '../tickets/TicketList';
-import { collection, db, doc, limit, onSnapshot, orderBy, query, where } from '../../firebase';
+import { payoutApi, shopApi } from '../../lib/queries';
+import { useShopLedger } from '../../lib/useShopLedger';
 
 interface ShopDashboardProps {
   shopId: string;
 }
 import { useGSAP } from '@gsap/react';
 import gsap from 'gsap';
+import { formatMoney, rupeesToPaise, paiseToRupees } from '../../utils/money';
 
 const getLedgerEntryTone = (entry: ShopLedgerEntry) => {
   if (entry.type === LedgerEntryType.PAYOUT) {
@@ -53,6 +55,40 @@ const getLedgerEntryLabel = (entry: ShopLedgerEntry) => {
   }
 };
 
+/**
+ * Render a settlement time the way a person would say it: "tomorrow at 6:00 am",
+ * "Thu at 6:00 am". A bare ISO timestamp or a relative "in 14 hours" both make
+ * the owner do arithmetic to answer "when do I actually get paid?".
+ */
+const formatSettlementTime = (iso: string): string => {
+  const when = new Date(iso);
+  if (Number.isNaN(when.getTime())) return 'soon';
+
+  const time = when.toLocaleTimeString('en-IN', { hour: 'numeric', minute: '2-digit' });
+
+  const startOfDay = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const daysAway = Math.round((startOfDay(when) - startOfDay(new Date())) / 86_400_000);
+
+  if (daysAway <= 0) return `today at ${time}`;
+  if (daysAway === 1) return `tomorrow at ${time}`;
+  if (daysAway < 7) return `${when.toLocaleDateString('en-IN', { weekday: 'short' })} at ${time}`;
+  return `${when.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })} at ${time}`;
+};
+
+/** One stage of the money pipeline. */
+const MoneyStage: React.FC<{
+  label: string;
+  amount: number;
+  hint: string;
+  accent: string;
+}> = ({ label, amount, hint, accent }) => (
+  <div className="bg-white dark:bg-zinc-900 px-3 py-3">
+    <p className="text-[10px] font-semibold uppercase tracking-wider text-gray-400 dark:text-gray-500">{label}</p>
+    <p className={`text-lg sm:text-xl font-bold mt-1 ${accent}`}>{formatMoney(amount)}</p>
+    <p className="text-[10px] leading-snug text-gray-500 dark:text-gray-400 mt-1">{hint}</p>
+  </div>
+);
+
 const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
   const { getOrdersForCurrentUser, updateOrderStatus, getShopById, updateShopSettings, payouts, requestPayout, confirmPayout, disputePayout, tickets, loadMoreOrders, ordersLimit, loadMorePayouts, payoutsLimit } = useAppContext();
   const [selectedOrderId, setSelectedOrderId] = useState<string | null>(null);
@@ -74,36 +110,43 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
 
   const allShopOrders = getOrdersForCurrentUser();
 
-  useEffect(() => {
-    const ledgerQuery = query(
-      collection(db, "shopLedger"),
-      where("shopId", "==", shopId),
-      orderBy("createdAt", "desc"),
-      limit(300)
-    );
+  // Balances and live money movement. Server-confirmed only — see useShopLedger.
+  const { balances, connection, liveActivity, refresh: refreshBalances } = useShopLedger(shopId);
 
-    const unsubscribeLedger = onSnapshot(ledgerQuery, (querySnapshot) => {
-      const fetchedEntries: ShopLedgerEntry[] = [];
-      querySnapshot.forEach((docSnap) => {
-        fetchedEntries.push({ id: docSnap.id, ...docSnap.data() } as ShopLedgerEntry);
-      });
-      setLedgerEntries(fetchedEntries);
+  // The ledger history list is paged data rather than a live figure, so it is
+  // refetched when a live event tells us something actually changed instead of
+  // on a timer.
+  const fetchLedger = useCallback(async () => {
+    try {
+      const data = await payoutApi.getLedger(shopId, { limit: 100 });
+      setLedgerEntries(data.entries);
       setLedgerError(false);
-    }, (error) => {
-      console.error("[ShopDashboard] Ledger listener error:", error);
+    } catch (error) {
+      console.error('[ShopDashboard] Ledger fetch error:', error);
       setLedgerError(true);
-    });
-
-    return () => unsubscribeLedger();
+    }
   }, [shopId]);
 
-  useEffect(() => {
-    const aggregateRef = doc(db, "shopAggregates", shopId);
-    const unsubscribeAggregate = onSnapshot(aggregateRef, (docSnap) => {
-      setShopAggregate(docSnap.exists() ? ({ shopId: docSnap.id, ...docSnap.data() } as ShopAggregate) : null);
-    });
+  useEffect(() => { void fetchLedger(); }, [fetchLedger]);
 
-    return () => unsubscribeAggregate();
+  // liveActivity only grows when the server confirms a ledger movement.
+  useEffect(() => {
+    if (liveActivity.length > 0) void fetchLedger();
+  }, [liveActivity.length, fetchLedger]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const fetchAggregate = async () => {
+      try {
+        const agg = await shopApi.getAggregate(shopId);
+        if (!cancelled) setShopAggregate(agg);
+      } catch { /* ignore */ }
+    };
+    fetchAggregate();
+    // Order counts, not money — a slow refresh is fine, and the real-time
+    // channel covers anything the owner is actually watching for.
+    const interval = setInterval(fetchAggregate, 5 * 60 * 1000);
+    return () => { cancelled = true; clearInterval(interval); };
   }, [shopId]);
 
   // Derive selectedOrder from live orders so it always reflects real-time Firestore data
@@ -121,15 +164,18 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
   const totalPaidOut = useMemo(() =>
     shopAggregate?.totalPaidOut ??
     shopPayouts
-      .filter(p => p.status === PayoutStatus.PAID || p.status === PayoutStatus.CONFIRMED)
+      .filter(p => p.status === PayoutStatus.IN_TRANSIT || p.status === PayoutStatus.PAID || p.status === PayoutStatus.CONFIRMED)
       .reduce((sum, payout) => sum + payout.amount, 0),
     [shopAggregate, shopPayouts]);
 
-  const rawLedgerBalance = shopProfile?.ledgerBalance || 0;
-  const redeemableAmount = Math.max(0, rawLedgerBalance);
-  const pendingAmount = shopProfile?.pendingBalance || 0;
-  const debtAmount = shopProfile?.debtAmount || 0;
-  const lifetimeNetEarned = rawLedgerBalance + pendingAmount + totalPaidOut;
+  // Live snapshot is authoritative; the shop object is a placeholder for the
+  // first render only.
+  const redeemableAmount = Math.max(0, balances?.available ?? shopProfile?.ledgerBalance ?? 0);
+  const pendingAmount = balances?.clearing ?? shopProfile?.pendingBalance ?? 0;
+  const inProgressAmount = balances?.inProgress ?? 0;
+  const debtAmount = balances?.debt ?? shopProfile?.debtAmount ?? 0;
+  const nextSettlementAt = balances?.nextSettlementAt ?? null;
+  const lifetimeNetEarned = redeemableAmount + pendingAmount + totalPaidOut;
   const hasRefundOffset = debtAmount > 0;
 
   const todayStart = useMemo(() => {
@@ -214,58 +260,10 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
   if (!shopProfile) {
     return <p className="text-status-error text-center p-5">Shop profile not found. Please contact support.</p>;
   }
-
-  // Pending approval gate
-  if (!shopProfile.isApproved) {
-    return (
-      <div className="flex flex-col items-center justify-center min-h-[60vh] py-12 px-4">
-        <div className="w-full max-w-md">
-          <div className="bg-white dark:bg-zinc-900 rounded-2xl shadow-xl border border-amber-200 dark:border-amber-800/40 overflow-hidden">
-            <div className="bg-gradient-to-r from-amber-400 to-orange-500 p-6 text-center">
-              <div className="w-16 h-16 mx-auto mb-3 rounded-full bg-white/20 backdrop-blur-sm flex items-center justify-center">
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-8 h-8 text-white">
-                  <path fillRule="evenodd" d="M12 1.5a5.25 5.25 0 0 0-5.25 5.25v3a3 3 0 0 0-3 3v6.75a3 3 0 0 0 3 3h10.5a3 3 0 0 0 3-3v-6.75a3 3 0 0 0-3-3v-3c0-2.9-2.35-5.25-5.25-5.25Zm3.75 8.25v-3a3.75 3.75 0 1 0-7.5 0v3h7.5Z" clipRule="evenodd" />
-                </svg>
-              </div>
-              <h2 className="text-2xl font-bold text-white">Pending Admin Approval</h2>
-              <p className="text-white/80 text-sm mt-1">Your shop registration is under review</p>
-            </div>
-            <div className="p-6 space-y-4">
-              <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800/30 rounded-xl p-4">
-                <div className="flex items-center gap-3 mb-2">
-                  <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center">
-                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-5 h-5 text-white">
-                      <path d="M5.223 2.25h13.554a.75.75 0 0 1 .678.427l2.443 5.145a.75.75 0 0 1 .072.323v.5c0 1.59-.81 2.994-2.04 3.815v8.29a.75.75 0 0 1-.75.75H4.82a.75.75 0 0 1-.75-.75v-8.29a4.41 4.41 0 0 1-2.04-3.815v-.5a.75.75 0 0 1 .072-.323l2.443-5.145a.75.75 0 0 1 .678-.427Z" />
-                    </svg>
-                  </div>
-                  <div>
-                    <p className="font-bold text-gray-900 dark:text-white">{shopProfile.name}</p>
-                    <p className="text-xs text-gray-500 dark:text-gray-400">{shopProfile.address}</p>
-                  </div>
-                </div>
-              </div>
-              <div className="text-center space-y-2">
-                <p className="text-sm text-gray-600 dark:text-gray-400">
-                  The admin needs to verify and approve your shop before you can start accepting orders.
-                </p>
-              </div>
-              <div className="flex items-center gap-2 justify-center text-amber-600 dark:text-amber-400">
-                <svg className="w-5 h-5 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                </svg>
-                <span className="text-sm font-medium">Awaiting approval...</span>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
   const getPayoutStatusStyle = (status: PayoutStatus) => {
     switch (status) {
       case PayoutStatus.PENDING: return 'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400 border-amber-300 dark:border-amber-700';
+      case PayoutStatus.IN_TRANSIT: return 'bg-sky-100 dark:bg-sky-900/30 text-sky-700 dark:text-sky-400 border-sky-300 dark:border-sky-700';
       case PayoutStatus.PAID: return 'bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400 border-blue-300 dark:border-blue-700';
       case PayoutStatus.CONFIRMED: return 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400 border-emerald-300 dark:border-emerald-700';
       case PayoutStatus.DISPUTED: return 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400 border-red-300 dark:border-red-700';
@@ -318,27 +316,95 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
           <p className="text-[10px] sm:text-xs text-gray-500 dark:text-gray-400 mt-0.5">Active Orders</p>
         </div>
         <div className="bg-white dark:bg-zinc-900 rounded-xl sm:rounded-2xl p-3 sm:p-4 border border-gray-200 dark:border-zinc-700 shadow-sm text-center">
-          <p className="text-2xl sm:text-3xl font-bold text-emerald-600 dark:text-emerald-400">₹{todayEarnings.toFixed(0)}</p>
+          <p className="text-2xl sm:text-3xl font-bold text-emerald-600 dark:text-emerald-400">{formatMoney(todayEarnings)}</p>
           <p className="text-[10px] sm:text-xs text-gray-500 dark:text-gray-400 mt-0.5">Today's Earnings</p>
-          <p className="text-[9px] text-gray-400 dark:text-gray-500 mt-0.5">Backend ledger tracked</p>
+          <p className="text-[9px] text-gray-400 dark:text-gray-500 mt-0.5">Across all completed orders</p>
         </div>
         <div className="bg-white dark:bg-zinc-900 rounded-xl sm:rounded-2xl p-3 sm:p-4 border border-gray-200 dark:border-zinc-700 shadow-sm text-center">
-          <p className="text-2xl sm:text-3xl font-bold text-amber-600 dark:text-amber-400">₹{pendingAmount.toFixed(0)}</p>
-          <p className="text-[10px] sm:text-xs text-gray-500 dark:text-gray-400 mt-0.5">Pending Settlement</p>
-          <p className="text-[9px] text-gray-400 dark:text-gray-500 mt-0.5">Moves to balance after settlement window</p>
+          <p className="text-2xl sm:text-3xl font-bold text-gray-700 dark:text-gray-200">{shopAggregate?.completedOrders ?? fallbackCompletedOrderCount}</p>
+          <p className="text-[10px] sm:text-xs text-gray-500 dark:text-gray-400 mt-0.5">Completed Orders</p>
         </div>
         <div className="bg-gradient-to-br from-indigo-500 to-purple-600 rounded-xl sm:rounded-2xl p-3 sm:p-4 shadow-md text-center">
-          <p className="text-2xl sm:text-3xl font-bold text-white">₹{redeemableAmount.toFixed(0)}</p>
+          <p className="text-2xl sm:text-3xl font-bold text-white">{formatMoney(redeemableAmount)}</p>
           <div className="flex flex-col items-center mt-0.5">
-            <p className="text-[10px] sm:text-xs text-indigo-100">Redeemable Balance</p>
-            <p className="text-[9px] text-indigo-200 mt-0.5">Available to request now</p>
+            <p className="text-[10px] sm:text-xs text-indigo-100">Available Now</p>
+            <p className="text-[9px] text-indigo-200 mt-0.5">Ready to withdraw</p>
           </div>
         </div>
       </div>
 
+      {/* Where your money is right now.
+          Four explicit stages so a shop owner never has to wonder whether a
+          payment is late, lost, or simply still clearing. */}
+      <div className="dashboard-item bg-white dark:bg-zinc-900 rounded-2xl border border-gray-200 dark:border-zinc-700 shadow-sm overflow-hidden">
+        <div className="flex items-center justify-between px-4 pt-4 pb-2">
+          <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-100">Where your money is</h3>
+          <span
+            className="inline-flex items-center gap-1.5 text-[11px] font-medium text-gray-500 dark:text-gray-400"
+            title={
+              connection === 'connected'
+                ? 'Updating live as payments come in'
+                : 'Reconnecting — figures refresh on a timer until then'
+            }
+          >
+            <span
+              className={`w-1.5 h-1.5 rounded-full ${
+                connection === 'connected'
+                  ? 'bg-emerald-500 animate-pulse'
+                  : connection === 'connecting'
+                    ? 'bg-amber-400'
+                    : 'bg-gray-400'
+              }`}
+            />
+            {connection === 'connected' ? 'Live' : connection === 'connecting' ? 'Connecting' : 'Offline'}
+          </span>
+        </div>
+
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-px bg-gray-200 dark:bg-zinc-700">
+          <MoneyStage
+            label="In progress"
+            amount={inProgressAmount}
+            hint="Paid by students, awaiting your fulfilment"
+            accent="text-slate-600 dark:text-slate-300"
+          />
+          <MoneyStage
+            label="Clearing"
+            amount={pendingAmount}
+            hint={
+              nextSettlementAt
+                ? `Available ${formatSettlementTime(nextSettlementAt)}`
+                : 'Earned, settling shortly'
+            }
+            accent="text-indigo-600 dark:text-indigo-400"
+          />
+          <MoneyStage
+            label="Available"
+            amount={redeemableAmount}
+            hint="Withdraw whenever you like"
+            accent="text-emerald-600 dark:text-emerald-400"
+          />
+          <MoneyStage
+            label="Paid out"
+            amount={totalPaidOut}
+            hint="Sent to your bank account"
+            accent="text-gray-500 dark:text-gray-400"
+          />
+        </div>
+
+        {liveActivity.some(item => item.isNew) && (
+          <div className="px-4 py-2.5 bg-emerald-50 dark:bg-emerald-900/20 border-t border-emerald-200 dark:border-emerald-800/40">
+            {liveActivity.filter(item => item.isNew).slice(0, 2).map(item => (
+              <p key={item.id} className="text-xs font-medium text-emerald-800 dark:text-emerald-200 animation-fade-in">
+                {formatMoney(item.amount)} just landed — {item.description}
+              </p>
+            ))}
+          </div>
+        )}
+      </div>
+
       {hasRefundOffset && (
         <div className="dashboard-item rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 shadow-sm dark:border-amber-900/40 dark:bg-amber-900/20 dark:text-amber-200">
-          Your account has an outstanding refund adjustment of ₹{debtAmount.toFixed(2)}. Your next earnings will offset this automatically.
+          Your account has an outstanding refund adjustment of {formatMoney(debtAmount)}. Your next earnings will offset this automatically.
         </div>
       )}
 
@@ -438,11 +504,11 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
             <div className="bg-white dark:bg-zinc-900 rounded-xl p-3 border border-gray-200 dark:border-zinc-700 text-center">
               <p className="text-[10px] sm:text-xs text-gray-500 dark:text-gray-400">Lifetime Net Earned</p>
-              <p className="text-lg font-bold text-gray-800 dark:text-gray-100">₹{lifetimeNetEarned.toFixed(0)}</p>
+              <p className="text-lg font-bold text-gray-800 dark:text-gray-100">{formatMoney(lifetimeNetEarned)}</p>
             </div>
             <div className="bg-white dark:bg-zinc-900 rounded-xl p-3 border border-gray-200 dark:border-zinc-700 text-center">
               <p className="text-[10px] sm:text-xs text-gray-500 dark:text-gray-400">Paid Out</p>
-              <p className="text-lg font-bold text-brand-primary">₹{totalPaidOut.toFixed(0)}</p>
+              <p className="text-lg font-bold text-brand-primary">{formatMoney(totalPaidOut)}</p>
             </div>
             <div className="bg-white dark:bg-zinc-900 rounded-xl p-3 border border-gray-200 dark:border-zinc-700 text-center">
               <p className="text-[10px] sm:text-xs text-gray-500 dark:text-gray-400">Completed Orders</p>
@@ -456,7 +522,7 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
             </div>
             <div className="bg-gradient-to-br from-emerald-500 to-green-600 rounded-xl p-3 text-center shadow-sm flex flex-col items-center justify-center">
               <p className="text-[10px] sm:text-xs text-emerald-50">Redeemable Balance</p>
-              <p className="text-lg font-extrabold text-white">₹{redeemableAmount.toFixed(0)}</p>
+              <p className="text-lg font-extrabold text-white">{formatMoney(redeemableAmount)}</p>
             </div>
           </div>
 
@@ -470,7 +536,7 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
               </div>
               <div className="text-right">
                 <p className="text-[10px] uppercase tracking-wide text-gray-400 dark:text-gray-500">Today</p>
-                <p className="text-lg font-bold text-emerald-600 dark:text-emerald-400">₹{todayEarnings.toFixed(2)}</p>
+                <p className="text-lg font-bold text-emerald-600 dark:text-emerald-400">{formatMoney(todayEarnings)}</p>
               </div>
             </div>
 
@@ -501,7 +567,7 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
                           </div>
                         </div>
                         <div className={`text-right font-bold ${isDebit ? 'text-rose-600 dark:text-rose-400' : 'text-emerald-600 dark:text-emerald-400'}`}>
-                          {isDebit ? '-' : '+'}₹{Math.abs(entry.amount).toFixed(2)}
+                          {isDebit ? '-' : '+'}{formatMoney(Math.abs(entry.amount))}
                         </div>
                       </div>
                     </div>
@@ -561,7 +627,7 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
                 <div className="space-y-3">
                   <div className="bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-200 dark:border-indigo-800/30 rounded-lg p-3">
                     <p className="text-sm text-indigo-700 dark:text-indigo-300">
-                      Available: <strong className="text-base">₹{redeemableAmount.toFixed(2)}</strong>
+                      Available: <strong className="text-base">{formatMoney(redeemableAmount)}</strong>
                     </p>
                   </div>
                   <div>
@@ -570,11 +636,11 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
                       id="payoutAmount"
                       type="number"
                       min="1"
-                      max={redeemableAmount}
+                      max={paiseToRupees(redeemableAmount)}
                       step="0.01"
                       value={payoutRequestAmount}
                       onChange={(e) => setPayoutRequestAmount(e.target.value)}
-                      placeholder={`Max ₹${redeemableAmount.toFixed(2)}`}
+                      placeholder={`Max ${formatMoney(redeemableAmount)}`}
                       className="w-full p-2.5 rounded-lg bg-white dark:bg-zinc-800 border border-gray-300 dark:border-zinc-600 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
                     />
                   </div>
@@ -592,7 +658,8 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
                   <div className="flex gap-2">
                     <Button
                       onClick={async () => {
-                        const amount = parseFloat(payoutRequestAmount);
+                        // The field is in rupees; the API takes paise.
+                        const amount = rupeesToPaise(parseFloat(payoutRequestAmount));
                         if (!amount || amount <= 0 || amount > redeemableAmount) return;
                         setIsRequestingPayout(true);
                         const result = await requestPayout(shopId, shopProfile?.name || '', amount, payoutRequestNote.trim() || undefined);
@@ -601,14 +668,18 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
                           setPayoutRequestAmount('');
                           setPayoutRequestNote('');
                           setShowPayoutRequestForm(false);
+                          // The reservation moves money out of Available. The
+                          // channel will report it too, but refreshing here
+                          // means the figure is right even if Pusher is down.
+                          refreshBalances();
                         }
                       }}
                       variant="primary"
                       size="md"
-                      disabled={isRequestingPayout || !payoutRequestAmount || parseFloat(payoutRequestAmount) <= 0 || parseFloat(payoutRequestAmount) > redeemableAmount}
+                      disabled={isRequestingPayout || !payoutRequestAmount || rupeesToPaise(parseFloat(payoutRequestAmount)) <= 0 || rupeesToPaise(parseFloat(payoutRequestAmount)) > redeemableAmount}
                       className="flex-1 !bg-gradient-to-r !from-indigo-500 !to-purple-600 hover:!from-indigo-600 hover:!to-purple-700"
                     >
-                      {isRequestingPayout ? 'Submitting...' : `Request ₹${parseFloat(payoutRequestAmount || '0').toFixed(2)}`}
+                      {isRequestingPayout ? 'Submitting...' : `Request ${formatMoney(rupeesToPaise(parseFloat(payoutRequestAmount || '0')))}`}
                     </Button>
                     <Button
                       onClick={() => {
@@ -637,7 +708,7 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
               {shopPayouts.map(payout => (
                 <div key={payout.id} className={`rounded-xl p-3.5 border ${getPayoutStatusStyle(payout.status)}`}>
                   <div className="flex items-center justify-between mb-1">
-                    <p className="font-bold text-base">₹{payout.amount.toFixed(2)}</p>
+                    <p className="font-bold text-base">{formatMoney(payout.amount)}</p>
                     <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-white/30 dark:bg-black/20 uppercase">
                       {payout.status}
                     </span>

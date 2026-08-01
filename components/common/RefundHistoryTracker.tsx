@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { RazorpayRefund } from '../../types';
+import { RefundRequest } from '../../types';
 import { useAppContext } from '../../contexts/AppContext';
+import { formatMoney } from '../../utils/money';
 
 interface RefundHistoryTrackerProps {
   orderId: string;
@@ -12,7 +13,7 @@ const debugLog = (...args: unknown[]) => {
 
 export const RefundHistoryTracker: React.FC<RefundHistoryTrackerProps> = ({ orderId }) => {
   const { syncRefundHistory, addNotification } = useAppContext();
-  const [refunds, setRefunds] = useState<RazorpayRefund[]>([]);
+  const [refunds, setRefunds] = useState<RefundRequest[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isSyncing, setIsSyncing] = useState(false);
 
@@ -25,7 +26,7 @@ export const RefundHistoryTracker: React.FC<RefundHistoryTrackerProps> = ({ orde
       if (result.success) {
         setRefunds(result.refunds);
         if (showNotification) {
-          addNotification({ message: 'Refund history synced with Razorpay.', type: 'success' });
+          addNotification({ message: 'Refund history synced.', type: 'success' });
         }
       } else {
         if (showNotification) {
@@ -61,9 +62,9 @@ export const RefundHistoryTracker: React.FC<RefundHistoryTrackerProps> = ({ orde
   if (refunds.length === 0 && !isLoading) {
     return (
       <div className="bg-gray-50 dark:bg-zinc-800/50 rounded-lg p-4 border border-gray-200 dark:border-zinc-700 text-center">
-        <p className="text-xs text-gray-500 dark:text-gray-400">No refunds found on Razorpay for this order.</p>
+        <p className="text-xs text-gray-500 dark:text-gray-400">No refunds found for this order.</p>
         <button onClick={() => fetchHistory(true)} className="mt-2 text-xs text-brand-primary underline underline-offset-2 hover:text-brand-primary/80 transition-colors">
-          Sync Live from Razorpay
+          Sync Live
         </button>
       </div>
     );
@@ -76,7 +77,7 @@ export const RefundHistoryTracker: React.FC<RefundHistoryTrackerProps> = ({ orde
           <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-3.5 h-3.5 text-brand-primary">
             <path d="M10 2a8 8 0 1 0 0 16 8 8 0 0 0 0-16Zm1 4a1 1 0 1 0-2 0v5.5a.75.75 0 0 0 .22.53l3 3a1 1 0 0 0 1.41-1.41l-2.63-2.63V6Z" />
           </svg>
-          Live Banking Timeline
+          Live Refund Timeline
         </h5>
         
         <button
@@ -103,17 +104,17 @@ export const RefundHistoryTracker: React.FC<RefundHistoryTrackerProps> = ({ orde
           let textColor = 'text-gray-600 dark:text-gray-400';
           let icon = '⏳';
 
-          if (refund.status === 'processed') {
+          if (refund.status === 'RESOLVED_REFUNDED') {
             statusColor = 'bg-emerald-500 shadow-emerald-500/30';
             borderColor = 'border-emerald-200 dark:border-emerald-900/30';
             textColor = 'text-emerald-700 dark:text-emerald-400';
             icon = '✅';
-          } else if (refund.status === 'failed') {
+          } else if (refund.status === 'RESOLVED_DENIED' || refund.status === 'REJECTED_BY_SHOP') {
             statusColor = 'bg-red-500 shadow-red-500/30';
             borderColor = 'border-red-200 dark:border-red-900/30';
             textColor = 'text-red-700 dark:text-red-400';
             icon = '❌';
-          } else if (refund.status === 'pending') {
+          } else {
             statusColor = 'bg-amber-500 shadow-amber-500/30';
             borderColor = 'border-amber-200 dark:border-amber-900/30';
             textColor = 'text-amber-700 dark:text-amber-400';
@@ -129,37 +130,38 @@ export const RefundHistoryTracker: React.FC<RefundHistoryTrackerProps> = ({ orde
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-1.5 flex-wrap">
                     <span className="text-xs font-bold text-gray-900 dark:text-white uppercase tracking-wide">
-                      {icon} {refund.status}
+                      {icon} {refund.status.replace(/_/g, ' ')}
                     </span>
                     <span className="text-[10px] text-gray-400 bg-gray-100 dark:bg-zinc-800 px-1.5 py-0.5 rounded font-mono truncate">
-                      {refund.id}
+                      {refund.id.slice(-6)}
                     </span>
                   </div>
                   
                   <p className="text-[10px] text-gray-500 dark:text-gray-400 mt-1">
-                    {new Date(refund.created_at * 1000).toLocaleString()}
+                    Requested: {new Date(refund.studentRequestedAt).toLocaleString()}
                   </p>
                   
-                  {refund.acquirer_data?.arn && (
-                     <div className="mt-2 text-[10px]">
-                       <span className="text-gray-400">ARN: </span>
-                       <span className="font-mono text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-zinc-800 px-1 py-0.5 rounded">
-                         {refund.acquirer_data.arn}
-                       </span>
-                     </div>
+                  {refund.reason && (
+                    <p className="mt-2 text-xs text-gray-700 dark:text-gray-300">
+                      <span className="font-semibold">Reason:</span> {refund.reason}
+                    </p>
                   )}
-                  {refund.notes?.reason && (
-                    <div className="mt-1 flex gap-1 items-start text-[10px] italic text-gray-500 dark:text-gray-400">
-                      <span className="mt-0.5">💬</span>
-                      <span>{refund.notes.reason}</span>
-                    </div>
+                  {refund.shopResponse && (
+                    <p className="mt-1 text-xs text-gray-700 dark:text-gray-300">
+                      <span className="font-semibold">Shop Response:</span> {refund.shopResponse}
+                    </p>
+                  )}
+                  {refund.adminNote && (
+                    <p className="mt-1 text-xs text-gray-700 dark:text-gray-300">
+                      <span className="font-semibold">Admin Note:</span> {refund.adminNote}
+                    </p>
                   )}
                 </div>
                 
-                <div className="text-right flex-shrink-0">
-                  <p className={`text-sm font-bold ${textColor}`}>
-                    ₹{(refund.amount / 100).toFixed(2)}
-                  </p>
+                <div className="text-right">
+                  <div className={`text-sm font-bold ${textColor}`}>
+                    {refund.refundAmount ? `${formatMoney(refund.refundAmount)}` : 'TBD'}
+                  </div>
                 </div>
               </div>
             </div>

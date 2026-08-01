@@ -25,10 +25,10 @@
     "@capgo/capacitor-social-login": "^8.3.9",
     "@gsap/react": "^2.1.2",
     "capacitor-razorpay": "^1.3.0",
-    "firebase": "^11.9.1",
     "gsap": "^3.14.2",
     "jszip": "^3.10.1",
     "pdf-lib": "^1.17.1",
+    "pusher-js": "^8.6.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },

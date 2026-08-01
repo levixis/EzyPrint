@@ -5,6 +5,7 @@ import { Button } from '../common/Button';
 import { Input } from '../common/Input';
 import { Select } from '../common/Select';
 import { Modal } from '../common/Modal';
+import { formatMoney } from '../../utils/money';
 
 interface TicketFormProps {
   isOpen: boolean;
@@ -122,7 +123,7 @@ const TicketForm: React.FC<TicketFormProps> = ({ isOpen, onClose, prefilledOrder
                   { value: '', label: 'None — General platform query' },
                   ...userOrders.slice(0, 20).map(o => ({
                     value: o.id,
-                    label: `#${o.id.slice(-6)} — ${o.fileName} (₹${o.priceDetails.totalPrice.toFixed(2)})`,
+                    label: `#${o.id.slice(-6)} — ${o.fileName} (${formatMoney(o.priceDetails.totalPrice)})`,
                   })),
                 ]}
               />

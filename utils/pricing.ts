@@ -38,13 +38,29 @@ export const getStudentPassExpiryDate = (activatedAt?: string): Date | null => {
   return new Date(activationDate + PASS_DURATION_DAYS * 24 * 60 * 60 * 1000);
 };
 
-// --- Helper: New Base Fee Logic ---
-export const calculateBaseFee = (pageCost: number): number => {
-  if (pageCost <= 0) return 0;
-  if (pageCost <= 5) return 2;
-  if (pageCost <= 30) return 3;
-  if (pageCost <= 70) return 4;
-  return 5;
+// ─────────────────────────────────────────────────────────────
+// PRICING
+//
+// All amounts are paise. This is a MIRROR of the authoritative implementation
+// in server/src/services/pricing.service.ts — the server writes the price that
+// is actually charged, and these functions exist only to show a live estimate
+// while the student configures their order. If you change a rule in one, change
+// it in the other, or the quote will not match the charge.
+// ─────────────────────────────────────────────────────────────
+
+/** Double-sided bills at 1.5x the single-side rate per sheet, not 2x. */
+const DOUBLE_SIDED_SHEET_MULTIPLIER = 1.5;
+
+/** Page cost at or below which a Student Pass waives the base fee (₹30). */
+const STUDENT_PASS_FEE_WAIVER_CEILING = 3000;
+
+/** Platform fee on page cost. Thresholds are ₹5 / ₹30 / ₹70; fees ₹2 / ₹3 / ₹4 / ₹5. */
+export const calculateBaseFee = (pageCostPaise: number): number => {
+  if (pageCostPaise <= 0) return 0;
+  if (pageCostPaise <= 500) return 200;
+  if (pageCostPaise <= 3000) return 300;
+  if (pageCostPaise <= 7000) return 400;
+  return 500;
 };
 
 /**
@@ -59,33 +75,14 @@ export const calculateOrderPrice = (
   const { pages, copies, color, doubleSided } = printOptions;
   if (pages <= 0 || copies <= 0) return { pageCost: 0, baseFee: 0, totalPrice: 0 };
 
-  const singleSideRate = color === PrintColor.COLOR ? shopPricing.colorPerPage : shopPricing.bwPerPage;
+  const pageCost = calculateFilePageCost(pages, color, copies, doubleSided, shopPricing);
 
-  let totalCost;
-  if (doubleSided && pages > 1) {
-    const fullSheets = Math.floor(pages / 2);
-    const remainderPages = pages % 2;
-    const doubleSideSheetRate = singleSideRate * 1.5;
-    const singleCopyCost = (fullSheets * doubleSideSheetRate) + (remainderPages * singleSideRate);
-    totalCost = singleCopyCost * copies;
-  } else {
-    totalCost = pages * singleSideRate * copies;
+  let baseFee = calculateBaseFee(pageCost);
+  if (hasStudentPass && pageCost <= STUDENT_PASS_FEE_WAIVER_CEILING) {
+    baseFee = 0;
   }
 
-  const calculatedPageCost = totalCost;
-
-  let calculatedBaseFee = calculateBaseFee(calculatedPageCost);
-  if (hasStudentPass && calculatedPageCost <= 30) {
-    calculatedBaseFee = 0;
-  }
-
-  const calculatedTotalPrice = calculatedPageCost + calculatedBaseFee;
-
-  return {
-    pageCost: parseFloat(calculatedPageCost.toFixed(2)),
-    baseFee: parseFloat(calculatedBaseFee.toFixed(2)),
-    totalPrice: parseFloat(calculatedTotalPrice.toFixed(2)),
-  };
+  return { pageCost, baseFee, totalPrice: pageCost + baseFee };
 };
 
 /**
@@ -105,12 +102,13 @@ const calculateFilePageCost = (
   if (doubleSided && pageCount > 1) {
     const fullSheets = Math.floor(pageCount / 2);
     const remainderPages = pageCount % 2;
-    const doubleSideSheetRate = singleSideRate * 1.5;
-    const singleCopyCost = (fullSheets * doubleSideSheetRate) + (remainderPages * singleSideRate);
-    return singleCopyCost * copies;
+    const sheetRate = singleSideRate * DOUBLE_SIDED_SHEET_MULTIPLIER;
+    const singleCopyCost = (fullSheets * sheetRate) + (remainderPages * singleSideRate);
+    // The 1.5x multiplier can land on a half-paisa for odd rates.
+    return Math.round(singleCopyCost * copies);
   }
 
-  return pageCount * singleSideRate * copies;
+  return Math.round(pageCount * singleSideRate * copies);
 };
 
 /**
@@ -140,16 +138,10 @@ export const calculateMultiFileOrderPrice = (
     );
   }
 
-  let calculatedBaseFee = calculateBaseFee(totalPageCost);
-  if (hasStudentPass && totalPageCost <= 30) {
-    calculatedBaseFee = 0;
+  let baseFee = calculateBaseFee(totalPageCost);
+  if (hasStudentPass && totalPageCost <= STUDENT_PASS_FEE_WAIVER_CEILING) {
+    baseFee = 0;
   }
 
-  const calculatedTotalPrice = totalPageCost + calculatedBaseFee;
-
-  return {
-    pageCost: parseFloat(totalPageCost.toFixed(2)),
-    baseFee: parseFloat(calculatedBaseFee.toFixed(2)),
-    totalPrice: parseFloat(calculatedTotalPrice.toFixed(2)),
-  };
+  return { pageCost: totalPageCost, baseFee, totalPrice: totalPageCost + baseFee };
 };

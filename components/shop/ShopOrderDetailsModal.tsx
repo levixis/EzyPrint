@@ -5,10 +5,11 @@ import { Modal } from '../common/Modal';
 import { Button } from '../common/Button';
 import { Select } from '../common/Select';
 import { Input } from '../common/Input';
-import { storage, storageRef, getDownloadURL, getBlob } from '../../firebase';
+import { uploadApi } from '../../lib/queries';
 import { Spinner } from '../common/Spinner';
 import { getOrderFiles } from '../../utils/orderHelpers';
 import { downloadFileNative } from '../../utils/mobile';
+import { formatMoney } from '../../utils/money';
 
 const debugLog = (...args: unknown[]) => {
   void args;
@@ -46,8 +47,7 @@ const ShopOrderDetailsModal: React.FC<ShopOrderDetailsModalProps> = ({
       const firstFile = files.find(f => f.fileStoragePath && !f.isFileDeleted);
       if (firstFile?.fileStoragePath) {
         setIsCheckingFiles(true);
-        const fileReference = storageRef(storage, firstFile.fileStoragePath);
-        getDownloadURL(fileReference)
+        uploadApi.getDownloadUrl(firstFile.fileStoragePath)
           .then(() => setDownloadError(null))
           .catch((error) => {
             debugLog("[ShopOrderDetailsModal] Error checking file:", error);
@@ -80,8 +80,8 @@ const ShopOrderDetailsModal: React.FC<ShopOrderDetailsModalProps> = ({
     setDownloadingFileIndex(index);
     setDownloadError(null);
     try {
-      const fileReference = storageRef(storage, file.fileStoragePath);
-      const rawBlob = await getBlob(fileReference);
+      // Download via REST API
+      const rawBlob = await uploadApi.downloadFile(file.fileStoragePath);
 
       // Re-create blob with correct MIME type
       const mimeTypeMap: Record<string, string> = {
@@ -228,22 +228,22 @@ const ShopOrderDetailsModal: React.FC<ShopOrderDetailsModalProps> = ({
         <p><strong>Student ID:</strong> {order.userId.slice(-10)}</p>
         <p><strong>Uploaded:</strong> {new Date(order.uploadedAt).toLocaleString()}</p>
 
-        <div className="bg-brand-secondaryLight/60 p-3 rounded-lg border border-brand-muted/30">
-          <h5 className="font-semibold text-brand-primary mb-1">Print Summary:</h5>
+        <div className="bg-brand-secondaryLight/60 dark:bg-zinc-800/50 p-3 rounded-lg border border-brand-muted/30 dark:border-zinc-700">
+          <h5 className="font-semibold text-brand-primary dark:text-red-400 mb-1">Print Summary:</h5>
           <ul className="list-disc list-inside text-xs space-y-0.5 text-gray-600 dark:text-gray-400">
-            <li className="font-semibold text-brand-primary bg-brand-primary/10 px-2 py-1 rounded inline-block mb-1">
+            <li className="font-semibold text-brand-primary dark:text-red-400 bg-brand-primary/10 dark:bg-red-900/30 px-2 py-1 rounded inline-block mb-1">
               Auto-Detected Pages: {order.printOptions.pages}
             </li>
             <li className="col-span-1">Files: {files.length} (settings per file shown above)</li>
           </ul>
         </div>
-        <div className="bg-brand-secondaryLight/60 p-3 rounded-lg border border-brand-muted/30">
-          <h5 className="font-semibold text-brand-primary mb-1">Pricing Details:</h5>
+        <div className="bg-brand-secondaryLight/60 dark:bg-zinc-800/50 p-3 rounded-lg border border-brand-muted/30 dark:border-zinc-700">
+          <h5 className="font-semibold text-brand-primary dark:text-red-400 mb-1">Pricing Details:</h5>
           <div className="text-xs text-gray-600 dark:text-gray-400 space-y-0.5">
-            <div className="flex justify-between"><span>Page Cost:</span> <span>₹{order.priceDetails.pageCost.toFixed(2)}</span></div>
-            <div className="flex justify-between"><span>Base Fee:</span> <span>₹{order.priceDetails.baseFee.toFixed(2)}</span></div>
+            <div className="flex justify-between"><span>Page Cost:</span> <span>{formatMoney(order.priceDetails.pageCost)}</span></div>
+            <div className="flex justify-between"><span>Base Fee:</span> <span>{formatMoney(order.priceDetails.baseFee)}</span></div>
             <hr className="my-1 border-brand-muted/50" />
-            <div className="flex justify-between font-semibold"><span>Total Order Value:</span> <span>₹{order.priceDetails.totalPrice.toFixed(2)}</span></div>
+            <div className="flex justify-between font-semibold"><span>Total Order Value:</span> <span>{formatMoney(order.priceDetails.totalPrice)}</span></div>
           </div>
         </div>
 

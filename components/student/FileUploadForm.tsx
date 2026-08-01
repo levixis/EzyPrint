@@ -9,6 +9,7 @@ import { Button } from '../common/Button';
 import { SUPPORTED_FILE_TYPES, SUPPORTED_MIME_TYPES } from '../../constants';
 import { Card } from '../common/Card';
 import { Spinner } from '../common/Spinner';
+import { formatMoney } from '../../utils/money';
 
 interface FileUploadFormProps {
   userId: string;
@@ -318,8 +319,8 @@ const FileUploadForm: React.FC<FileUploadFormProps> = ({ userId, isLoadingShops,
       {currentSelectedShop && (
         <p className="text-xs text-gray-700 dark:text-gray-300 font-medium -mt-4 mb-4">
           Rates for {currentSelectedShop.name}:
-          B&amp;W: ₹{currentSelectedShop.customPricing.bwPerPage}/pg,
-          Color: ₹{currentSelectedShop.customPricing.colorPerPage}/pg.
+          B&amp;W: {formatMoney(currentSelectedShop.customPricing.bwPerPage)}/pg,
+          Color: {formatMoney(currentSelectedShop.customPricing.colorPerPage)}/pg.
         </p>
       )}
 
@@ -490,12 +491,12 @@ const FileUploadForm: React.FC<FileUploadFormProps> = ({ userId, isLoadingShops,
         <div className="flex justify-between items-end mb-2">
           <div>
             <h4 className="text-sm font-semibold text-brand-primary uppercase tracking-wider mb-1">Total Estimated Price</h4>
-            <p className="text-4xl font-extrabold text-brand-text dark:text-white">₹{priceDetails.totalPrice.toFixed(2)}</p>
+            <p className="text-4xl font-extrabold text-brand-text dark:text-white">{formatMoney(priceDetails.totalPrice)}</p>
           </div>
           {fileEntries.length > 0 && (
             <div className="text-right text-xs text-brand-lightText">
               <p>{fileEntries.length} file{fileEntries.length > 1 ? 's' : ''} • {totalPages} pages</p>
-              <p>Page Cost: ₹{priceDetails.pageCost.toFixed(2)} + Fee: ₹{priceDetails.baseFee.toFixed(2)}</p>
+              <p>Page Cost: {formatMoney(priceDetails.pageCost)} + Fee: {formatMoney(priceDetails.baseFee)}</p>
             </div>
           )}
         </div>

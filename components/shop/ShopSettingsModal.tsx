@@ -8,6 +8,7 @@ import { AccountOtpModal } from '../common/AccountOtpModal';
 import { useAppContext } from '../../contexts/AppContext';
 import { calculateBaseFee } from '../../utils/pricing';
 import { Card } from '../common/Card';
+import { formatMoney, rupeesToPaise, paiseToRupees } from '../../utils/money';
 
 interface ShopSettingsModalProps {
   isOpen: boolean;
@@ -32,8 +33,9 @@ const EMPTY_PAYOUT_METHOD_FORM: Partial<PayoutMethod> & { type: PayoutMethodType
 
 const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, shop, onSaveSettings }) => {
   const { requestAccountActionOTP, executeAccountAction, getBankDetails, saveBankDetails, logBankAccess, currentUser, getPaymentConfig } = useAppContext();
-  const [bwPriceInput, setBwPriceInput] = useState(String(shop.customPricing.bwPerPage));
-  const [colorPriceInput, setColorPriceInput] = useState(String(shop.customPricing.colorPerPage));
+  // Rates are stored in paise; the shop owner enters and reads rupees.
+  const [bwPriceInput, setBwPriceInput] = useState(String(paiseToRupees(shop.customPricing.bwPerPage)));
+  const [colorPriceInput, setColorPriceInput] = useState(String(paiseToRupees(shop.customPricing.colorPerPage)));
   const [isShopOpen, setIsShopOpen] = useState(shop.isOpen);
 
   const [currentPayoutMethods, setCurrentPayoutMethods] = useState<PayoutMethod[]>([]);
@@ -72,8 +74,8 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
   useEffect(() => {
     if (isOpen) {
         if (!prevIsOpen.current || shop.id !== prevShopId.current) {
-            setBwPriceInput(String(shop.customPricing.bwPerPage));
-            setColorPriceInput(String(shop.customPricing.colorPerPage));
+            setBwPriceInput(String(paiseToRupees(shop.customPricing.bwPerPage)));
+            setColorPriceInput(String(paiseToRupees(shop.customPricing.colorPerPage)));
             setIsShopOpen(shop.isOpen);
             setEditingPayoutMethod(null);
             setError('');
@@ -150,8 +152,8 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
     const parsedBwPrice = parseFloat(bwPriceInput);
     const parsedColorPrice = parseFloat(colorPriceInput);
 
-    const finalBw = bwPriceInput.trim() === '' ? 0 : (isNaN(parsedBwPrice) ? -1 : parsedBwPrice);
-    const finalColor = colorPriceInput.trim() === '' ? 0 : (isNaN(parsedColorPrice) ? -1 : parsedColorPrice);
+    const finalBw = bwPriceInput.trim() === '' ? 0 : (isNaN(parsedBwPrice) ? -1 : rupeesToPaise(parsedBwPrice));
+    const finalColor = colorPriceInput.trim() === '' ? 0 : (isNaN(parsedColorPrice) ? -1 : rupeesToPaise(parsedColorPrice));
 
     if (finalBw < 0 || finalColor < 0) {
       setError('Prices must be valid positive numbers. Please enter a number or leave blank for 0.');
@@ -352,11 +354,12 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
     }
   };
 
+  // Tier boundaries in paise: \u20B95, \u20B930, \u20B970, and just past \u20B970.
   const baseFeeTiers = [
-    { range: "\u20B90.01 - \u20B95.00", fee: calculateBaseFee(5) },
-    { range: "\u20B95.01 - \u20B930.00", fee: calculateBaseFee(30) },
-    { range: "\u20B930.01 - \u20B970.00", fee: calculateBaseFee(70) },
-    { range: "Over \u20B970.00", fee: calculateBaseFee(71) },
+    { range: "\u20B90.01 - \u20B95.00", fee: calculateBaseFee(500) },
+    { range: "\u20B95.01 - \u20B930.00", fee: calculateBaseFee(3000) },
+    { range: "\u20B930.01 - \u20B970.00", fee: calculateBaseFee(7000) },
+    { range: "Over \u20B970.00", fee: calculateBaseFee(7001) },
   ];
 
   return (
@@ -704,7 +707,7 @@ const ShopSettingsModal: React.FC<ShopSettingsModalProps> = ({ isOpen, onClose, 
             <ul className="list-disc list-inside text-sm text-gray-700 dark:text-gray-300 space-y-1.5 bg-gray-50 dark:bg-zinc-800/60 p-4 rounded-xl border border-gray-200 dark:border-zinc-700">
                 {baseFeeTiers.map(tier => (
                     <li key={tier.range}>For page costs in range <strong>{tier.range}</strong>, Base Fee = <strong>
-                        {`₹${tier.fee.toFixed(2)}`}
+                        {`${formatMoney(tier.fee)}`}
                     </strong></li>
                 ))}
             </ul>

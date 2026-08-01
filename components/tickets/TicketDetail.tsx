@@ -3,8 +3,7 @@ import { SupportTicket, TicketStatus, UserType } from '../../types';
 import { Modal } from '../common/Modal';
 import { Button } from '../common/Button';
 import { useAppContext } from '../../contexts/AppContext';
-import { storage, storageRef, getDownloadURL, app } from '../../firebase';
-import { getFunctions, httpsCallable } from 'firebase/functions';
+import { uploadApi, adminApi } from '../../lib/queries';
 import { RefundOtpModal } from '../common/RefundOtpModal';
 import { RefundHistoryTracker } from '../common/RefundHistoryTracker';
 
@@ -91,9 +90,7 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
     setIsRequestingOTP(true);
     setRefundResult(null);
     try {
-      const functions = getFunctions(app, 'asia-south1');
-      const requestRefundOTPFn = httpsCallable(functions, 'requestRefundOTP');
-      await requestRefundOTPFn({ orderId: relatedOrder.id });
+      await adminApi.requestOTP(`refund_${relatedOrder.id}`);
       setOtpSent(true);
       setRefundResult({ success: true, message: 'OTP sent to your admin email!' });
     } catch (err) {
@@ -108,14 +105,7 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
     setIsIssuingRefund(true);
     setRefundResult(null);
     try {
-      const functions = getFunctions(app, 'asia-south1');
-      const initiateRefundFn = httpsCallable(functions, 'initiateRefund');
-      const result = await initiateRefundFn({
-        orderId: relatedOrder.id,
-        reason: `Refund requested from Ticket #${liveTicket.id.slice(-6)}`,
-        otp: enteredOtp.trim(),
-      });
-      const data = result.data as { success: boolean; message: string };
+      const data = await adminApi.executeAction('initiateRefund', enteredOtp.trim()) as unknown as { success: boolean; message: string };
       setRefundResult({ success: true, message: data.message || 'Refund successfully initiated.' });
       setOtpSent(false);
     } catch (err) {
@@ -131,7 +121,10 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
 
   // Resolve attachment storage paths to download URLs
   useEffect(() => {
-    if (!isOpen || !liveTicket.attachmentPaths || liveTicket.attachmentPaths.length === 0) {
+    const hasLegacy = liveTicket.attachmentPaths && liveTicket.attachmentPaths.length > 0;
+    const hasNew = liveTicket.attachments && liveTicket.attachments.length > 0;
+    
+    if (!isOpen || (!hasLegacy && !hasNew)) {
       setAttachmentUrls([]);
       return;
     }
@@ -140,15 +133,18 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
     setIsLoadingAttachments(true);
 
     const resolveUrls = async () => {
+      const legacyPaths = liveTicket.attachmentPaths ?? [];
+      const newPaths = (liveTicket.attachments ?? []).map(a => ({ path: a.storageKey, originalName: a.originalName }));
+      
+      const allPaths = [...legacyPaths.map(p => ({ path: p, originalName: getFileNameFromPath(p) })), ...newPaths];
+
       const results = await Promise.all(
-        (liveTicket.attachmentPaths ?? []).map(async (path) => {
-          const fileName = getFileNameFromPath(path);
+        allPaths.map(async ({ path, originalName }) => {
           try {
-            const ref = storageRef(storage, path);
-            const url = await getDownloadURL(ref);
-            return { path, url, fileName };
+            const result = await uploadApi.getDownloadUrl(path);
+            return { path, url: result.url, fileName: originalName };
           } catch {
-            return { path, url: '', fileName, error: true };
+            return { path, url: '', fileName: originalName, error: true };
           }
         })
       );
@@ -160,7 +156,7 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
 
     resolveUrls();
     return () => { cancelled = true; };
-  }, [isOpen, liveTicket.attachmentPaths]);
+  }, [isOpen, liveTicket.attachmentPaths, liveTicket.attachments]);
 
   const handleSendReply = async () => {
     if (!replyText.trim()) return;
@@ -265,12 +261,12 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
             </div>
 
             {/* Attachments Section */}
-            {(liveTicket.attachmentPaths?.length ?? 0) > 0 && (
+            {( (liveTicket.attachmentPaths?.length ?? 0) > 0 || (liveTicket.attachments?.length ?? 0) > 0 ) && (
               <div className="bg-white dark:bg-zinc-900 rounded-xl border border-gray-200 dark:border-zinc-700 overflow-hidden">
                 <div className="px-4 py-2.5 border-b border-gray-200 dark:border-zinc-700 flex items-center gap-2">
                   <span className="text-sm">📎</span>
                   <h5 className="text-xs font-bold text-gray-500 dark:text-gray-400 uppercase tracking-wider">
-                    Attachments ({liveTicket.attachmentPaths!.length})
+                    Attachments ({(liveTicket.attachmentPaths?.length ?? 0) + (liveTicket.attachments?.length ?? 0)})
                   </h5>
                 </div>
                 <div className="p-3 space-y-2">

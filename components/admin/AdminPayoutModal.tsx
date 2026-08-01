@@ -5,6 +5,7 @@ import { Input } from '../common/Input';
 import { ShopProfile, DocumentOrder, ShopPayout, OrderStatus, PayoutStatus } from '../../types';
 import { useAppContext } from '../../contexts/AppContext';
 import { AccountOtpModal } from '../common/AccountOtpModal';
+import { formatMoney, rupeesToPaise, paiseToRupees } from '../../utils/money';
 
 interface AdminPayoutModalProps {
   isOpen: boolean;
@@ -62,7 +63,7 @@ const AdminPayoutModal: React.FC<AdminPayoutModalProps> = ({ isOpen, onClose, sh
     const completedOrderCount = shopCompletedOrders.length;
 
     const totalAlreadyPaid = payouts
-      .filter(p => p.shopId === shop.id && (p.status === PayoutStatus.CONFIRMED || p.status === PayoutStatus.PAID))
+      .filter(p => p.shopId === shop.id && (p.status === PayoutStatus.CONFIRMED || p.status === PayoutStatus.PAID || p.status === PayoutStatus.IN_TRANSIT))
       .reduce((sum, p) => sum + p.amount, 0);
 
     const pendingPayoutAmount = payouts
@@ -72,11 +73,14 @@ const AdminPayoutModal: React.FC<AdminPayoutModalProps> = ({ isOpen, onClose, sh
     return { totalEarned, totalAlreadyPaid, pendingDue, completedOrderCount, pendingPayoutAmount };
   }, [shop.ledgerBalance, allOrders, payouts, shop.id]);
 
-  const effectiveAmount = payoutMode === 'all' ? financials.pendingDue : parseFloat(amount || '0');
+  // `amount` is the rupee string the admin types. Everything compared against
+  // a balance or sent to the API is paise.
+  const typedPaise = rupeesToPaise(parseFloat(amount || '0'));
+  const effectiveAmount = payoutMode === 'all' ? financials.pendingDue : typedPaise;
 
   const handleSubmit = async () => {
     setError('');
-    const parsedAmount = payoutMode === 'all' ? financials.pendingDue : parseFloat(amount);
+    const parsedAmount = payoutMode === 'all' ? financials.pendingDue : typedPaise;
 
     if (isNaN(parsedAmount) || parsedAmount <= 0) {
       setError('Please enter a valid amount greater than ₹0.');
@@ -84,7 +88,7 @@ const AdminPayoutModal: React.FC<AdminPayoutModalProps> = ({ isOpen, onClose, sh
     }
 
     if (parsedAmount > financials.pendingDue) {
-      setError(`Amount exceeds the pending due of ₹${financials.pendingDue.toFixed(2)}. You can only pay up to what the shop has earned.`);
+      setError(`Amount exceeds the pending due of ${formatMoney(financials.pendingDue)}. You can only pay up to what the shop has earned.`);
       return;
     }
 
@@ -94,7 +98,7 @@ const AdminPayoutModal: React.FC<AdminPayoutModalProps> = ({ isOpen, onClose, sh
   const executePayout = async (otp: string) => {
     setIsSubmitting(true);
     setOtpResult(null);
-    const parsedAmount = payoutMode === 'all' ? financials.pendingDue : parseFloat(amount);
+    const parsedAmount = payoutMode === 'all' ? financials.pendingDue : typedPaise;
     
     const result = await createPayout(shop.id, shop.name, parsedAmount, adminNote.trim(), otp);
     setIsSubmitting(false);
@@ -112,9 +116,9 @@ const AdminPayoutModal: React.FC<AdminPayoutModalProps> = ({ isOpen, onClose, sh
   const handleAmountChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const val = e.target.value.replace(/[^0-9.]/g, '');
     // Prevent entering more than pending due
-    const numVal = parseFloat(val);
+    const numVal = rupeesToPaise(parseFloat(val));
     if (!isNaN(numVal) && numVal > financials.pendingDue) {
-      setAmount(financials.pendingDue.toFixed(2));
+      setAmount(paiseToRupees(financials.pendingDue).toFixed(2));
       return;
     }
     setAmount(val);
@@ -128,23 +132,23 @@ const AdminPayoutModal: React.FC<AdminPayoutModalProps> = ({ isOpen, onClose, sh
           <p className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-3">Earnings Summary</p>
           <div className="grid grid-cols-3 gap-3">
             <div className="text-center">
-              <p className="text-lg font-bold text-emerald-600 dark:text-emerald-400">₹{financials.totalEarned.toFixed(2)}</p>
+              <p className="text-lg font-bold text-emerald-600 dark:text-emerald-400">{formatMoney(financials.totalEarned)}</p>
               <p className="text-[10px] text-gray-500 dark:text-gray-400 uppercase">Total Earned</p>
             </div>
             <div className="text-center">
-              <p className="text-lg font-bold text-blue-600 dark:text-blue-400">₹{financials.totalAlreadyPaid.toFixed(2)}</p>
+              <p className="text-lg font-bold text-blue-600 dark:text-blue-400">{formatMoney(financials.totalAlreadyPaid)}</p>
               <p className="text-[10px] text-gray-500 dark:text-gray-400 uppercase">Already Paid</p>
             </div>
             <div className="text-center">
               <p className={`text-lg font-bold ${financials.pendingDue > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-gray-400 dark:text-gray-500'}`}>
-                ₹{financials.pendingDue.toFixed(2)}
+                {formatMoney(financials.pendingDue)}
               </p>
               <p className="text-[10px] text-gray-500 dark:text-gray-400 uppercase">Pending Due</p>
             </div>
           </div>
           {financials.pendingPayoutAmount > 0 && (
             <p className="text-xs text-amber-600 dark:text-amber-400 mt-2 text-center">
-              ₹{financials.pendingPayoutAmount.toFixed(2)} in pending (unconfirmed) payouts
+              {formatMoney(financials.pendingPayoutAmount)} in pending (unconfirmed) payouts
             </p>
           )}
           <p className="text-xs text-gray-400 dark:text-gray-500 mt-2 text-center">
@@ -201,7 +205,7 @@ const AdminPayoutModal: React.FC<AdminPayoutModalProps> = ({ isOpen, onClose, sh
                     : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300'
                 }`}
               >
-                Pay All (₹{financials.pendingDue.toFixed(2)})
+                Pay All ({formatMoney(financials.pendingDue)})
               </button>
               <button
                 onClick={() => { setPayoutMode('custom'); setError(''); }}
@@ -218,27 +222,27 @@ const AdminPayoutModal: React.FC<AdminPayoutModalProps> = ({ isOpen, onClose, sh
             {payoutMode === 'custom' && (
               <div>
                 <Input
-                  label={`Payout Amount (max ₹${financials.pendingDue.toFixed(2)})`}
+                  label={`Payout Amount (max ${formatMoney(financials.pendingDue)})`}
                   id="payoutAmount"
                   type="text"
                   inputMode="decimal"
                   value={amount}
                   onChange={handleAmountChange}
-                  placeholder={`e.g., ${Math.min(500, financials.pendingDue).toFixed(2)}`}
+                  placeholder={`e.g., ${paiseToRupees(Math.min(50000, financials.pendingDue)).toFixed(2)}`}
                   leftIcon={<span className="text-gray-400 font-medium">₹</span>}
                 />
                 {/* Quick amount buttons */}
                 <div className="flex gap-2 mt-2 flex-wrap">
                   {[0.25, 0.5, 0.75, 1].map(fraction => {
-                    const quickAmount = parseFloat((financials.pendingDue * fraction).toFixed(2));
+                    const quickAmount = Math.round(financials.pendingDue * fraction);
                     if (quickAmount <= 0) return null;
                     return (
                       <button
                         key={fraction}
-                        onClick={() => setAmount(quickAmount.toFixed(2))}
+                        onClick={() => setAmount(paiseToRupees(quickAmount).toFixed(2))}
                         className="px-3 py-1.5 text-xs font-medium rounded-lg bg-gray-100 dark:bg-zinc-800 text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-zinc-700 transition-colors border border-gray-200 dark:border-zinc-600"
                       >
-                        {fraction === 1 ? 'All' : `${fraction * 100}%`} — ₹{quickAmount.toFixed(2)}
+                        {fraction === 1 ? 'All' : `${fraction * 100}%`} — {formatMoney(quickAmount)}
                       </button>
                     );
                   })}
@@ -265,7 +269,7 @@ const AdminPayoutModal: React.FC<AdminPayoutModalProps> = ({ isOpen, onClose, sh
             disabled={financials.pendingDue <= 0 || effectiveAmount <= 0}
             className="!bg-gradient-to-r !from-emerald-500 !to-green-600 hover:!from-emerald-600 hover:!to-green-700"
           >
-            Mark Payout as Paid — ₹{effectiveAmount.toFixed(2)}
+            Mark Payout as Paid — {formatMoney(effectiveAmount)}
           </Button>
         </div>
       </div>
@@ -275,7 +279,7 @@ const AdminPayoutModal: React.FC<AdminPayoutModalProps> = ({ isOpen, onClose, sh
         isOpen={isOTPModalOpen}
         onClose={() => setIsOTPModalOpen(false)}
         title="Verify Payout"
-        description={<p>You are authorizing a manual payout of <strong>₹{effectiveAmount.toFixed(2)}</strong> to <strong>{shop.name}</strong>.</p>}
+        description={<p>You are authorizing a manual payout of <strong>{formatMoney(effectiveAmount)}</strong> to <strong>{shop.name}</strong>.</p>}
         confirmText="Confirm Payout"
         loadingText="Processing..."
         isProcessing={isSubmitting}
@@ -285,7 +289,7 @@ const AdminPayoutModal: React.FC<AdminPayoutModalProps> = ({ isOpen, onClose, sh
         onRequestOTP={async () => {
           setIsRequestingOTP(true);
           setOtpResult(null);
-          const res = await requestAccountActionOTP('CREATE_MANUAL_PAYOUT');
+          const res = await requestAccountActionOTP(`payout_${shop.id}`);
           setIsRequestingOTP(false);
           if (res.success) {
             setOtpSent(true);

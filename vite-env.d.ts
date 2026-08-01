@@ -43,6 +43,8 @@ interface ImportMetaEnv {
    * Razorpay public key ID for payment gateway integration.
    */
   readonly VITE_RAZORPAY_KEY_ID: string;
+  readonly VITE_PUSHER_KEY: string;
+  readonly VITE_PUSHER_CLUSTER: string;
 }
 
 interface ImportMeta {
