@@ -43,5 +43,12 @@ export default defineConfig({
   },
   server: {
     port: 5173 // You can keep your existing port or change it
+  },
+  test: {
+    environment: 'jsdom',
+    globals: true,
+    // Only our own tests. Without this vitest walks node_modules and tries to
+    // run every package's fixtures.
+    include: ['{lib,utils,components,contexts}/**/*.test.{ts,tsx}'],
   }
 })
