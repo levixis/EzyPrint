@@ -6,7 +6,7 @@
  * that would silently lose or invent money if they were wrong.
  */
 
-import { computeBalanceMovement } from '../services/ledger.service';
+import { computeBalanceMovement, shopShareOfRefund } from '../services/ledger.service';
 import { computeAvailableAt } from '../services/settlement.service';
 import { env } from '../config/env';
 
@@ -176,5 +176,39 @@ describe('Refund reversal (refund.failed)', () => {
     // split across the two buckets it came from.
     const total = (s: typeof before) => s.pendingBalance + s.ledgerBalance - s.debtAmount;
     expect(total(afterReversal)).toBe(total(before));
+  });
+});
+
+/**
+ * Who absorbs a refund.
+ *
+ * The student is refunded `totalPrice`, but the shop only ever received
+ * `pageCost` — `baseFee` is the platform's commission. These pin the rule that
+ * the platform absorbs its own fee instead of clawing it back from the shop.
+ */
+describe('Shop liability for a refund', () => {
+  /** Minimal tx double exposing just the lookup shopShareOfRefund performs. */
+  const txWithEarning = (amount: number | null) => ({
+    ledgerEntry: {
+      findUnique: async () => (amount === null ? null : { amount }),
+    },
+  });
+
+  test('a full refund debits the shop only its earnings, not the base fee', async () => {
+    // Real production order: page=300 + base=200 = total=500.
+    const share = await shopShareOfRefund(txWithEarning(300), 'order-1', 500);
+    expect(share).toBe(300);
+  });
+
+  test('a partial refund below the earning is borne entirely by the shop', async () => {
+    const share = await shopShareOfRefund(txWithEarning(300), 'order-1', 200);
+    expect(share).toBe(200);
+  });
+
+  test('an order refunded before completion never earned, so the shop owes nothing', async () => {
+    // No `earn:<orderId>` entry exists — deducting here would invent debt
+    // against a shop that was never paid.
+    const share = await shopShareOfRefund(txWithEarning(null), 'order-1', 500);
+    expect(share).toBe(0);
   });
 });

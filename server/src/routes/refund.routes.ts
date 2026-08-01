@@ -211,22 +211,29 @@ router.post('/:id/resolve', authenticate, authorize('ADMIN'), validate(resolveRe
         data: { status: 'REFUNDED' }
       });
 
-      await ledgerService.createLedgerEntry({
-        shopId: request.shopId,
-        type: 'REFUND_DEDUCTION',
-        amount: amount,
-        description: `Refund for order ${request.orderId}`,
-        counterparty: 'STUDENT',
-        createdBy: 'ADMIN',
-        orderId: request.orderId,
-        eventId: `refund:${request.id}`,
-        // The student has already been refunded by Razorpay at this point. If
-        // the shop's balance no longer covers it — because they were paid out
-        // in the meantime — the shortfall becomes debt offset against their
-        // future earnings. Refusing here would leave the platform out of pocket
-        // with no record of who owes it.
-        allowDebt: true,
-      }, tx, outboxIds);
+      // The student is refunded the full amount by Razorpay, but the shop is
+      // only liable for the part it actually received. The platform absorbs
+      // its own base fee rather than clawing it back from the shop.
+      const shopShare = await ledgerService.shopShareOfRefund(tx, request.orderId, amount);
+
+      if (shopShare > 0) {
+        await ledgerService.createLedgerEntry({
+          shopId: request.shopId,
+          type: 'REFUND_DEDUCTION',
+          amount: shopShare,
+          description: `Refund for order ${request.orderId}`,
+          counterparty: 'STUDENT',
+          createdBy: 'ADMIN',
+          orderId: request.orderId,
+          eventId: `refund:${request.id}`,
+          // The student has already been refunded by Razorpay at this point. If
+          // the shop's balance no longer covers it — because they were paid out
+          // in the meantime — the shortfall becomes debt offset against their
+          // future earnings. Refusing here would leave the platform out of pocket
+          // with no record of who owes it.
+          allowDebt: true,
+        }, tx, outboxIds);
+      }
 
       return tx.refundRequest.findUnique({ where: { id } });
     });

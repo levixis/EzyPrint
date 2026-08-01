@@ -100,6 +100,38 @@ function eventTypeFor(type: LedgerEntryType): RealtimeEventType {
   return CREDIT_TYPES.has(type) ? 'ledger.credited' : 'ledger.debited';
 }
 
+/**
+ * How much of a refund the shop is liable for.
+ *
+ * The student is refunded `totalPrice`, but a shop only ever receives
+ * `pageCost` — `baseFee` is the platform's commission. Debiting the full
+ * refund charged the shop for revenue it never saw, so the platform now
+ * absorbs its own fee.
+ *
+ * The cap comes from the actual `earn:<orderId>` entry rather than from the
+ * order's `pageCost`, because an order refunded before it reached COMPLETED
+ * never earned anything. Reading `pageCost` there would invent debt against a
+ * shop that was never paid.
+ *
+ * A single indexed lookup on the unique eventId — no read-modify-write, so
+ * there is nothing here for a concurrent refund to race against. The write
+ * that consumes this figure still goes through `createLedgerEntry`'s
+ * compare-and-swap.
+ */
+export async function shopShareOfRefund(
+  tx: any,
+  orderId: string,
+  refundAmount: number
+): Promise<number> {
+  const earning = await tx.ledgerEntry.findUnique({
+    where: { eventId: `earn:${orderId}` },
+    select: { amount: true },
+  });
+
+  if (!earning) return 0;
+  return Math.min(refundAmount, earning.amount);
+}
+
 export interface CreateLedgerEntryInput {
   shopId: string;
   type: LedgerEntryType;

@@ -492,17 +492,23 @@ async function processWebhookEvent(eventType: string, event: any, eventId: strin
             data: { status: 'REFUNDED' },
           });
 
-          await ledgerService.createLedgerEntry({
-            shopId: request.shopId,
-            type: 'REFUND_DEDUCTION',
-            amount: refund.amount,
-            description: `Refund for order ${request.orderId}`,
-            counterparty: 'STUDENT',
-            createdBy: 'SYSTEM',
-            orderId: request.orderId,
-            eventId: `refund:${request.id}`,
-            allowDebt: true,
-          }, tx, outboxIds);
+          // Same split as the admin resolve path: the shop is liable only for
+          // what it actually received, never for the platform's base fee.
+          const shopShare = await ledgerService.shopShareOfRefund(tx, request.orderId, refund.amount);
+
+          if (shopShare > 0) {
+            await ledgerService.createLedgerEntry({
+              shopId: request.shopId,
+              type: 'REFUND_DEDUCTION',
+              amount: shopShare,
+              description: `Refund for order ${request.orderId}`,
+              counterparty: 'STUDENT',
+              createdBy: 'SYSTEM',
+              orderId: request.orderId,
+              eventId: `refund:${request.id}`,
+              allowDebt: true,
+            }, tx, outboxIds);
+          }
         }
 
         await tx.webhookEvent.update({
