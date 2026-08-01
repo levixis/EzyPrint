@@ -526,7 +526,11 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
                                     setIsUpdatingStatus(true);
                                     const result = await shopInitiateRefund(liveTicket.id, liveTicket.relatedOrderId!, "Refund pre-approved by shop");
                                     if (result.success) {
-                                      await handleStatusChange(TicketStatus.CLOSED);
+                                      // RESOLVED, not CLOSED. The shop is a
+                                      // party to this complaint and says it has
+                                      // dealt with it; whether that is true is
+                                      // the student's call, or an admin's.
+                                      await handleStatusChange(TicketStatus.RESOLVED);
                                       setIsPreApproveModalOpen(false);
                                     } else {
                                       addNotification({ 

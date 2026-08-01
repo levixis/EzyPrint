@@ -260,14 +260,65 @@ export async function addMessage(
   return created;
 }
 
+/**
+ * Which status each party may move a ticket to.
+ *
+ * The route was ADMIN-only, so a shop could not close a complaint it had just
+ * settled by refunding, and a student could not escalate their own ticket —
+ * both buttons existed and both returned 403.
+ *
+ * Opening it up is not the same as letting anyone set anything:
+ *
+ * - A shop may acknowledge (IN_REVIEW) and mark RESOLVED, but not CLOSE. A
+ *   complaint is against them, and a party to a dispute should not be able to
+ *   file it away — RESOLVED says "we have dealt with this", and the student or
+ *   an admin decides whether that is true.
+ * - The person who raised it may escalate (IN_REVIEW) or CLOSE it, because
+ *   closing your own complaint is just saying you are satisfied.
+ * - An admin may set anything, as the party with no stake in the outcome.
+ */
+const TICKET_TRANSITIONS: Record<string, TicketStatus[]> = {
+  ADMIN: ['OPEN', 'IN_REVIEW', 'RESOLVED', 'CLOSED'] as TicketStatus[],
+  SHOP_OWNER: ['IN_REVIEW', 'RESOLVED'] as TicketStatus[],
+  RAISER: ['IN_REVIEW', 'CLOSED'] as TicketStatus[],
+};
+
 export async function updateTicketStatus(
   ticketId: string,
   newStatus: TicketStatus,
   changedByUserId: string,
-  note?: string
+  note?: string,
+  changedByUserType?: string
 ) {
   const ticket = await prisma.ticket.findUnique({ where: { id: ticketId } });
   if (!ticket) throw ApiError.notFound('Ticket not found');
+
+  // Omitted only by callers that have already established authority.
+  if (changedByUserType !== undefined) {
+    if (!(await canAccessTicket(ticket, changedByUserId, changedByUserType))) {
+      throw ApiError.forbidden('You do not have access to this ticket');
+    }
+
+    // The raiser's own rights win over their role's: a shop owner who raised a
+    // ticket to the admin is the complainant there, not the subject of it.
+    const role =
+      changedByUserType === 'ADMIN'
+        ? 'ADMIN'
+        : ticket.raisedBy === changedByUserId
+          ? 'RAISER'
+          : 'SHOP_OWNER';
+
+    if (!TICKET_TRANSITIONS[role]?.includes(newStatus)) {
+      // The close-specific wording only when that is what was attempted —
+      // telling a shop trying to reopen a ticket that it may not close one
+      // explains nothing about what it did.
+      throw ApiError.forbidden(
+        role === 'SHOP_OWNER' && newStatus === 'CLOSED'
+          ? 'A shop can mark a ticket resolved, but only the student or an admin can close it'
+          : `You cannot set this ticket to ${newStatus}`
+      );
+    }
+  }
 
   const user = await prisma.user.findUnique({
     where: { id: changedByUserId },

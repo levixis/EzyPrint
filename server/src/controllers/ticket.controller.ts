@@ -74,7 +74,13 @@ export async function updateStatus(req: Request, res: Response, next: NextFuncti
     if (!req.user) throw ApiError.unauthorized();
     const { status, note } = req.body;
     if (!status) throw ApiError.badRequest('status is required');
-    const ticket = await ticketService.updateTicketStatus(req.params.ticketId as string, status, req.user.userId, note);
+    const ticket = await ticketService.updateTicketStatus(
+      req.params.ticketId as string,
+      status,
+      req.user.userId,
+      note,
+      req.user.userType
+    );
     res.json({ success: true, message: `Ticket ${status}`, data: { ticket } });
   } catch (error) { next(error); }
 }

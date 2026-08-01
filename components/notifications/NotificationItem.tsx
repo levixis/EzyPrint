@@ -2,6 +2,7 @@ import React from 'react';
 import { NotificationMessage } from '../../types';
 import { Button } from '../common/Button';
 import { useSwipeToDismiss } from '../../utils/useSwipeToDismiss';
+import { toDate } from '../../utils/datetime';
 
 interface NotificationItemProps {
   notification: NotificationMessage;
@@ -16,9 +17,17 @@ const NotificationItem: React.FC<NotificationItemProps> = ({ notification, onMar
     disabled: notification.read,
   });
 
-  const timeAgo = (dateString: string): string => {
-    const date = new Date(dateString);
-    const seconds = Math.floor((new Date().getTime() - date.getTime()) / 1000);
+  const timeAgo = (value: unknown): string => {
+    // `new Date(undefined).getTime()` is NaN, and NaN survives every branch
+    // below to arrive as the literal string "NaNs ago". A notification with no
+    // usable timestamp is still worth reading — the message is the point — so
+    // the time is dropped rather than the row being garbled.
+    const date = toDate(value);
+    if (!date) return "";
+
+    // Clamped: a clock skewed a second ahead of the server otherwise renders
+    // "-1s ago" on a notification that has only just arrived.
+    const seconds = Math.max(0, Math.floor((Date.now() - date.getTime()) / 1000));
     if (seconds < 5) return "just now";
     let interval = seconds / 31536000;
     if (interval > 1) return Math.floor(interval) + "y ago";

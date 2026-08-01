@@ -4,6 +4,7 @@ import { env } from '../config/env';
 import type { RefundRequestStatus } from '@prisma/client';
 import * as ledgerService from './ledger.service';
 import * as realtimeService from './realtime.service';
+import * as notifyService from './notify.service';
 
 /**
  * Refund execution — the network call to Razorpay and the local persistence
@@ -320,7 +321,12 @@ export async function shopRefundOrder(params: {
     // two approvals in flight together cannot both read the same day's total
     // and both decide they are under the cap. Released automatically at commit
     // or rollback; keyed on the shop, so other shops are unaffected.
-    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${order.shopId}))`;
+    // $executeRaw, not $queryRaw: pg_advisory_xact_lock returns void, and
+    // Prisma cannot deserialize a void column — it takes the lock and then
+    // throws on the way back, which surfaced as "Internal server error" on
+    // every refund. The scheduler's locks read fine only because
+    // pg_try_advisory_lock returns a boolean.
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${order.shopId}))`;
 
     const since = startOfDayIST();
     const settledToday = await tx.refundRequest.findMany({
@@ -379,6 +385,10 @@ export async function shopRefundOrder(params: {
   });
 
   if (escalationReason) {
+    notifyService.notifyAdmins(
+      `Refund of ₹${(amount / 100).toFixed(2)} on order ${orderId} needs your approval — ${escalationReason}.`,
+      'warning'
+    );
     return { settled: false, escalationReason, amount };
   }
 
@@ -390,6 +400,13 @@ export async function shopRefundOrder(params: {
     resolvedBy: shopOwnerUserId,
     adminNote: `Approved by shop: ${reason}`,
   });
+
+  // Told, not asked. Removing the approval gate is only safe if abuse is
+  // visible as it happens rather than discovered in the ledger later.
+  notifyService.notifyAdmins(
+    `Shop refunded ₹${(amount / 100).toFixed(2)} on order ${orderId} under its own limit.`,
+    'info'
+  );
 
   return { settled: true, amount };
 }
