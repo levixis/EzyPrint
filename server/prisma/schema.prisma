@@ -561,6 +561,10 @@ model TicketAttachment {
   id              String   @id @default(cuid())
   uploadId        String?  @unique // Idempotency key for file uploads
   ticketId        String
+  /// The reply this file was sent with, so it renders inside the conversation
+  /// rather than in a separate pile. Null for files attached when the ticket
+  /// was first raised, which belong to the ticket itself.
+  messageId       String?
   storageKey      String
   originalName    String
   mimeType        String
@@ -572,6 +576,7 @@ model TicketAttachment {
   ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
 
   @@index([ticketId])
+  @@index([messageId])
   @@map("ticket_attachments")
 }
 

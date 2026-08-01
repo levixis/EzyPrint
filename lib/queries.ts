@@ -300,7 +300,7 @@ export const ticketApi = {
     api.get<{ ticket: SupportTicket }>(`/tickets/${ticketId}`).then(r => r.ticket),
 
   addMessage: (ticketId: string, message: string) =>
-    api.post(`/tickets/${ticketId}/messages`, { message }),
+    api.post<{ message: { id: string } }>(`/tickets/${ticketId}/messages`, { message }),
 
   updateStatus: (ticketId: string, status: TicketStatus, note?: string) =>
     api.patch(`/tickets/${ticketId}/status`, { status, note }),

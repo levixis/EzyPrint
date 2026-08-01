@@ -1477,7 +1477,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   ): Promise<{ success: boolean; message?: string }> => {
     if (!currentUser) return { success: false, message: 'Not logged in' };
     try {
-      await ticketApi.addMessage(ticketId, message);
+      const posted = await ticketApi.addMessage(ticketId, message);
 
       // Uploaded after the message so a rejected file cannot swallow the reply
       // itself — the text is the part the other party is waiting on. Each
@@ -1486,7 +1486,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       const failed: string[] = [];
       for (const { file, uploadId } of attachments ?? []) {
         try {
-          await uploadApi.uploadSingle(file, uploadId, { ticketId });
+          // messageId is what puts the file inside the conversation rather
+          // than in a separate pile beside it.
+          await uploadApi.uploadSingle(file, uploadId, { ticketId, messageId: posted?.message?.id });
         } catch {
           failed.push(file.name);
         }

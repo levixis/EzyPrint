@@ -68,11 +68,16 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   // Attachment download URLs
-  const [attachmentUrls, setAttachmentUrls] = useState<{ path: string; url: string; fileName: string; error?: boolean }[]>([]);
+  const [attachmentUrls, setAttachmentUrls] = useState<{ path: string; url: string; fileName: string; messageId: string | null; error?: boolean }[]>([]);
   const [isLoadingAttachments, setIsLoadingAttachments] = useState(false);
 
   // Get live ticket data from the tickets array
   const liveTicket = tickets.find(t => t.id === ticket.id) || ticket;
+
+  // Files sent with the opening description stay in the side panel; files sent
+  // with a reply render inside that reply, where their context is.
+  const ticketLevelAttachments = attachmentUrls.filter(a => !a.messageId);
+  const attachmentsFor = (messageId: string) => attachmentUrls.filter(a => a.messageId === messageId);
   const isAdmin = currentUser?.type === UserType.ADMIN;
   const isClosed = liveTicket.status === TicketStatus.CLOSED || liveTicket.status === TicketStatus.RESOLVED;
 
@@ -138,17 +143,26 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
 
     const resolveUrls = async () => {
       const legacyPaths = liveTicket.attachmentPaths ?? [];
-      const newPaths = (liveTicket.attachments ?? []).map(a => ({ path: a.storageKey, originalName: a.originalName }));
-      
-      const allPaths = [...legacyPaths.map(p => ({ path: p, originalName: getFileNameFromPath(p) })), ...newPaths];
+      const newPaths = (liveTicket.attachments ?? []).map(a => ({
+        path: a.storageKey,
+        originalName: a.originalName,
+        // Null for files sent with the opening description; those belong to the
+        // ticket rather than to any one reply.
+        messageId: a.messageId ?? null,
+      }));
+
+      const allPaths = [
+        ...legacyPaths.map(p => ({ path: p, originalName: getFileNameFromPath(p), messageId: null as string | null })),
+        ...newPaths,
+      ];
 
       const results = await Promise.all(
-        allPaths.map(async ({ path, originalName }) => {
+        allPaths.map(async ({ path, originalName, messageId }) => {
           try {
             const result = await uploadApi.getDownloadUrl(path);
-            return { path, url: result.url, fileName: originalName };
+            return { path, url: result.url, fileName: originalName, messageId };
           } catch {
-            return { path, url: '', fileName: originalName, error: true };
+            return { path, url: '', fileName: originalName, messageId, error: true };
           }
         })
       );
@@ -307,19 +321,19 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
             </div>
 
             {/* Attachments Section */}
-            {( (liveTicket.attachmentPaths?.length ?? 0) > 0 || (liveTicket.attachments?.length ?? 0) > 0 ) && (
+            {ticketLevelAttachments.length > 0 && (
               <div className="bg-white dark:bg-zinc-900 rounded-xl border border-gray-200 dark:border-zinc-700 overflow-hidden">
                 <div className="px-4 py-2.5 border-b border-gray-200 dark:border-zinc-700 flex items-center gap-2">
                   <span className="text-sm">📎</span>
                   <h5 className="text-xs font-bold text-gray-500 dark:text-gray-400 uppercase tracking-wider">
-                    Attachments ({(liveTicket.attachmentPaths?.length ?? 0) + (liveTicket.attachments?.length ?? 0)})
+                    Attachments ({ticketLevelAttachments.length})
                   </h5>
                 </div>
                 <div className="p-3 space-y-2">
                   {isLoadingAttachments ? (
                     <p className="text-xs text-gray-400 dark:text-gray-500 text-center py-2">Loading attachments…</p>
                   ) : (
-                    attachmentUrls.map((att) => (
+                    ticketLevelAttachments.map((att) => (
                       <div key={att.path} className="flex items-center gap-3 bg-gray-50 dark:bg-zinc-800 px-3 py-2.5 rounded-lg border border-gray-100 dark:border-zinc-700">
                         <span className="text-lg flex-shrink-0">{getFileIcon(att.fileName)}</span>
                         <span className="text-sm text-gray-700 dark:text-gray-300 truncate flex-1 min-w-0">
@@ -614,6 +628,29 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
                         {msg.senderName} {isAdminMsg && '(Admin)'}
                       </p>
                       <p className="text-sm whitespace-pre-wrap leading-relaxed">{msg.message}</p>
+
+                      {/* Files sent with this reply, shown against the words
+                          they illustrate rather than in a pile beside them. */}
+                      {attachmentsFor(msg.id).map((att) => (
+                        <a
+                          key={att.path}
+                          href={att.error ? undefined : att.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className={`mt-2 flex items-center gap-2 px-2.5 py-2 rounded-lg text-xs transition-colors ${
+                            isCurrentUser
+                              ? 'bg-white/15 hover:bg-white/25'
+                              : 'bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-700 hover:border-brand-primary/50'
+                          } ${att.error ? 'cursor-default opacity-60' : ''}`}
+                        >
+                          <span className="text-base shrink-0">{getFileIcon(att.fileName)}</span>
+                          <span className="truncate flex-1 min-w-0">{att.fileName}</span>
+                          <span className={`shrink-0 font-semibold ${isCurrentUser ? 'text-white/80' : 'text-brand-primary'}`}>
+                            {att.error ? 'Unavailable' : 'View'}
+                          </span>
+                        </a>
+                      ))}
+
                       <p className={`text-[10px] mt-1.5 ${isCurrentUser ? 'text-white/60' : 'text-gray-400 dark:text-gray-500'}`}>
                         {formatDateTime(msg.createdAt ?? msg.timestamp)}
                       </p>

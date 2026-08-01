@@ -48,6 +48,8 @@ export const ticketMessageSchema = z.object({
 export const ticketAttachmentSchema = z.object({
   id: z.string(),
   storageKey: z.string(),
+  /** The reply this file was sent with; null for ticket-level attachments. */
+  messageId: z.string().nullable().optional(),
   originalName: z.string().catch('attachment'),
   mimeType: z.string().optional(),
   sizeBytes: z.number().nullable().optional(),

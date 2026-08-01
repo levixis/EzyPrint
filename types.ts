@@ -284,6 +284,8 @@ export interface TicketStatusChange {
 }
 
 export interface TicketAttachment {
+  /** The reply this file was sent with; absent for ticket-level attachments. */
+  messageId?: string | null;
   id: string;
   ticketId: string;
   storageKey: string;

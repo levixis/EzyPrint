@@ -76,7 +76,10 @@ export async function uploadSingle(req: Request, res: Response, next: NextFuncti
         });
       } else if (targetTicket) {
         await prisma.ticketAttachment.create({
-          data: { ticketId: targetTicket.id, storageKey: result.storageKey, originalName: result.originalName, mimeType: result.mimeType, sizeBytes: result.sizeBytes, uploadId }
+          // messageId ties the file to the reply that carried it, so it renders
+          // inside the conversation. Absent for files attached when the ticket
+          // was raised — those belong to the ticket itself.
+          data: { ticketId: targetTicket.id, messageId: metadata.messageId ?? null, storageKey: result.storageKey, originalName: result.originalName, mimeType: result.mimeType, sizeBytes: result.sizeBytes, uploadId }
         });
       }
     } catch (e) {
