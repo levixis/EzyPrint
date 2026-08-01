@@ -2,7 +2,7 @@
 import React, { createContext, useState, useContext, useCallback, useMemo, ReactNode, useEffect, useRef } from 'react';
 import { DocumentOrder, NotificationMessage, OrderStatus, User, UserType, ShopProfile, ShopPricing, PayoutMethod, AppView, ShopPayout, PrintColor, BankDetails, PaymentConfiguration, SupportTicket, TicketCategory, TicketStatus, ReactivationRequest, RefundRequest, EarningsReport } from '../types';
 
-import { Capacitor } from '@capacitor/core';
+import { Capacitor, registerPlugin } from '@capacitor/core';
 import { playNewOrderSound, initAudioContext } from '../utils/notificationSound';
 
 // API layer — replaces all Firebase SDK calls
@@ -20,6 +20,23 @@ export { calculateBaseFee, calculateOrderPrice, calculateMultiFileOrderPrice, is
 // Push notification registration for native mobile
 import { registerPushNotifications, unregisterPushNotifications } from '../utils/pushNotifications';
 import { formatMoney } from '../utils/money';
+
+/**
+ * The web OAuth client id, used on every platform.
+ *
+ * Android's own client id is registered in Google Cloud but is deliberately not
+ * used here: Google audiences the id_token to whatever client id is requested,
+ * and the server checks `aud` against GOOGLE_CLIENT_IDS. Asking for the Android
+ * one produces a token our own backend then rejects.
+ */
+const GOOGLE_WEB_CLIENT_ID =
+  '283831997162-p8afki1sjtfa9srdvr6infpf06gofmk5.apps.googleusercontent.com';
+
+/** Implemented in android/app/src/main/java/com/ezyprint/app/GoogleSignInLegacyPlugin.java */
+const GoogleSignInLegacy = registerPlugin<{
+  signIn(options: { webClientId: string }): Promise<{ idToken: string; email?: string; name?: string }>;
+  signOut(options?: { webClientId?: string }): Promise<void>;
+}>('GoogleSignInLegacy');
 
 const isDevelopment = import.meta.env.DEV;
 const debugLog = (...args: unknown[]) => {
@@ -706,43 +723,45 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     try {
       let idToken: string;
 
-      if (isNative) {
-        // Native Android/iOS: use native Google Sign-In via Credential Manager
-        const { SocialLogin } = await import('@capgo/capacitor-social-login');
-        await SocialLogin.initialize({
-          google: {
-            webClientId: '283831997162-p8afki1sjtfa9srdvr6infpf06gofmk5.apps.googleusercontent.com',
-          },
-        });
-        // Credential Manager only has a native implementation on API 34+.
-        // Below that it runs through the Play Services shim, which can leave
-        // its HiddenActivity resumed and never call back at all — the app then
-        // sits on "Loading authentication…" indefinitely with no way out. A
-        // deadline turns that into an error the user can act on.
-        const result = await Promise.race([
-          SocialLogin.login({
-            provider: 'google',
-            options: {
-              scopes: ['email', 'profile'],
-              // The sheet otherwise offers only accounts that have already
-              // authorised this app, which on a first install is none of them.
-              style: 'bottom',
-              filterByAuthorizedAccounts: false,
-            },
-          }),
+      if (isNative && Capacitor.getPlatform() === 'android') {
+        // Android goes through GoogleSignInLegacyPlugin, ours, in
+        // android/app/src/main/java/com/ezyprint/app.
+        //
+        // The social-login plugin drives Google only through Credential
+        // Manager, which has no native implementation below API 34 and on
+        // mid-range Android 10-13 phones can display its picker and never call
+        // back — not an error, not a cancellation, just silence. Most of a
+        // campus is on exactly those devices.
+        //
+        // The plugin below shows the same system account picker over the
+        // accounts already on the phone, so nothing about the experience
+        // changes; only the API underneath it does.
+        const idTokenResult = await Promise.race([
+          GoogleSignInLegacy.signIn({ webClientId: GOOGLE_WEB_CLIENT_ID }),
           new Promise<never>((_, reject) =>
             setTimeout(
               () => reject(new Error('Google Sign-In did not respond. Please try again.')),
-              45_000
+              60_000
             )
           ),
         ]);
+
+        if (!idTokenResult?.idToken) {
+          throw new Error('Google Sign-In returned no id token.');
+        }
+        idToken = idTokenResult.idToken;
+      } else if (isNative) {
+        // iOS keeps the social-login plugin, where Google sign-in does not go
+        // through the Android Credential Manager path at all.
+        const { SocialLogin } = await import('@capgo/capacitor-social-login');
+        await SocialLogin.initialize({ google: { webClientId: GOOGLE_WEB_CLIENT_ID } });
+
+        const result = await SocialLogin.login({
+          provider: 'google',
+          options: { scopes: ['email', 'profile'] },
+        });
         const loginResponse = result?.result;
         if (!loginResponse || loginResponse.responseType !== 'online' || !loginResponse.idToken) {
-          // Name what came back. "No result" is true of a dismissed sheet, a
-          // credential that was not a Google account, and an offline-mode
-          // response that carries a server auth code instead of an id token —
-          // three different problems that need three different fixes.
           throw new Error(
             `Native Google Sign-In returned no id token (responseType: ${
               loginResponse?.responseType ?? 'none'
@@ -771,7 +790,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
             
             try {
               const client = google.accounts.oauth2.initTokenClient({
-                client_id: '283831997162-p8afki1sjtfa9srdvr6infpf06gofmk5.apps.googleusercontent.com',
+                client_id: GOOGLE_WEB_CLIENT_ID,
                 scope: 'email profile openid',
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any
                 callback: (response: any) => {
@@ -1028,6 +1047,20 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const logoutUser = async (): Promise<void> => {
     setIsLoadingAuth(true);
     try {
+      // The device token is withdrawn here, while the session is still valid,
+      // and not left to the effect cleanup that also calls this.
+      //
+      // That cleanup is keyed on the current user, so it only runs once
+      // `currentUser` is already null — by which point `clearTokens()` below
+      // has run, `POST /users/me/push-token/remove` goes out with no
+      // Authorization header, 401s, and is swallowed. The device stayed in the
+      // previous account's `fcmTokens` and kept receiving that person's orders
+      // and ticket replies after they had signed out. On a shared phone that is
+      // someone else's order history arriving on your lock screen.
+      //
+      // Calling it twice is harmless: it clears its own token first, so the
+      // later cleanup finds nothing to withdraw.
+      await unregisterPushNotifications();
       await authApi.logout();
     } catch (err) {
       debugLog('[AppContext] Logout error:', err);

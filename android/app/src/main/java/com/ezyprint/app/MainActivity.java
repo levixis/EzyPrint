@@ -23,6 +23,9 @@ public class MainActivity extends BridgeActivity implements ModifiedMainActivity
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        // Registered before super.onCreate: the bridge is built there, and a
+        // plugin registered afterwards is not visible to it.
+        registerPlugin(GoogleSignInLegacyPlugin.class);
         super.onCreate(savedInstanceState);
         createNotificationChannels();
     }
