@@ -141,9 +141,15 @@ export const listUsersSchema = z.object({
 
 export const updateShopSchema = z.object({
   body: z.object({
+    // Paise, and whole ones — a fraction of a paise cannot be charged, and
+    // rounding it later is how a quote stops matching the amount taken.
+    //
+    // The ceiling reads 100000 rather than 1000 because these became paise:
+    // the old cap was ₹1000 per page and had silently tightened to ₹10, so a
+    // shop pricing colour above that was rejected as invalid.
     pricing: z.object({
-      bwPerPage: z.number().min(0).max(1000),
-      colorPerPage: z.number().min(0).max(1000),
+      bwPerPage: z.number().int('Price must be a whole number of paise').min(0).max(100_000),
+      colorPerPage: z.number().int('Price must be a whole number of paise').min(0).max(100_000),
     }).optional(),
     isOpen: z.boolean().optional(),
     contactPhone: z.string().max(20).optional(),

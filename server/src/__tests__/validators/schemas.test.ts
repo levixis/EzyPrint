@@ -278,9 +278,17 @@ describe('Shop Update Schema', () => {
     }).success).toBe(false);
   });
 
-  test('rejects pricing above max (1000)', () => {
+  test('rejects pricing above max (₹1000 a page, in paise)', () => {
+    // This used to assert 1001 was rejected, which was correct while these
+    // were rupees. After the paise migration the same number meant ₹10.01 and
+    // the assertion was pinning the ceiling 100x too low — the test was
+    // holding the bug in place.
     expect(validate(updateShopSchema, {
-      body: { pricing: { bwPerPage: 2, colorPerPage: 1001 } },
+      body: { pricing: { bwPerPage: 200, colorPerPage: 1001 } },
+    }).success).toBe(true);
+
+    expect(validate(updateShopSchema, {
+      body: { pricing: { bwPerPage: 200, colorPerPage: 100_001 } },
     }).success).toBe(false);
   });
 });
@@ -370,5 +378,42 @@ describe('createReferralSchema', () => {
   test('caps validity at a year, so no code is a standing key', () => {
     expect(parse(365).success).toBe(true);
     expect(parse(4000).success).toBe(false);
+  });
+});
+
+/**
+ * Shop pricing is paise. The bounds were written when it was rupees, so the
+ * ceiling had quietly become ₹10 per page — a shop charging more for colour
+ * was told its price was invalid.
+ */
+describe('updateShopSchema pricing', () => {
+  const { updateShopSchema } = require('../../validators/schemas');
+  const parse = (bwPerPage: unknown, colorPerPage: unknown) =>
+    updateShopSchema.safeParse({ body: { pricing: { bwPerPage, colorPerPage } }, query: {}, params: {} });
+
+  test('accepts ordinary campus rates in paise', () => {
+    // ₹2 and ₹5 a page.
+    expect(parse(200, 500).success).toBe(true);
+  });
+
+  test('accepts a price the old rupee-era cap would have rejected', () => {
+    // ₹15 a page in paise. Under max(1000) this was refused as invalid.
+    expect(parse(1500, 2000).success).toBe(true);
+  });
+
+  test('free is allowed, negative is not', () => {
+    expect(parse(0, 300).success).toBe(true);
+    expect(parse(-1, 300).success).toBe(false);
+  });
+
+  test('rejects a fraction of a paise', () => {
+    // Rounding this later is how a quote stops matching the amount charged.
+    expect(parse(150.5, 300).success).toBe(false);
+  });
+
+  test('still refuses an absurd price', () => {
+    // ₹1000 a page is the ceiling; beyond it is a typo, not a rate.
+    expect(parse(100_000, 300).success).toBe(true);
+    expect(parse(100_001, 300).success).toBe(false);
   });
 });

@@ -714,10 +714,29 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
             webClientId: '283831997162-p8afki1sjtfa9srdvr6infpf06gofmk5.apps.googleusercontent.com',
           },
         });
-        const result = await SocialLogin.login({
-          provider: 'google',
-          options: { scopes: ['email', 'profile'] },
-        });
+        // Credential Manager only has a native implementation on API 34+.
+        // Below that it runs through the Play Services shim, which can leave
+        // its HiddenActivity resumed and never call back at all — the app then
+        // sits on "Loading authentication…" indefinitely with no way out. A
+        // deadline turns that into an error the user can act on.
+        const result = await Promise.race([
+          SocialLogin.login({
+            provider: 'google',
+            options: {
+              scopes: ['email', 'profile'],
+              // The sheet otherwise offers only accounts that have already
+              // authorised this app, which on a first install is none of them.
+              style: 'bottom',
+              filterByAuthorizedAccounts: false,
+            },
+          }),
+          new Promise<never>((_, reject) =>
+            setTimeout(
+              () => reject(new Error('Google Sign-In did not respond. Please try again.')),
+              45_000
+            )
+          ),
+        ]);
         const loginResponse = result?.result;
         if (!loginResponse || loginResponse.responseType !== 'online' || !loginResponse.idToken) {
           // Name what came back. "No result" is true of a dismissed sheet, a

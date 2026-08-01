@@ -447,8 +447,12 @@ export async function loginWithGoogle(
             ownerUserId: newUser.id,
             name: shopName,
             address: shopAddress,
-            bwPerPage: 1,
-            colorPerPage: 3,
+            // Pricing is deliberately not set here. `bwPerPage` and
+            // `colorPerPage` are paise, and these lines used to pass 1 and 3 —
+            // rupee figures that survived the paise migration because it
+            // converted stored data, not code. Every shop registered after it
+            // was priced at one paise a page. The schema holds the defaults
+            // (100 / 300); one source of truth cannot drift from itself.
             isOpen: false,
             isApproved: false,
           },
