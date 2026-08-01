@@ -63,3 +63,25 @@ describe('Order transition permissions', () => {
     });
   });
 });
+
+describe('Failed payment is a dead end no longer', () => {
+  test('a student can cancel an order whose payment failed', () => {
+    // Nothing was ever charged, so there is nothing to refund. Previously
+    // PAYMENT_FAILED could only go back to PENDING_PAYMENT, trapping the order
+    // in a retry loop that not even an admin could clear.
+    expect(canRoleTransition('STUDENT', 'PAYMENT_FAILED', 'CANCELLED')).toBe(true);
+  });
+
+  test('retrying payment still works', () => {
+    expect(canRoleTransition('STUDENT', 'PAYMENT_FAILED', 'PENDING_PAYMENT')).toBe(true);
+  });
+
+  test('an admin can clear one too', () => {
+    expect(canRoleTransition('ADMIN', 'PAYMENT_FAILED', 'CANCELLED')).toBe(true);
+  });
+
+  test('a failed payment cannot jump straight to fulfilment', () => {
+    expect(canRoleTransition('STUDENT', 'PAYMENT_FAILED', 'COMPLETED')).toBe(false);
+    expect(canRoleTransition('SHOP_OWNER', 'PAYMENT_FAILED', 'PRINTING')).toBe(false);
+  });
+});

@@ -21,6 +21,9 @@ const RAZORPAY_KEY_ID = import.meta.env.VITE_RAZORPAY_KEY_ID;
 const STUDENT_CANCELLABLE: OrderStatus[] = [
   OrderStatus.PENDING_PAYMENT,
   OrderStatus.PENDING_APPROVAL,
+  // Payment never went through, so there is nothing to refund — the student
+  // can retry or drop it rather than being stuck with a dead order.
+  OrderStatus.PAYMENT_FAILED,
 ];
 const debugLog = (...args: unknown[]) => {
   void args;

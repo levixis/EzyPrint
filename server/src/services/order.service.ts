@@ -65,7 +65,9 @@ const TRANSITIONS_BY_ROLE: Record<string, Partial<Record<OrderStatus, OrderStatu
   STUDENT: {
     PENDING_PAYMENT: ['CANCELLED', 'PAYMENT_FAILED'],
     PENDING_APPROVAL: ['CANCELLED'],
-    PAYMENT_FAILED: ['PENDING_PAYMENT'],
+    // Retry or give up. Nothing was charged, so cancelling costs nothing and
+    // beats leaving a dead order in the student's list forever.
+    PAYMENT_FAILED: ['PENDING_PAYMENT', 'CANCELLED'],
   },
   SHOP_OWNER: {
     PENDING_APPROVAL: ['PRINTING', 'CANCELLED'],
@@ -94,7 +96,9 @@ const VALID_TRANSITIONS: Record<string, OrderStatus[]> = {
   READY_FOR_PICKUP: ['COMPLETED', 'CANCELLED'],
   COMPLETED: ['REFUNDED'],
   CANCELLED: [],
-  PAYMENT_FAILED: ['PENDING_PAYMENT'],
+  // Cancellable as well as retryable: nothing was ever charged, so there is
+  // nothing to refund and no reason to trap the order in a retry loop.
+  PAYMENT_FAILED: ['PENDING_PAYMENT', 'CANCELLED'],
   REFUNDED: [],
 };
 
