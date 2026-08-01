@@ -59,6 +59,9 @@ const getFileIcon = (fileName: string): string => {
 const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) => {
   const { addNotification, addTicketMessage, updateTicketStatus, currentUser, tickets, orders, allOrders, shopInitiateRefund, escalateTicketToAdmin, refundRequests } = useAppContext();
   const [replyText, setReplyText] = useState('');
+  /** Files chosen but not yet sent. Each keeps the upload id minted at pick time. */
+  const [pendingFiles, setPendingFiles] = useState<{ file: File; uploadId: string }[]>([]);
+  const [attachError, setAttachError] = useState('');
   const [isSending, setIsSending] = useState(false);
   const [isUpdatingStatus, setIsUpdatingStatus] = useState(false);
   const [isPreApproveModalOpen, setIsPreApproveModalOpen] = useState(false);
@@ -159,12 +162,54 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
     return () => { cancelled = true; };
   }, [isOpen, liveTicket.attachmentPaths, liveTicket.attachments]);
 
+  /** Mirrors the limits the ticket creation form applies. */
+  const MAX_REPLY_ATTACHMENTS = 3;
+  const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
+
+  const handlePickFiles = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const picked = Array.from(e.target.files ?? []);
+    // Reset immediately so picking the same file twice in a row still fires.
+    e.target.value = '';
+    if (picked.length === 0) return;
+
+    const room = MAX_REPLY_ATTACHMENTS - pendingFiles.length;
+    const rejected: string[] = [];
+    const accepted: { file: File; uploadId: string }[] = [];
+
+    for (const file of picked.slice(0, room)) {
+      if (file.size > MAX_ATTACHMENT_BYTES) {
+        rejected.push(`${file.name} (over 5MB)`);
+        continue;
+      }
+      // Minted here rather than at send: a retry after a failed upload reuses
+      // this id, so the server recognises it instead of storing a duplicate.
+      accepted.push({ file, uploadId: `tkt_${liveTicket.id}_${crypto.randomUUID()}` });
+    }
+
+    if (picked.length > room) rejected.push(`only ${MAX_REPLY_ATTACHMENTS} files per message`);
+    setAttachError(rejected.join(' · '));
+    setPendingFiles(prev => [...prev, ...accepted]);
+  };
+
   const handleSendReply = async () => {
-    if (!replyText.trim()) return;
+    const text = replyText.trim();
+    // A reply is worth sending if it carries either words or files.
+    if (!text && pendingFiles.length === 0) return;
+
     setIsSending(true);
-    const result = await addTicketMessage(liveTicket.id, replyText.trim());
+    setAttachError('');
+
+    const result = await addTicketMessage(
+      liveTicket.id,
+      // The server requires a message body, and an attachment with no words is
+      // a legitimate reply — so it gets described rather than rejected.
+      text || `Attached ${pendingFiles.length} file${pendingFiles.length === 1 ? '' : 's'}`,
+      pendingFiles,
+    );
+
     if (result.success) {
       setReplyText('');
+      setPendingFiles([]);
     }
     setIsSending(false);
   };
@@ -582,7 +627,55 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
             {/* Reply Box — Pinned at bottom */}
             {!isClosed ? (
               <div className="pt-3 border-t border-gray-200 dark:border-zinc-700">
+                {pendingFiles.length > 0 && (
+                  <div className="flex flex-wrap gap-2 mb-2">
+                    {pendingFiles.map(({ file, uploadId }) => (
+                      <span
+                        key={uploadId}
+                        className="inline-flex items-center gap-1.5 max-w-full px-2.5 py-1 rounded-lg bg-gray-100 dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 text-xs text-gray-700 dark:text-gray-300"
+                      >
+                        <span className="truncate max-w-[180px]">{file.name}</span>
+                        <span className="text-gray-400 shrink-0">({Math.round(file.size / 1024)} KB)</span>
+                        <button
+                          type="button"
+                          aria-label={`Remove ${file.name}`}
+                          onClick={() => setPendingFiles(prev => prev.filter(f => f.uploadId !== uploadId))}
+                          className="text-gray-400 hover:text-status-error transition-colors shrink-0"
+                        >
+                          ✕
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+                {attachError && (
+                  <p className="text-xs text-status-error mb-2">{attachError}</p>
+                )}
                 <div className="flex gap-2">
+                  <label
+                    className={`self-end shrink-0 w-11 h-11 flex items-center justify-center rounded-xl border border-gray-200 dark:border-zinc-700 transition-colors ${
+                      pendingFiles.length >= MAX_REPLY_ATTACHMENTS || isSending
+                        ? 'opacity-40 cursor-not-allowed'
+                        : 'cursor-pointer hover:bg-gray-100 dark:hover:bg-zinc-800'
+                    }`}
+                    title={
+                      pendingFiles.length >= MAX_REPLY_ATTACHMENTS
+                        ? `Up to ${MAX_REPLY_ATTACHMENTS} files per message`
+                        : 'Attach a file (max 5MB)'
+                    }
+                  >
+                    <input
+                      type="file"
+                      multiple
+                      className="hidden"
+                      aria-label="Attach files"
+                      disabled={pendingFiles.length >= MAX_REPLY_ATTACHMENTS || isSending}
+                      onChange={handlePickFiles}
+                    />
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5 text-gray-500 dark:text-gray-400">
+                      <path fillRule="evenodd" d="M15.621 4.379a3 3 0 0 0-4.242 0l-7 7a3 3 0 0 0 4.241 4.243h.001l.497-.5a.75.75 0 0 1 1.064 1.057l-.498.501-.002.002a4.5 4.5 0 0 1-6.364-6.364l7-7a4.5 4.5 0 0 1 6.368 6.36l-3.455 3.553A2.625 2.625 0 1 1 9.52 9.52l3.45-3.451a.75.75 0 1 1 1.061 1.06l-3.45 3.451a1.125 1.125 0 0 0 1.587 1.595l3.454-3.553a3 3 0 0 0 0-4.242Z" clipRule="evenodd" />
+                    </svg>
+                  </label>
                   <textarea
                     value={replyText}
                     onChange={(e) => setReplyText(e.target.value.slice(0, 2000))}
@@ -594,7 +687,7 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
                   <Button
                     variant="primary"
                     onClick={handleSendReply}
-                    disabled={!replyText.trim() || isSending}
+                    disabled={(!replyText.trim() && pendingFiles.length === 0) || isSending}
                     className="self-end shrink-0 w-11 h-11 !p-0 flex items-center justify-center rounded-xl"
                   >
                     {isSending ? (
@@ -610,7 +703,7 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
                   </Button>
                 </div>
                 <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-1.5 ml-1">
-                  {replyText.length}/2000 characters
+                  {replyText.length}/2000 characters{pendingFiles.length > 0 ? ` · ${pendingFiles.length} file${pendingFiles.length === 1 ? '' : 's'} attached` : ''}
                 </p>
               </div>
             ) : (

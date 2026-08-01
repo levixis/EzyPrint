@@ -1,5 +1,6 @@
 import { describe, test, expect, vi, beforeEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { SupportTicket, TicketStatus, TicketCategory, UserType } from '../../types';
 
 /**
@@ -12,11 +13,13 @@ import { SupportTicket, TicketStatus, TicketCategory, UserType } from '../../typ
  * crash; these cover every array the component reads.
  */
 
+export const addTicketMessageMock = vi.fn().mockResolvedValue({ success: true });
+
 vi.mock('../../contexts/AppContext', () => ({
   useAppContext: () => ({
     tickets: [],
     currentUser: { id: 'usr_1', type: UserType.STUDENT, name: 'Aastha' },
-    addTicketMessage: vi.fn(),
+    addTicketMessage: addTicketMessageMock,
     updateTicketStatus: vi.fn(),
     refundRequests: [],
   }),
@@ -98,5 +101,79 @@ describe('TicketDetail', () => {
 
     expect(() => renderDetail(full)).not.toThrow();
     expect(screen.getAllByText(/hello/).length).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * Attaching files to a reply.
+ *
+ * The composer was text-only, so a student mid-conversation could not send the
+ * screenshot the whole conversation was about — attachments existed only at
+ * ticket creation.
+ */
+describe('Reply attachments', () => {
+  const file = (name: string, bytes: number) =>
+    new File(['x'.repeat(bytes)], name, { type: 'image/jpeg' });
+
+  // The modal renders through a portal, so queries must go via screen/document
+  // rather than the container render() returns.
+  const openComposer = () => {
+    addTicketMessageMock.mockClear();
+    renderDetail({ ...bareTicket, messages: [], statusHistory: [] } as SupportTicket);
+    const input = screen.getByLabelText('Attach files') as HTMLInputElement;
+    return { input };
+  };
+
+  const clickSend = () => {
+    const buttons = Array.from(document.querySelectorAll('button'));
+    return userEvent.click(buttons[buttons.length - 1]);
+  };
+
+  test('the composer offers a file input', () => {
+    const { input } = openComposer();
+    expect(input).not.toBeNull();
+  });
+
+  test('a chosen file appears before it is sent', async () => {
+    const { input } = openComposer();
+    await userEvent.upload(input, file('screenshot.jpeg', 100));
+    expect(screen.getByText('screenshot.jpeg')).toBeDefined();
+  });
+
+  test('a file over 5MB is refused with a reason rather than silently dropped', async () => {
+    const { input } = openComposer();
+    await userEvent.upload(input, file('huge.jpeg', 6 * 1024 * 1024));
+    expect(screen.getByText(/over 5MB/)).toBeDefined();
+    expect(screen.queryByText('huge.jpeg')).toBeNull();
+  });
+
+  test('a chosen file can be removed again', async () => {
+    const { input } = openComposer();
+    await userEvent.upload(input, file('oops.jpeg', 100));
+    await userEvent.click(screen.getByLabelText('Remove oops.jpeg'));
+    expect(screen.queryByText('oops.jpeg')).toBeNull();
+  });
+
+  test('files reach the send handler with the id minted at pick time', async () => {
+    const { input } = openComposer();
+    await userEvent.upload(input, file('proof.jpeg', 100));
+    await clickSend();
+
+    const calls = addTicketMessageMock.mock.calls;
+    const [, , attachments] = calls[calls.length - 1] ?? [];
+    expect(attachments).toHaveLength(1);
+    // Stable across retries, so the server dedupes rather than storing twice.
+    expect(attachments[0].uploadId).toMatch(/^tkt_/);
+    expect(attachments[0].file.name).toBe('proof.jpeg');
+  });
+
+  test('an attachment with no text still sends, described rather than rejected', async () => {
+    const { input } = openComposer();
+    await userEvent.upload(input, file('only-a-file.jpeg', 100));
+    await clickSend();
+
+    const calls = addTicketMessageMock.mock.calls;
+    const [, message] = calls[calls.length - 1] ?? [];
+    expect(message).toBe('Attached 1 file');
   });
 });

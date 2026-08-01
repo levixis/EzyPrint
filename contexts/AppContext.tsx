@@ -128,7 +128,8 @@ interface AppContextType {
   // Support Tickets
   tickets: SupportTicket[];
   createTicket: (ticketData: { subject: string; category: TicketCategory; description: string; relatedOrderId?: string; attachmentFiles?: File[] }) => Promise<{ success: boolean; ticketId?: string; message?: string }>;
-  addTicketMessage: (ticketId: string, message: string) => Promise<{ success: boolean; message?: string }>;
+  /** `attachments` carry an id minted at selection, so a retry is idempotent. */
+  addTicketMessage: (ticketId: string, message: string, attachments?: { file: File; uploadId: string }[]) => Promise<{ success: boolean; message?: string }>;
   updateTicketStatus: (ticketId: string, newStatus: TicketStatus, note?: string) => Promise<{ success: boolean; message?: string }>;
   shopInitiateRefund: (ticketId: string, orderId: string, reason: string) => Promise<{ success: boolean; message?: string }>;
   escalateTicketToAdmin: (ticketId: string, reason: string) => Promise<{ success: boolean; message?: string }>;
@@ -1469,11 +1470,40 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
   }, [currentUser, addNotification, fetchTickets]);
 
-  const addTicketMessage = useCallback(async (ticketId: string, message: string): Promise<{ success: boolean; message?: string }> => {
+  const addTicketMessage = useCallback(async (
+    ticketId: string,
+    message: string,
+    attachments?: { file: File; uploadId: string }[],
+  ): Promise<{ success: boolean; message?: string }> => {
     if (!currentUser) return { success: false, message: 'Not logged in' };
     try {
       await ticketApi.addMessage(ticketId, message);
-      fetchTickets();
+
+      // Uploaded after the message so a rejected file cannot swallow the reply
+      // itself — the text is the part the other party is waiting on. Each
+      // carries the id minted when it was picked, so retrying a failed send
+      // reuses the server's idempotency key rather than storing a second copy.
+      const failed: string[] = [];
+      for (const { file, uploadId } of attachments ?? []) {
+        try {
+          await uploadApi.uploadSingle(file, uploadId, { ticketId });
+        } catch {
+          failed.push(file.name);
+        }
+      }
+
+      // Awaited, unlike before: the caller clears its composer on success, and
+      // clearing before the refetch lands makes a just-sent attachment vanish
+      // until something else triggers a reload.
+      await fetchTickets();
+
+      if (failed.length > 0) {
+        addNotification({
+          message: `Reply sent, but these files could not be attached: ${failed.join(', ')}.`,
+          type: 'warning',
+        });
+      }
+
       return { success: true };
     } catch (err: unknown) {
       const errorMessage = getErrorMessage(err);
