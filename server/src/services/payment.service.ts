@@ -420,7 +420,15 @@ async function processWebhookEvent(eventType: string, event: any, eventId: strin
       // student who closed the browser before the verify call ran: they are
       // charged either way, so the pass must not depend on the tab staying open.
       if (payment.notes?.subscription_type === 'student_pass' && payment.notes?.userId) {
-        await activateStudentPass(payment.notes.userId, rpPaymentId);
+        // The signature proves Razorpay sent this, not that the sum is right.
+        if (payment.amount !== env.STUDENT_PASS_PRICE_PAISE) {
+          console.error(
+            `⚠️ Student Pass paid ${payment.amount} but the price is ` +
+            `${env.STUDENT_PASS_PRICE_PAISE} (payment ${rpPaymentId}) — not activating.`
+          );
+        } else {
+          await activateStudentPass(payment.notes.userId, rpPaymentId);
+        }
         await prisma.webhookEvent.update({
           where: { eventId },
           data: { processed: true, processedAt: new Date() },
@@ -433,8 +441,27 @@ async function processWebhookEvent(eventType: string, event: any, eventId: strin
           where: { razorpayOrderId: rpOrderId },
         });
 
-        // Only process if order exists and is still pending payment
-        if (order && order.status === 'PENDING_PAYMENT') {
+        // What was actually paid must equal what this order costs, read from our
+        // own row rather than from the webhook.
+        //
+        // A valid HMAC proves the payload came from Razorpay; it says nothing
+        // about the sum being the one this order should cost. Today Razorpay
+        // enforces the amount attached to the order it issued, so a short
+        // payment cannot arrive — but that is Razorpay's invariant, not ours,
+        // and it stops holding the moment partial payments are enabled on the
+        // account. Fulfilling on someone else's guarantee is what leaves an
+        // order marked paid for less than it cost.
+        const amountMatches = order ? payment.amount === order.totalPrice : false;
+
+        if (order && !amountMatches) {
+          console.error(
+            `⚠️ Amount mismatch on order ${order.id}: paid ${payment.amount}, ` +
+            `expected ${order.totalPrice} (payment ${rpPaymentId}) — leaving unpaid for review.`
+          );
+        }
+
+        // Only process if order exists, is still pending payment, and the sum agrees
+        if (order && order.status === 'PENDING_PAYMENT' && amountMatches) {
           await tx.order.update({
             where: { id: order.id },
             data: {
