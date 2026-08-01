@@ -4,6 +4,7 @@ import { calculateOrderPrice } from './pricing.service';
 import { creditOrderEarning } from './settlement.service';
 import { enqueueShopEvent, publishQueued } from './realtime.service';
 import { claimCancellationRefund, settleClaimedRefund } from './refund.service';
+import { purgeOrderFiles, isTerminalForFiles } from './cleanup.service';
 import type { OrderStatus, PrintColor } from '@prisma/client';
 import crypto from 'crypto';
 
@@ -480,6 +481,20 @@ export async function updateOrderStatus(
   });
 
   await publishQueued(outboxIds);
+
+  // The print job is done, so the documents are no longer needed. Deleting them
+  // here rather than on a retention timer is deliberate: a student who wants the
+  // same thing printed again re-uploads it, and we stop holding scanned IDs and
+  // coursework for people who finished with us months ago.
+  //
+  // After the commit and outside any transaction — an R2 failure must not roll
+  // back an order that is already complete. The row stays flagged as having a
+  // file, so the retention sweep retries it.
+  if (isTerminalForFiles(newStatus)) {
+    purgeOrderFiles(orderId).catch((error) => {
+      console.error(`[order] file cleanup failed for ${orderId}, leaving it to the sweep:`, error);
+    });
+  }
 
   // Outside the transaction: this makes a network call to Razorpay, which must
   // never run while holding database locks. The cancellation is already

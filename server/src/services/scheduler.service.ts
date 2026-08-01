@@ -3,6 +3,7 @@ import { env } from '../config/env';
 import { runSettlementSweep } from './settlement.service';
 import { reconcilePayments } from './payment.service';
 import { dispatchOutbox, pruneOutbox } from './realtime.service';
+import { sweepUndeletedFiles } from './cleanup.service';
 
 /**
  * In-process background jobs.
@@ -24,6 +25,7 @@ const LOCK_KEYS = {
   settlement: 4820_001,
   reconciliation: 4820_002,
   outboxPrune: 4820_003,
+  fileRetention: 4820_004,
 } as const;
 
 /**
@@ -108,6 +110,21 @@ export function startScheduler(): void {
 
   schedule('outbox-prune', 6 * 60 * 60 * 1000, async () => {
     await withAdvisoryLock(LOCK_KEYS.outboxPrune, () => pruneOutbox());
+  });
+
+  // Backstop for the inline deletion that runs when an order finishes or a
+  // ticket is resolved. That call can fail when R2 is briefly unreachable, and
+  // orders completed before retention existed have nothing to trigger their
+  // removal at all. Without this the bucket keeps documents the rest of the
+  // system considers gone.
+  schedule('file-retention', env.FILE_RETENTION_SWEEP_INTERVAL_MS, async () => {
+    const result = await withAdvisoryLock(LOCK_KEYS.fileRetention, () => sweepUndeletedFiles());
+    if (result && result.filesRemoved > 0) {
+      console.log(
+        `[scheduler] file-retention removed ${result.filesRemoved} file(s) ` +
+        `from ${result.ordersPurged} order(s) and ${result.ticketsPurged} ticket(s)`
+      );
+    }
   });
 
   console.log(

@@ -1,6 +1,7 @@
 import { prisma } from '../utils/prisma';
 import { ApiError } from '../utils/ApiError';
 import type { TicketCategory, TicketStatus } from '@prisma/client';
+import { purgeTicketAttachments } from './cleanup.service';
 
 /**
  * Ticket Service — support ticket system.
@@ -253,6 +254,16 @@ export async function updateTicketStatus(
       },
     }),
   ]);
+
+  // The dispute is over, so the evidence attached to it can go. The
+  // conversation stays — that is the record of what was decided. Fired after
+  // the commit so a storage failure cannot undo the resolution; the sweep
+  // retries anything left behind.
+  if (newStatus === 'RESOLVED' || newStatus === 'CLOSED') {
+    purgeTicketAttachments(ticketId).catch((error) => {
+      console.error(`[ticket] attachment cleanup failed for ${ticketId}, leaving it to the sweep:`, error);
+    });
+  }
 
   return updatedTicket;
 }
