@@ -1426,12 +1426,37 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         relatedOrderId: ticketData.relatedOrderId,
       });
 
-      // Upload attachments if any
+      // Upload attachments if any.
+      //
+      // A failed attachment must not lose the ticket: it has already been
+      // created, and the description is the part support actually needs. The
+      // student is told which files did not make it so they can add them to the
+      // conversation rather than starting over.
+      const failedAttachments: string[] = [];
+
       if (ticketData.attachmentFiles && ticketData.attachmentFiles.length > 0) {
-        for (const file of ticketData.attachmentFiles.slice(0, 3)) {
-          if (file.size > 5 * 1024 * 1024) continue;
-          await uploadApi.uploadSingle(file, { ticketId: result.ticketId });
+        for (const [index, file] of ticketData.attachmentFiles.slice(0, 3).entries()) {
+          if (file.size > 5 * 1024 * 1024) {
+            failedAttachments.push(`${file.name} (over 5MB)`);
+            continue;
+          }
+          try {
+            // Derived from the ticket and position rather than random, so a
+            // retry of this same upload reuses the server's idempotency key
+            // instead of storing a duplicate.
+            await uploadApi.uploadSingle(file, `ticket_${result.ticketId}_${index}`, { ticketId: result.ticketId });
+          } catch {
+            failedAttachments.push(file.name);
+          }
         }
+      }
+
+      if (failedAttachments.length > 0) {
+        addNotification({
+          message: `Ticket created, but these files could not be attached: ${failedAttachments.join(', ')}. You can add them in the ticket.`,
+          type: 'warning',
+          targetUserId: currentUser.id,
+        });
       }
 
       addNotification({ message: `Ticket "${ticketData.subject}" submitted.`, type: 'success', targetUserId: currentUser.id });

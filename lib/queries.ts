@@ -212,10 +212,19 @@ export const paymentApi = {
 // ──────────────────────────────────────────────
 
 export const uploadApi = {
-  /** Upload a single file */
-  uploadSingle: (file: File, metadata?: Record<string, string>) => {
+  /**
+   * Upload a single file.
+   *
+   * `uploadId` is the server's idempotency key — it carries a unique constraint,
+   * so re-sending the same id returns the existing file rather than storing a
+   * second copy. The server rejects a request without one, which is why the
+   * caller must keep the same id across retries instead of letting this
+   * generate a fresh one each time.
+   */
+  uploadSingle: (file: File, uploadId: string, metadata?: Record<string, string>) => {
     const formData = new FormData();
     formData.append('file', file);
+    formData.append('uploadId', uploadId);
     if (metadata) {
       formData.append('metadata', JSON.stringify(metadata));
     }
