@@ -346,7 +346,12 @@ model OrderFile {
   fileStoragePath String?
   fileSizeBytes Int?
   isFileDeleted Boolean    @default(false)
+  /// Page count as claimed by the client when the order was created. A hint
+  /// for display only — never trust it for pricing.
   pageCount     Int        @default(1)
+  /// Page count the server counted from the uploaded bytes. Null until the
+  /// file is uploaded. This is the only figure pricing may use.
+  verifiedPageCount Int?
   color         PrintColor @default(BLACK_WHITE)
   copies        Int        @default(1)
   doubleSided   Boolean    @default(false)

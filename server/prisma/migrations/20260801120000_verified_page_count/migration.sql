@@ -1,0 +1,14 @@
+-- ─────────────────────────────────────────────────────────────
+-- Server-counted page count
+--
+-- `pageCount` arrives from the browser, which counts pages with pdf-lib and
+-- posts the result. Price is pageCount × rate × copies, so understating it
+-- understates the bill: a 200-page PDF declared as 1 page was charged as one
+-- page and printed as two hundred, with the loss falling on the shop.
+--
+-- The claimed value is kept for display, but pricing may only use a count the
+-- server took from the bytes it received. Nullable because existing rows were
+-- uploaded before this existed, and because the count is only knowable once
+-- the file has actually arrived.
+-- ─────────────────────────────────────────────────────────────
+ALTER TABLE "order_files" ADD COLUMN "verifiedPageCount" INTEGER;

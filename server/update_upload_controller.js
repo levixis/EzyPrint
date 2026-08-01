@@ -1,6 +1,7 @@
-import { Request, Response, NextFunction } from 'express';
+const fs = require('fs');
+
+const code = `import { Request, Response, NextFunction } from 'express';
 import * as storageService from '../services/storage.service';
-import { countPages } from '../services/pagecount.service';
 import { ApiError } from '../utils/ApiError';
 import path from 'path';
 
@@ -62,17 +63,9 @@ export async function uploadSingle(req: Request, res: Response, next: NextFuncti
 
     try {
       if (targetOrderFile) {
-        // Counted from the bytes we received, not from what the client claimed.
-        const { pages, counted } = await countPages(req.file.buffer, result.mimeType);
         await prisma.orderFile.update({
           where: { id: targetOrderFile.id },
-          data: {
-            fileStoragePath: result.storageKey,
-            fileSizeBytes: result.sizeBytes,
-            fileType: result.mimeType,
-            uploadId,
-            ...(counted ? { verifiedPageCount: pages } : {}),
-          }
+          data: { fileStoragePath: result.storageKey, fileSizeBytes: result.sizeBytes, fileType: result.mimeType, uploadId }
         });
       } else if (targetTicket) {
         await prisma.ticketAttachment.create({
@@ -128,9 +121,9 @@ export async function uploadMultiple(req: Request, res: Response, next: NextFunc
       
       for (const idx of metadata.fileIndexes) {
         const orderFile = targetOrder.files[idx as number];
-        if (!orderFile) throw ApiError.badRequest(`Order file index ${idx} out of bounds`);
+        if (!orderFile) throw ApiError.badRequest(\`Order file index \${idx} out of bounds\`);
         if (orderFile.fileStoragePath && req.body.replace !== 'true') {
-          throw ApiError.badRequest(`Order file at index ${idx} already linked. Pass replace=true.`);
+          throw ApiError.badRequest(\`Order file at index \${idx} already linked. Pass replace=true.\`);
         }
       }
     } else if (metadata.ticketId) {
@@ -143,37 +136,7 @@ export async function uploadMultiple(req: Request, res: Response, next: NextFunc
       throw ApiError.badRequest('Valid metadata containing orderId+fileIndexes or ticketId is required');
     }
 
-    
-    const existingOrderFiles = targetOrder ? await prisma.orderFile.findMany({ where: { uploadId: { in: uploadIds }, fileStoragePath: { not: null } } }) : [];
-    if (existingOrderFiles.length > 0) {
-      return res.status(200).json({ success: true, message: 'Files already uploaded', data: { files: existingOrderFiles.map(f => ({ storageKey: f.fileStoragePath, originalName: f.fileName, mimeType: f.fileType, sizeBytes: f.fileSizeBytes })) } });
-    }
-
-    const existingTicketAttachments = targetTicket ? await prisma.ticketAttachment.findMany({ where: { uploadId: { in: uploadIds } } }) : [];
-    if (existingTicketAttachments.length > 0) {
-      return res.status(200).json({ success: true, message: 'Files already uploaded', data: { files: existingTicketAttachments.map(f => ({ storageKey: f.storageKey, originalName: f.originalName, mimeType: f.mimeType, sizeBytes: f.sizeBytes })) } });
-    }
-
-    const uploadPromises = files.map((file) => storageService.uploadFile(file.buffer, file.originalname, file.mimetype, folder));
-    const settledResults = await Promise.allSettled(uploadPromises);
-    
-    const results: any[] = [];
-    const failed: any[] = [];
-    for (const r of settledResults) {
-      if (r.status === 'fulfilled') results.push(r.value);
-      else failed.push(r.reason);
-    }
-    
-    if (failed.length > 0) {
-      await Promise.allSettled(results.map(r => storageService.deleteFile(r.storageKey)));
-      throw ApiError.internal('One or more files failed to upload to storage');
-    }
-
-    // Counted from the received bytes before the transaction, so parsing does
-    // not hold a database transaction open.
-    const pageCounts = targetOrder
-      ? await Promise.all(files.map((file, i) => countPages(file.buffer, results[i].mimeType)))
-      : [];
+    const results = await Promise.all(files.map((file) => storageService.uploadFile(file.buffer, file.originalname, file.mimetype, folder)));
 
     try {
       await prisma.$transaction(async (tx) => {
@@ -182,16 +145,9 @@ export async function uploadMultiple(req: Request, res: Response, next: NextFunc
             const idx = metadata.fileIndexes[i];
             const orderFile = targetOrder.files[idx];
             const result = results[i];
-            const count = pageCounts[i];
             await tx.orderFile.update({
               where: { id: orderFile.id },
-              data: {
-                fileStoragePath: result.storageKey,
-                fileSizeBytes: result.sizeBytes,
-                fileType: result.mimeType,
-                uploadId: uploadIds[i],
-                ...(count?.counted ? { verifiedPageCount: count.pages } : {}),
-              }
+              data: { fileStoragePath: result.storageKey, fileSizeBytes: result.sizeBytes, fileType: result.mimeType, uploadId: uploadIds[i] }
             });
           }
         } else if (targetTicket) {
@@ -208,7 +164,7 @@ export async function uploadMultiple(req: Request, res: Response, next: NextFunc
       throw e;
     }
 
-    res.status(201).json({ success: true, message: `${results.length} file(s) uploaded successfully`, data: { files: results } });
+    res.status(201).json({ success: true, message: \`\${results.length} file(s) uploaded successfully\`, data: { files: results } });
   } catch (error) { next(error); }
 }
 
@@ -291,3 +247,5 @@ export async function cleanupOrphans(req: Request, res: Response, next: NextFunc
     res.json({ success: true, message: 'Cleanup job triggered' });
   } catch (error) { next(error); }
 }
+`;
+fs.writeFileSync('src/controllers/upload.controller.ts', code);

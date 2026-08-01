@@ -150,6 +150,8 @@ interface AppContextType {
   notificationsLimit: number;
   shopsLimit: number;
   loadMoreOrders: () => void;
+  /** Re-read orders from the server, e.g. after the server corrects a price. */
+  refreshOrders: () => Promise<void>;
   loadMorePayouts: () => void;
   loadMoreNotifications: () => void;
   loadMoreShops: () => void;
@@ -1672,7 +1674,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       }
     },
     ordersLimit, payoutsLimit, notificationsLimit, shopsLimit,
-    loadMoreOrders, loadMorePayouts, loadMoreNotifications, loadMoreShops
+    loadMoreOrders, loadMorePayouts, loadMoreNotifications, loadMoreShops,
+    refreshOrders: fetchOrders,
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }), [
     currentUser, isLoadingAuth, pendingProfileCreationType, pendingProfileEmail, pendingProfileName,

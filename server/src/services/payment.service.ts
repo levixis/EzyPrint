@@ -5,6 +5,7 @@ import { ApiError } from '../utils/ApiError';
 import { env } from '../config/env';
 import * as ledgerService from './ledger.service';
 import * as realtimeService from './realtime.service';
+import * as orderService from './order.service';
 
 /**
  * Payment Service — Razorpay integration with production-grade safety.
@@ -79,6 +80,41 @@ export async function createPaymentOrder(
   orderId: string,
   userId: string
 ): Promise<CreatePaymentResult> {
+  const preflight = await prisma.order.findUnique({ where: { id: orderId } });
+  if (!preflight) throw ApiError.notFound('Order not found');
+  if (preflight.userId !== userId) throw ApiError.forbidden('This is not your order');
+
+  // ── Price the order from pages the server counted, before charging ──
+  //
+  // `pageCount` reaches the order from the browser and is the multiplier in
+  // `pageCount × rate × copies`. Every other pricing input already comes from
+  // the database; this is the last one that did not, and understating it
+  // understated the bill — a 200-page PDF declared as one page was charged as
+  // one page and printed as two hundred.
+  //
+  // Done before the Razorpay order exists, which is the last moment the price
+  // can still move without a student having been charged. If it moves we stop
+  // rather than charging the corrected figure: the amount taken must be the
+  // amount that was on screen when they agreed to it.
+  if (!preflight.razorpayOrderId && preflight.status === 'PENDING_PAYMENT') {
+    const repriced = await orderService.repriceFromVerifiedPages(orderId);
+
+    if (repriced.unverifiable.length > 0) {
+      throw ApiError.badRequest(
+        `We could not read the page count for ${repriced.unverifiable.join(', ')}. ` +
+        `Please re-upload ${repriced.unverifiable.length > 1 ? 'these files' : 'this file'} before paying.`
+      );
+    }
+
+    if (repriced.changed) {
+      throw ApiError.conflict(
+        `The page count for this order was different from what was submitted, so the ` +
+        `total is now ₹${(repriced.totalPrice / 100).toFixed(2)} instead of ` +
+        `₹${(repriced.previousTotal / 100).toFixed(2)}. Please review and pay again.`
+      );
+    }
+  }
+
   const order = await prisma.order.findUnique({ where: { id: orderId } });
   if (!order) throw ApiError.notFound('Order not found');
   if (order.userId !== userId) throw ApiError.forbidden('This is not your order');

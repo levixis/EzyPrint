@@ -46,7 +46,7 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
   const [showOverlay, setShowOverlay] = useState(false);
   const [infoDialog, setInfoDialog] = useState<{ title: string; message: string } | null>(null);
   const [pendingCancelOrder, setPendingCancelOrder] = useState<{ order: DocumentOrder; requiresRefund: boolean } | null>(null);
-  const { updateOrderStatus, currentUser } = useAppContext();
+  const { updateOrderStatus, currentUser, refreshOrders } = useAppContext();
 
   // Clear optimistic statuses once Firestore catches up with the real status
   useEffect(() => {
@@ -214,8 +214,19 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
       setProcessingOrderId(null);
       setShowOverlay(false);
       setStatusMessage('');
+
+      // The server recounts the pages of the uploaded files before charging and
+      // refuses if the total moved, so nobody is charged an amount they were not
+      // shown. Surfacing the reason and refetching means the card re-renders
+      // with the corrected price for the student to accept or cancel.
+      const message = error instanceof Error ? error.message : String(error);
+      await refreshOrders();
+      setInfoDialog({
+        title: 'Order total updated',
+        message: message || 'We could not start the payment. Please try again.',
+      });
     }
-  }, [processingOrderId, currentUser, updateOrderStatus]);
+  }, [processingOrderId, currentUser, updateOrderStatus, refreshOrders]);
 
   const openWebRazorpay = (
     baseOptions: Record<string, unknown>,

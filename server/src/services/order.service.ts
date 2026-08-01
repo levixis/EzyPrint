@@ -528,3 +528,92 @@ function formatOrder(order: any) {
     },
   };
 }
+
+// ────────────────────────────────────────────────────────────
+// PRICE VERIFICATION
+// ────────────────────────────────────────────────────────────
+
+export interface RepriceResult {
+  /** True when the verified price differs from what the order currently says. */
+  changed: boolean;
+  previousTotal: number;
+  totalPrice: number;
+  /** Files whose format the server cannot count, so cannot price from. */
+  unverifiable: string[];
+}
+
+/**
+ * Recompute an order's price from page counts the server counted itself.
+ *
+ * `pageCount` on an order arrives from the browser and is the multiplier in
+ * `pageCount × rate × copies`, so understating it understates the bill. Every
+ * other pricing input already comes from the database — the shop's rates, the
+ * student's pass — and this closes the last one.
+ *
+ * Called immediately before a Razorpay order is created, which is the last
+ * point at which the price can still change without a student having been
+ * charged. When the figure moves, the order is updated and the caller stops:
+ * a student must never be charged more than the amount they were shown.
+ *
+ * The write is guarded on the total we just read and on PENDING_PAYMENT, so a
+ * concurrent payment attempt that already claimed the order cannot have the
+ * price changed underneath it.
+ */
+export async function repriceFromVerifiedPages(orderId: string): Promise<RepriceResult> {
+  const order = await prisma.order.findUnique({
+    where: { id: orderId },
+    include: { files: true, shop: { select: { bwPerPage: true, colorPerPage: true } } },
+  });
+  if (!order) throw ApiError.notFound('Order not found');
+
+  const unverifiable = order.files
+    .filter((f) => f.verifiedPageCount == null)
+    .map((f) => f.fileName);
+
+  // Nothing to compare against yet — the caller decides whether that is fatal.
+  if (unverifiable.length > 0) {
+    return {
+      changed: false,
+      previousTotal: order.totalPrice,
+      totalPrice: order.totalPrice,
+      unverifiable,
+    };
+  }
+
+  const student = await prisma.user.findUnique({
+    where: { id: order.userId },
+    select: { hasStudentPass: true, studentPassActivatedAt: true },
+  });
+
+  const { pageCost, baseFee, totalPrice } = calculateOrderPrice(
+    order.files.map((f) => ({
+      pageCount: f.verifiedPageCount as number,
+      color: f.color,
+      copies: f.copies,
+      doubleSided: f.doubleSided,
+    })),
+    { bwPerPage: order.shop.bwPerPage, colorPerPage: order.shop.colorPerPage },
+    isStudentPassActive(student?.hasStudentPass, student?.studentPassActivatedAt)
+  );
+
+  if (totalPrice === order.totalPrice) {
+    return { changed: false, previousTotal: order.totalPrice, totalPrice, unverifiable: [] };
+  }
+
+  await prisma.order.updateMany({
+    where: { id: orderId, status: 'PENDING_PAYMENT', totalPrice: order.totalPrice },
+    data: {
+      pageCost,
+      baseFee,
+      totalPrice,
+      pages: order.files[0]?.verifiedPageCount ?? order.pages,
+    },
+  });
+
+  return {
+    changed: true,
+    previousTotal: order.totalPrice,
+    totalPrice,
+    unverifiable: [],
+  };
+}
