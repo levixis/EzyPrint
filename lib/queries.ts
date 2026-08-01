@@ -370,6 +370,17 @@ export const refundApi = {
   create: (orderId: string, reason: string) =>
     api.post('/refunds', { orderId, reason }),
 
+  /**
+   * A shop refunding its own order outright, rather than responding to a claim
+   * the student raised. Settles immediately within the server's velocity
+   * limits; past them the server escalates to an admin and says so.
+   */
+  shopRefund: (orderId: string, reason: string) =>
+    api.post<{ settled: boolean; escalationReason?: string; amount: number }>(
+      '/refunds/shop-refund',
+      { orderId, reason }
+    ),
+
   respond: (requestId: string, approved: boolean, shopResponse?: string) =>
     api.post(`/refunds/${requestId}/respond`, { approved, shopResponse }),
 

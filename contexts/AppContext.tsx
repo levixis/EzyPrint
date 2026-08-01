@@ -1660,15 +1660,24 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const shopInitiateRefund = useCallback(async (_ticketId: string, orderId: string, reason: string): Promise<{ success: boolean; message?: string }> => {
     try {
       if (!currentUser || currentUser.type !== UserType.SHOP_OWNER) throw new Error('Unauthorized');
-      await orderApi.requestRefund(orderId, reason);
-      addNotification({ message: `Refund request initiated successfully.`, type: 'success' });
+      // Not `orderApi.requestRefund`, which posts to the student-only create
+      // endpoint: a shop owner was rejected by `authorize('STUDENT')` before
+      // any of this ran, so the button could never have worked.
+      const result = await refundApi.shopRefund(orderId, reason);
+      addNotification({
+        message: result.settled
+          ? 'Refund issued. The student will see it in 5-7 working days.'
+          : `${result.escalationReason ?? 'Over the shop refund limit'}. Sent to an admin to process.`,
+        type: result.settled ? 'success' : 'info',
+      });
+      fetchRefundRequests();
       return { success: true };
     } catch (err: unknown) {
       const message = getErrorMessage(err);
       addNotification({ message: `Failed to initiate refund: ${message}`, type: 'error' });
       return { success: false, message };
     }
-  }, [currentUser, addNotification]);
+  }, [currentUser, addNotification, fetchRefundRequests]);
 
   const escalateTicketToAdmin = useCallback(async (ticketId: string, _reason: string): Promise<{ success: boolean; message?: string }> => {
     try {

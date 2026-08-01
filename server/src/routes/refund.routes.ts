@@ -3,7 +3,8 @@ import { authenticate, authorize } from '../middleware/auth';
 import { prisma } from '../utils/prisma';
 import { ApiError } from '../utils/ApiError';
 import { validate } from '../middleware/validate';
-import { requestRefundSchema, respondRefundSchema, resolveRefundSchema } from '../validators/schemas';
+import { requestRefundSchema, respondRefundSchema, resolveRefundSchema, shopRefundSchema } from '../validators/schemas';
+import { sensitiveLimiter } from '../middleware/rateLimiter';
 import * as ledgerService from '../services/ledger.service';
 import * as realtimeService from '../services/realtime.service';
 import * as otpService from '../services/otp.service';
@@ -68,6 +69,36 @@ router.post('/', authenticate, authorize('STUDENT'), validate(requestRefundSchem
     });
     
     res.json({ success: true, data: request });
+  } catch (error) { next(error); }
+});
+
+/**
+ * Shop refunds one of its own orders, without waiting on an admin.
+ *
+ * A refund returns money to the payer's original card or UPI, so approving one
+ * cannot enrich whoever approved it — unlike a payout, which moves money to an
+ * account the shop controls and keeps its OTP gate. The service bounds this by
+ * velocity instead: a ceiling per refund and per day, over which the claim is
+ * left for an admin rather than refused.
+ */
+router.post('/shop-refund', authenticate, authorize('SHOP_OWNER'), sensitiveLimiter, validate(shopRefundSchema), async (req, res, next) => {
+  try {
+    if (!req.user) throw ApiError.unauthorized();
+    const { orderId, reason } = req.body;
+
+    const outcome = await refundService.shopRefundOrder({
+      orderId,
+      shopOwnerUserId: req.user.userId,
+      reason,
+    });
+
+    res.json({
+      success: true,
+      data: outcome,
+      message: outcome.settled
+        ? 'Refund issued. The student will see it in 5-7 working days.'
+        : `${outcome.escalationReason}. Sent to an admin to process.`,
+    });
   } catch (error) { next(error); }
 });
 

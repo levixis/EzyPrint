@@ -314,6 +314,14 @@ export const requestRefundSchema = z.object({
   }),
 });
 
+/** A shop refunding its own order. Same shape as a student's request. */
+export const shopRefundSchema = z.object({
+  body: z.object({
+    orderId: z.string().min(1, 'Order ID is required'),
+    reason: z.string().min(1, 'Reason is required').max(1000),
+  }),
+});
+
 export const respondRefundSchema = z.object({
   body: z.object({
     approved: z.boolean(),

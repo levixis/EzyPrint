@@ -161,6 +161,25 @@ export const env = {
   OUTBOX_DISPATCH_INTERVAL_MS: intFromEnv('OUTBOX_DISPATCH_INTERVAL_MS', 10 * 1000),
   /** How often to retry file deletions the inline purge missed. */
   FILE_RETENTION_SWEEP_INTERVAL_MS: intFromEnv('FILE_RETENTION_SWEEP_INTERVAL_MS', 60 * 60 * 1000),
+  // ── Shop-initiated refunds ──
+  /**
+   * How much a shop can refund on its own authority before an admin is needed.
+   *
+   * Requiring an admin for every refund is the wrong control. A refund returns
+   * money to the payer's original card or UPI, so a compromised shop account
+   * cannot extract anything with one — it can only hand that shop's own
+   * earnings back to people who genuinely paid. Payouts are the operation that
+   * moves money to an account the shop controls, and those keep their OTP gate.
+   *
+   * What actually bounds refund abuse is velocity, which is what payment
+   * processors use: a cap per refund, and caps on count and value per day.
+   * Beyond any of them the request escalates to an admin exactly as before, so
+   * the limits shape the blast radius rather than the permission.
+   */
+  SHOP_REFUND_MAX_PER_REFUND_PAISE: intFromEnv('SHOP_REFUND_MAX_PER_REFUND_PAISE', 50_000),
+  SHOP_REFUND_MAX_PER_DAY_COUNT: intFromEnv('SHOP_REFUND_MAX_PER_DAY_COUNT', 10),
+  SHOP_REFUND_MAX_PER_DAY_PAISE: intFromEnv('SHOP_REFUND_MAX_PER_DAY_PAISE', 200_000),
+
   /**
    * How often to delete referral codes that expired unredeemed.
    *
