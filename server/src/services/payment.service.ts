@@ -308,7 +308,16 @@ export async function verifyPayment(
 export async function handleWebhook(
   rawBody: string,
   signature: string,
-  webhookSecret: string
+  webhookSecret: string,
+  /**
+   * Value of the `X-Razorpay-Event-Id` header.
+   *
+   * Razorpay puts the event's unique id in this header, not in the JSON body —
+   * the body has `entity`, `event`, `payload`, `created_at` and no top-level
+   * `id`. Reading `event.id` therefore always found undefined, so every real
+   * delivery was rejected as malformed and no webhook was ever processed.
+   */
+  headerEventId?: string
 ) {
   // Step 1: Verify signature BEFORE any DB work
   const expectedSignature = crypto
@@ -321,11 +330,13 @@ export async function handleWebhook(
   }
 
   const event = JSON.parse(rawBody);
-  const eventId = event.id; // Razorpay's unique event ID
+  // The header is the real source; `event.id` is only a fallback for callers
+  // that synthesise a payload (the reconciliation job, tests).
+  const eventId = headerEventId || event.id;
   const eventType = event.event;
 
   if (!eventId) {
-    throw ApiError.badRequest('Webhook payload missing event.id');
+    throw ApiError.badRequest('Webhook missing event id (X-Razorpay-Event-Id header)');
   }
 
   // Step 2/3: Record the event, idempotently.

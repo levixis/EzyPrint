@@ -19,6 +19,7 @@ export { calculateBaseFee, calculateOrderPrice, calculateMultiFileOrderPrice, is
 
 // Push notification registration for native mobile
 import { registerPushNotifications, unregisterPushNotifications } from '../utils/pushNotifications';
+import { formatMoney } from '../utils/money';
 
 const isDevelopment = import.meta.env.DEV;
 const debugLog = (...args: unknown[]) => {
@@ -1113,7 +1114,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
     // 3. Success notification
     const fileLabel = fileInputs.length === 1 ? fileInputs[0].file.name : `${fileInputs.length} files`;
-    addNotification({ message: `Order #${orderId.slice(-6)} for ${fileLabel} (₹${verifiedPrice.totalPrice}) placed at ${targetShop.name}. Proceed to payment.`, orderId, type: 'info', targetUserId: userId });
+    addNotification({ message: `Order #${orderId.slice(-6)} for ${fileLabel} (${formatMoney(verifiedPrice.totalPrice)}) placed at ${targetShop.name}. Proceed to payment.`, orderId, type: 'info', targetUserId: userId });
 
     // Refresh orders
     fetchOrders();
@@ -1279,7 +1280,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     try {
       addNotification({ message: `Submitting payout request...`, type: 'info' });
       await payoutApi.request({ shopId, amount, shopOwnerNote });
-      addNotification({ message: `Payout request of ₹${amount.toFixed(2)} submitted. Admin will review and process it.`, type: 'success', targetShopId: shopId });
+      addNotification({ message: `Payout request of ${formatMoney(amount)} submitted. Admin will review and process it.`, type: 'success', targetShopId: shopId });
       fetchPayouts();
       return { success: true };
     } catch (err: unknown) {

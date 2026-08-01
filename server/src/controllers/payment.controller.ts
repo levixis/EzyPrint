@@ -90,7 +90,8 @@ export async function webhook(req: Request, res: Response, next: NextFunction) {
       : typeof req.body === 'string'
       ? req.body
       : JSON.stringify(req.body);
-    const result = await paymentService.handleWebhook(rawBody, signature, webhookSecret);
+    const headerEventId = req.headers['x-razorpay-event-id'] as string | undefined;
+    const result = await paymentService.handleWebhook(rawBody, signature, webhookSecret, headerEventId);
 
     // Always return 200 to Razorpay — even if processing failed.
     // Failed events are retried by the reconciliation job, not by
