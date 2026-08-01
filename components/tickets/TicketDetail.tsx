@@ -502,11 +502,11 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
             </Modal>
 
             {/* Status History */}
-            {liveTicket.statusHistory.length > 1 && (
+            {(liveTicket.statusHistory ?? []).length > 1 && (
               <div className="bg-white dark:bg-zinc-900 rounded-xl p-4 border border-gray-200 dark:border-zinc-700">
                 <h5 className="text-xs font-bold text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-3">Status History</h5>
                 <div className="space-y-2 pl-3 border-l-2 border-gray-200 dark:border-zinc-700">
-                  {liveTicket.statusHistory.map((change, i) => (
+                  {(liveTicket.statusHistory ?? []).map((change, i) => (
                     <div key={i} className="text-xs text-gray-500 dark:text-gray-400">
                       <span className="font-semibold text-gray-700 dark:text-gray-300">{change.changedByName}</span>
                       {' → '}

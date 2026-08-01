@@ -50,5 +50,6 @@ export default defineConfig({
     // Only our own tests. Without this vitest walks node_modules and tries to
     // run every package's fixtures.
     include: ['{lib,utils,components,contexts}/**/*.test.{ts,tsx}'],
+    setupFiles: ['./vitest.setup.ts'],
   }
 })

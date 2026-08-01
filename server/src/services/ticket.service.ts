@@ -149,6 +149,7 @@ export async function listTickets(
           orderBy: { createdAt: 'asc' },
         },
         attachments: true,
+        statusHistory: { orderBy: { createdAt: 'asc' } },
         _count: { select: { messages: true } },
       },
       skip: (page - 1) * limit,

@@ -53,6 +53,15 @@ export const ticketAttachmentSchema = z.object({
   sizeBytes: z.number().nullable().optional(),
 }).loose();
 
+export const ticketStatusChangeSchema = z.object({
+  id: z.string().optional(),
+  from: z.string().optional(),
+  to: z.string().optional(),
+  changedByName: z.string().catch('Unknown'),
+  note: z.string().nullable().optional(),
+  createdAt: isoDate.optional(),
+}).loose();
+
 export const supportTicketSchema = z.object({
   id: z.string(),
   subject: z.string().catch(''),
@@ -60,10 +69,14 @@ export const supportTicketSchema = z.object({
   category: z.string(),
   raisedBy: z.string(),
   raisedByName: z.string().catch('Unknown'),
-  // The three fields that took the app down: all collections, all defaulted.
+  // Every collection on a ticket is defaulted. Each one is a `.length` or
+  // `.map` somewhere in the UI, and each is absent from at least one of the
+  // endpoints that returns a ticket — which is how two separate screens were
+  // blanked by two different missing arrays.
   messages: list(ticketMessageSchema),
   attachments: list(ticketAttachmentSchema),
   attachmentPaths: list(z.string()),
+  statusHistory: list(ticketStatusChangeSchema),
   messageCount: z.number().optional(),
 }).loose();
 

@@ -314,7 +314,8 @@ export interface SupportTicket {
   messages?: TicketMessage[];
   /** Total messages, sent by the list endpoint so it need not ship the thread. */
   messageCount?: number;
-  statusHistory: TicketStatusChange[];
+  /** Optional for the same reason as `messages` — not every endpoint sends it. */
+  statusHistory?: TicketStatusChange[];
   createdAt: string;
   updatedAt: string;
   adminLastRepliedAt?: string;
