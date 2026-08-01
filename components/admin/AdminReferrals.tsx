@@ -1,14 +1,69 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { referralApi, ReferralCode } from '../../lib/queries';
 import { Button } from '../common/Button';
 import { Card } from '../common/Card';
 import { Spinner } from '../common/Spinner';
+import { formatDate } from '../../utils/datetime';
+
+export type ReferralStatus = 'active' | 'used' | 'expired';
+
+/**
+ * One definition of a code's status, so the badge and the filter cannot
+ * disagree about what the same row is.
+ *
+ * Read `usedAt` rather than `usedBy`: the latter is a foreign key that clears
+ * when the shop owner's account is deleted, and such a code is still spent.
+ */
+export const referralStatus = (code: ReferralCode, now: Date = new Date()): ReferralStatus => {
+  if (code.usedAt || code.usedBy) return 'used';
+  if (code.expiresAt && new Date(code.expiresAt) < now) return 'expired';
+  return 'active';
+};
+
+const STATUS_STYLES: Record<ReferralStatus, string> = {
+  active: 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400',
+  used: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400',
+  expired: 'bg-gray-100 text-gray-800 dark:bg-zinc-700 dark:text-gray-300',
+};
+
+const STATUS_LABELS: Record<ReferralStatus, string> = {
+  active: 'Active',
+  used: 'Used',
+  expired: 'Expired',
+};
+
+type Filter = ReferralStatus | 'all';
+
+const FILTERS: Array<{ key: Filter; label: string }> = [
+  { key: 'active', label: 'Active' },
+  { key: 'used', label: 'Used' },
+  { key: 'expired', label: 'Expired' },
+  { key: 'all', label: 'All' },
+];
+
+/**
+ * Who a spent code let in.
+ *
+ * The relation is optional because the account may since have been deleted —
+ * the code survives that on purpose, so the row is labelled rather than left
+ * looking unused.
+ */
+const usedByLabel = (code: ReferralCode): string => {
+  if (!code.usedAt && !code.usedBy) return '—';
+  const shop = code.user?.shop?.name;
+  const person = code.user?.name || code.user?.email;
+  if (shop && person) return `${shop} (${person})`;
+  return shop || person || 'Deleted account';
+};
 
 const AdminReferrals: React.FC = () => {
   const [codes, setCodes] = useState<ReferralCode[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isGenerating, setIsGenerating] = useState(false);
   const [error, setError] = useState('');
+  // Active by default: a used code is a record to look up, not something an
+  // admin needs in front of them while handing out new ones.
+  const [filter, setFilter] = useState<Filter>('active');
 
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
@@ -57,6 +112,24 @@ const AdminReferrals: React.FC = () => {
     }
   };
 
+  const counts = useMemo(() => {
+    const now = new Date();
+    return codes.reduce(
+      (acc, code) => {
+        acc[referralStatus(code, now)]++;
+        acc.all++;
+        return acc;
+      },
+      { active: 0, used: 0, expired: 0, all: 0 } as Record<Filter, number>
+    );
+  }, [codes]);
+
+  const visible = useMemo(() => {
+    if (filter === 'all') return codes;
+    const now = new Date();
+    return codes.filter((code) => referralStatus(code, now) === filter);
+  }, [codes, filter]);
+
   return (
     <div className="space-y-6">
       <div className="flex justify-between items-center">
@@ -71,12 +144,40 @@ const AdminReferrals: React.FC = () => {
 
       {error && <p className="text-sm text-red-500">{error}</p>}
 
+      {!isLoading && codes.length > 0 && (
+        <div role="tablist" aria-label="Filter referral codes" className="flex flex-wrap gap-2">
+          {FILTERS.map(({ key, label }) => (
+            <button
+              key={key}
+              role="tab"
+              aria-selected={filter === key}
+              onClick={() => setFilter(key)}
+              className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+                filter === key
+                  ? 'bg-brand-primary text-white'
+                  : 'bg-gray-100 text-gray-600 hover:bg-gray-200 dark:bg-zinc-800 dark:text-gray-300 dark:hover:bg-zinc-700'
+              }`}
+            >
+              {label}
+              <span className={`ml-1.5 ${filter === key ? 'text-white/70' : 'text-gray-400 dark:text-gray-500'}`}>
+                {counts[key]}
+              </span>
+            </button>
+          ))}
+        </div>
+      )}
+
       <Card>
         {isLoading ? (
           <div className="flex justify-center p-8"><Spinner /></div>
         ) : codes.length === 0 ? (
           <div className="text-center p-8 text-gray-500 dark:text-gray-400">
             No referral codes found. Generate one to get started.
+          </div>
+        ) : visible.length === 0 ? (
+          <div className="text-center p-8 text-gray-500 dark:text-gray-400">
+            {/* Unreachable for 'all' — if any code exists, 'all' shows it. */}
+            No {filter === 'all' ? '' : `${STATUS_LABELS[filter].toLowerCase()} `}codes.
           </div>
         ) : (
           <div className="overflow-x-auto">
@@ -85,13 +186,15 @@ const AdminReferrals: React.FC = () => {
                 <tr>
                   <th className="px-6 py-3 rounded-tl-lg">Code</th>
                   <th className="px-6 py-3">Status</th>
+                  <th className="px-6 py-3">Used By</th>
+                  <th className="px-6 py-3">Issued By</th>
                   <th className="px-6 py-3">Created At</th>
                   <th className="px-6 py-3">Expires At</th>
                   <th className="px-6 py-3 rounded-tr-lg">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-100 dark:divide-zinc-800">
-                {codes.map((code) => (
+                {visible.map((code) => (
                   <tr key={code.id} className="hover:bg-gray-50 dark:hover:bg-zinc-800/50">
                     <td className="px-6 py-4 font-mono font-medium text-gray-900 dark:text-white flex items-center space-x-2">
                       <span>{code.code}</span>
@@ -112,28 +215,28 @@ const AdminReferrals: React.FC = () => {
                       </button>
                     </td>
                     <td className="px-6 py-4">
-                      {code.usedBy ? (
-                        <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400">
-                          Used
-                        </span>
-                      ) : (code.expiresAt && new Date(code.expiresAt) < new Date()) ? (
-                        <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-800 dark:bg-zinc-700 dark:text-gray-300">
-                          Expired
-                        </span>
-                      ) : (
-                        <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400">
-                          Active
-                        </span>
-                      )}
+                      <span
+                        className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
+                          STATUS_STYLES[referralStatus(code)]
+                        }`}
+                      >
+                        {STATUS_LABELS[referralStatus(code)]}
+                      </span>
                     </td>
                     <td className="px-6 py-4 text-gray-500 dark:text-gray-400">
-                      {new Date(code.createdAt).toLocaleDateString()}
+                      {usedByLabel(code)}
                     </td>
                     <td className="px-6 py-4 text-gray-500 dark:text-gray-400">
-                      {code.expiresAt ? new Date(code.expiresAt).toLocaleDateString() : 'Never'}
+                      {code.creator?.name || code.creator?.email || 'Deleted account'}
+                    </td>
+                    <td className="px-6 py-4 text-gray-500 dark:text-gray-400">
+                      {formatDate(code.createdAt)}
+                    </td>
+                    <td className="px-6 py-4 text-gray-500 dark:text-gray-400">
+                      {code.expiresAt ? formatDate(code.expiresAt) : 'Never'}
                     </td>
                     <td className="px-6 py-4">
-                      {!code.usedBy && (
+                      {referralStatus(code) !== 'used' && (
                         <button
                           onClick={() => handleDelete(code.id)}
                           className="text-red-600 hover:text-red-900 dark:text-red-400 dark:hover:text-red-300 text-xs font-medium"

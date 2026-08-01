@@ -1,5 +1,7 @@
 import { Router } from 'express';
 import { authenticate, authorize } from '../middleware/auth';
+import { validate } from '../middleware/validate';
+import { createReferralSchema } from '../validators/schemas';
 import * as referralController from '../controllers/referral.controller';
 
 const router = Router();
@@ -8,7 +10,7 @@ const router = Router();
 router.use(authenticate, authorize('ADMIN'));
 
 router.get('/', referralController.listReferralCodes);
-router.post('/', referralController.createReferralCode);
+router.post('/', validate(createReferralSchema), referralController.createReferralCode);
 router.delete('/:codeId', referralController.deleteReferralCode);
 
 export default router;

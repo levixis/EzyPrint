@@ -451,13 +451,18 @@ export const adminApi = {
 export interface ReferralCode {
   id: string;
   code: string;
-  createdBy: string;
-  usedBy?: string;
-  usedAt?: string;
-  expiresAt?: string;
+  /**
+   * `createdBy` and `usedBy` are foreign keys that go null when the account is
+   * deleted — the code outlives it, so `creator` and `user` are both absent for
+   * a row whose account is gone. `usedAt` is what says the code was spent.
+   */
+  createdBy?: string | null;
+  usedBy?: string | null;
+  usedAt?: string | null;
+  expiresAt?: string | null;
   createdAt: string;
-  creator?: { name: string | null; email: string | null };
-  user?: { name: string | null; email: string | null; shop?: { name: string } | null };
+  creator?: { name: string | null; email: string | null } | null;
+  user?: { name: string | null; email: string | null; shop?: { name: string } | null } | null;
 }
 
 export const referralApi = {

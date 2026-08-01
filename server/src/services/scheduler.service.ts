@@ -4,6 +4,7 @@ import { runSettlementSweep } from './settlement.service';
 import { reconcilePayments } from './payment.service';
 import { dispatchOutbox, pruneOutbox } from './realtime.service';
 import { sweepUndeletedFiles } from './cleanup.service';
+import { sweepExpiredReferralCodes } from './referral.service';
 
 /**
  * In-process background jobs.
@@ -26,6 +27,7 @@ const LOCK_KEYS = {
   reconciliation: 4820_002,
   outboxPrune: 4820_003,
   fileRetention: 4820_004,
+  referralSweep: 4820_005,
 } as const;
 
 /**
@@ -124,6 +126,16 @@ export function startScheduler(): void {
         `[scheduler] file-retention removed ${result.filesRemoved} file(s) ` +
         `from ${result.ordersPurged} order(s) and ${result.ticketsPurged} ticket(s)`
       );
+    }
+  });
+
+  // Referral codes that expired without ever being redeemed are dead weight:
+  // nobody can use them and they attach to no shop. Redeemed codes are never
+  // touched — those are the record of how a shop owner got in.
+  schedule('referral-sweep', env.REFERRAL_SWEEP_INTERVAL_MS, async () => {
+    const deleted = await withAdvisoryLock(LOCK_KEYS.referralSweep, () => sweepExpiredReferralCodes());
+    if (deleted) {
+      console.log(`[scheduler] referral-sweep removed ${deleted} expired unused code(s)`);
     }
   });
 

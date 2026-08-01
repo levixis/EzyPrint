@@ -106,10 +106,15 @@ export async function registerWithEmail(
 
     // If registering as shop owner, create the shop profile too
     if (type === 'SHOP_OWNER' && shopName && shopAddress && referralCode) {
+      // Guarded on `usedAt`, not `usedBy`: `usedBy` is now a foreign key that
+      // goes null if the owner's account is deleted, which would make a spent
+      // code redeemable a second time. `usedAt` records the same event in the
+      // same statement and is never cleared. The claim itself is unchanged —
+      // one updateMany, and count === 0 means somebody else took it first.
       const result = await tx.referralCode.updateMany({
         where: {
           code: referralCode,
-          usedBy: null,
+          usedAt: null,
           OR: [
             { expiresAt: null },
             { expiresAt: { gt: new Date() } }
@@ -420,10 +425,12 @@ export async function loginWithGoogle(
       });
 
       if (userType === 'SHOP_OWNER' && shopName && shopAddress && referralCode) {
+        // Same claim as the password path — see the note there on why this
+        // guards `usedAt` rather than `usedBy`.
         const result = await tx.referralCode.updateMany({
           where: {
             code: referralCode,
-            usedBy: null,
+            usedAt: null,
             OR: [
               { expiresAt: null },
               { expiresAt: { gt: new Date() } }

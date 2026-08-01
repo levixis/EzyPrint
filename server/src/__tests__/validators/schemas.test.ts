@@ -335,3 +335,40 @@ describe('Payment Verify Schema', () => {
     }).success).toBe(false);
   });
 });
+
+/**
+ * `daysValid` reached `setDate()` straight from the request body. A string
+ * produced an Invalid Date and a 500; a negative number minted a code that had
+ * already expired when it was handed out.
+ */
+describe('createReferralSchema', () => {
+  const { createReferralSchema } = require('../../validators/schemas');
+  const parse = (daysValid: unknown) =>
+    createReferralSchema.safeParse({ body: { daysValid }, query: {}, params: {} });
+
+  test('accepts a sane validity window', () => {
+    expect(parse(7).success).toBe(true);
+  });
+
+  test('omitting it is fine — the service defaults to 7 days', () => {
+    expect(createReferralSchema.safeParse({ body: {}, query: {}, params: {} }).success).toBe(true);
+  });
+
+  test('rejects a non-number before it can become an Invalid Date', () => {
+    expect(parse('abc').success).toBe(false);
+  });
+
+  test('rejects zero and negative windows', () => {
+    expect(parse(0).success).toBe(false);
+    expect(parse(-100).success).toBe(false);
+  });
+
+  test('rejects a fractional day', () => {
+    expect(parse(1.5).success).toBe(false);
+  });
+
+  test('caps validity at a year, so no code is a standing key', () => {
+    expect(parse(365).success).toBe(true);
+    expect(parse(4000).success).toBe(false);
+  });
+});

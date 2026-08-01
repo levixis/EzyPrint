@@ -119,6 +119,14 @@ export const updateProfileSchema = z.object({
   ),
 });
 
+export const pushTokenSchema = z.object({
+  body: z.object({
+    // FCM registration tokens are long opaque strings; bound them so a junk
+    // payload cannot be stored on the user record.
+    token: z.string().min(20).max(4096).trim(),
+  }),
+});
+
 export const listUsersSchema = z.object({
   query: z.object({
     ...pagination,
@@ -241,6 +249,29 @@ export const ticketStatusSchema = z.object({
   body: z.object({
     status: z.enum(['OPEN', 'IN_REVIEW', 'RESOLVED', 'CLOSED']),
     note: z.string().max(1000).optional(),
+  }),
+});
+
+// ────────────────────────────────────────────────────────────
+// REFERRAL SCHEMAS
+// ────────────────────────────────────────────────────────────
+
+/**
+ * `daysValid` reached `setDate()` unchecked, so a non-number produced an
+ * Invalid Date and a 500, and a negative one minted a code that was expired
+ * the moment it was issued.
+ *
+ * Capped at a year: a referral code is a short-lived invitation, and one that
+ * never practically expires is a standing key to shop-owner registration.
+ */
+export const createReferralSchema = z.object({
+  body: z.object({
+    daysValid: z
+      .number()
+      .int('Validity must be a whole number of days')
+      .min(1, 'A code must be valid for at least a day')
+      .max(365, 'A code cannot be valid for more than a year')
+      .optional(),
   }),
 });
 
