@@ -10,6 +10,13 @@
  */
 
 import * as api from './api';
+import {
+  parseListResponse,
+  supportTicketSchema,
+  orderSchema,
+  payoutSchema,
+  refundRequestSchema,
+} from './schemas';
 import type {
   User, ShopProfile, DocumentOrder, NotificationMessage,
   SupportTicket, ShopPayout, ShopPricing, PayoutMethod,
@@ -150,7 +157,8 @@ export const orderApi = {
     if (params?.limit) query.set('limit', String(params.limit));
     if (params?.offset) query.set('offset', String(params.offset));
     const qs = query.toString();
-    return api.get<{ orders: DocumentOrder[] }>(`/orders${qs ? `?${qs}` : ''}`).then(r => r.orders);
+    return api.get<{ orders: unknown }>(`/orders${qs ? `?${qs}` : ''}`)
+      .then(r => parseListResponse(orderSchema, r.orders, 'orderApi.list') as unknown as DocumentOrder[]);
   },
 
   listAll: (params?: { limit?: number; offset?: number }) => {
@@ -285,7 +293,8 @@ export const ticketApi = {
     relatedOrderId?: string;
   }) => api.post<{ ticket: { id: string } }>('/tickets', data).then(r => ({ ticketId: r.ticket.id })),
 
-  list: () => api.get<{ tickets: SupportTicket[] }>('/tickets').then(r => r.tickets),
+  list: () => api.get<{ tickets: unknown }>('/tickets')
+    .then(r => parseListResponse(supportTicketSchema, r.tickets, 'ticketApi.list') as unknown as SupportTicket[]),
 
   getById: (ticketId: string) =>
     api.get<{ ticket: SupportTicket }>(`/tickets/${ticketId}`).then(r => r.ticket),
@@ -348,7 +357,8 @@ export const payoutApi = {
     if (params?.shopId) query.set('shopId', params.shopId);
     if (params?.limit) query.set('limit', String(params.limit));
     const qs = query.toString();
-    return api.get<ShopPayout[]>(`/payouts${qs ? `?${qs}` : ''}`);
+    return api.get<unknown>(`/payouts${qs ? `?${qs}` : ''}`)
+      .then(d => parseListResponse(payoutSchema, d, 'payoutApi.list') as unknown as ShopPayout[]);
   },
 };
 
@@ -374,7 +384,8 @@ export const refundApi = {
       `/refunds/history/${orderId}`
     ),
 
-  list: () => api.get<RefundRequest[]>('/refunds'),
+  list: () => api.get<unknown>('/refunds')
+    .then(d => parseListResponse(refundRequestSchema, d, 'refundApi.list') as unknown as RefundRequest[]),
 };
 
 // ──────────────────────────────────────────────
