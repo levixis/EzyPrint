@@ -8,6 +8,37 @@ import type { TicketCategory, TicketStatus } from '@prisma/client';
  * raisedByName, description etc. as direct fields).
  */
 
+/** The shop a given owner runs, or null if they have none yet. */
+async function shopIdForOwner(ownerUserId: string): Promise<string | null> {
+  const shop = await prisma.shop.findUnique({
+    where: { ownerUserId },
+    select: { id: true },
+  });
+  return shop?.id ?? null;
+}
+
+/**
+ * Whether a user may read and reply to a ticket.
+ *
+ * Three parties can be involved: the raiser, an admin, and — when the ticket
+ * is filed against a shop — that shop's owner. The upload controller's
+ * `verifyStorageAccess` already granted shop owners access to ticket
+ * attachments, so excluding them here left them able to fetch a complaint's
+ * files while being unable to read the complaint.
+ */
+async function canAccessTicket(
+  ticket: { raisedBy: string; shopId: string | null },
+  userId: string,
+  userType: string
+): Promise<boolean> {
+  if (userType === 'ADMIN') return true;
+  if (ticket.raisedBy === userId) return true;
+  if (userType === 'SHOP_OWNER' && ticket.shopId) {
+    return ticket.shopId === (await shopIdForOwner(userId));
+  }
+  return false;
+}
+
 export async function createTicket(
   raisedByUserId: string,
   data: {
@@ -85,7 +116,21 @@ export async function listTickets(
   const limit = Math.min(50, Math.max(1, options?.limit || 20));
 
   const where: Record<string, unknown> = {};
-  if (userType !== 'ADMIN') where.raisedBy = userId;
+
+  if (userType === 'SHOP_OWNER') {
+    // A shop owner is a party to two different sets of tickets: the ones they
+    // raised themselves, and the customer complaints filed against their shop.
+    // Scoping to `raisedBy` alone hid the second set entirely, which is the
+    // set the shop dashboard's "Customer tickets about your orders" panel
+    // exists to show.
+    const shopId = await shopIdForOwner(userId);
+    where.OR = shopId
+      ? [{ raisedBy: userId }, { shopId }]
+      : [{ raisedBy: userId }];
+  } else if (userType !== 'ADMIN') {
+    where.raisedBy = userId;
+  }
+
   if (options?.status) where.status = options.status;
 
   const [tickets, total] = await Promise.all([
@@ -123,7 +168,7 @@ export async function getTicketById(ticketId: string, userId: string, userType: 
   });
 
   if (!ticket) throw ApiError.notFound('Ticket not found');
-  if (userType !== 'ADMIN' && ticket.raisedBy !== userId) {
+  if (!(await canAccessTicket(ticket, userId, userType))) {
     throw ApiError.forbidden('Not your ticket');
   }
 
@@ -138,7 +183,7 @@ export async function addMessage(
 ) {
   const ticket = await prisma.ticket.findUnique({ where: { id: ticketId } });
   if (!ticket) throw ApiError.notFound('Ticket not found');
-  if (userType !== 'ADMIN' && ticket.raisedBy !== senderUserId) {
+  if (!(await canAccessTicket(ticket, senderUserId, userType))) {
     throw ApiError.forbidden('Not your ticket');
   }
   if (ticket.status === 'CLOSED') throw ApiError.badRequest('Ticket is closed');
@@ -149,16 +194,30 @@ export async function addMessage(
     select: { name: true, type: true },
   });
 
-  return prisma.ticketMessage.create({
-    data: {
-      ticketId,
-      senderId: senderUserId,
-      senderName: user?.name || 'Unknown',
-      senderType: user?.type || 'STUDENT',
-      message,
-    },
-    include: { sender: { select: { id: true, name: true, type: true } } },
-  });
+  // Which party replied last. The schema has carried these three columns since
+  // the beginning and nothing ever wrote them, so response-time reporting had
+  // no data to work from.
+  const repliedAt = new Date();
+  const replyStamp =
+    userType === 'ADMIN' ? { adminLastRepliedAt: repliedAt }
+    : ticket.raisedBy === senderUserId ? { raiserLastRepliedAt: repliedAt }
+    : { shopLastRepliedAt: repliedAt };
+
+  const [created] = await prisma.$transaction([
+    prisma.ticketMessage.create({
+      data: {
+        ticketId,
+        senderId: senderUserId,
+        senderName: user?.name || 'Unknown',
+        senderType: user?.type || 'STUDENT',
+        message,
+      },
+      include: { sender: { select: { id: true, name: true, type: true } } },
+    }),
+    prisma.ticket.update({ where: { id: ticketId }, data: replyStamp }),
+  ]);
+
+  return created;
 }
 
 export async function updateTicketStatus(

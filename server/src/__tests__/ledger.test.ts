@@ -119,3 +119,62 @@ describe('Settlement timing', () => {
     expect(computeAvailableAt(now).getTime()).toBeGreaterThan(now.getTime());
   });
 });
+
+/**
+ * A failed Razorpay refund must leave the shop exactly where it started.
+ *
+ * The reversal is a compensating ADJUSTMENT credit rather than a deletion, so
+ * these check the pair sums to zero across all three balances — including the
+ * case where the deduction pushed the shop into debt, which is where an
+ * asymmetric reversal would quietly invent or destroy money.
+ */
+describe('Refund reversal (refund.failed)', () => {
+  /** Apply a movement to a shop, as the ledger's updateMany would. */
+  const apply = (
+    shop: { pendingBalance: number; ledgerBalance: number; debtAmount: number },
+    move: { clearing: number; available: number; debt: number }
+  ) => ({
+    pendingBalance: shop.pendingBalance + move.clearing,
+    ledgerBalance: shop.ledgerBalance + move.available,
+    debtAmount: shop.debtAmount + move.debt,
+  });
+
+  test('reversing a fully-covered refund restores the original balances', () => {
+    const before = { pendingBalance: 10000, ledgerBalance: 5000, debtAmount: 0 };
+
+    const afterRefund = apply(before, computeBalanceMovement('REFUND_DEDUCTION', 4000, before));
+    expect(afterRefund).toEqual({ pendingBalance: 6000, ledgerBalance: 5000, debtAmount: 0 });
+
+    const afterReversal = apply(afterRefund, computeBalanceMovement('ADJUSTMENT', 4000, afterRefund));
+    expect(afterReversal).toEqual(before);
+  });
+
+  test('reversing a refund that created debt clears the debt exactly', () => {
+    const before = { pendingBalance: 1000, ledgerBalance: 0, debtAmount: 0 };
+
+    // 5000 owed against 1000 held: 1000 drains, 4000 becomes debt.
+    const move = computeBalanceMovement('REFUND_DEDUCTION', 5000, before);
+    expect(move).toEqual({ clearing: -1000, available: 0, debt: 4000 });
+
+    const afterRefund = apply(before, move);
+    expect(afterRefund).toEqual({ pendingBalance: 0, ledgerBalance: 0, debtAmount: 4000 });
+
+    // The credit must pay the debt down first, then restore the balance.
+    const afterReversal = apply(afterRefund, computeBalanceMovement('ADJUSTMENT', 5000, afterRefund));
+    expect(afterReversal).toEqual(before);
+  });
+
+  test('reversal is exact when the refund drained both buckets into debt', () => {
+    const before = { pendingBalance: 2000, ledgerBalance: 3000, debtAmount: 0 };
+
+    const afterRefund = apply(before, computeBalanceMovement('REFUND_DEDUCTION', 8000, before));
+    expect(afterRefund).toEqual({ pendingBalance: 0, ledgerBalance: 0, debtAmount: 3000 });
+
+    const afterReversal = apply(afterRefund, computeBalanceMovement('ADJUSTMENT', 8000, afterRefund));
+    expect(afterReversal.debtAmount).toBe(0);
+    // Total value is conserved, though it re-lands in clearing rather than
+    // split across the two buckets it came from.
+    const total = (s: typeof before) => s.pendingBalance + s.ledgerBalance - s.debtAmount;
+    expect(total(afterReversal)).toBe(total(before));
+  });
+});

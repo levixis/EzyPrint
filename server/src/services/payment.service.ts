@@ -3,6 +3,8 @@ import crypto from 'crypto';
 import { prisma } from '../utils/prisma';
 import { ApiError } from '../utils/ApiError';
 import { env } from '../config/env';
+import * as ledgerService from './ledger.service';
+import * as realtimeService from './realtime.service';
 
 /**
  * Payment Service — Razorpay integration with production-grade safety.
@@ -374,6 +376,27 @@ export async function handleWebhook(
  * and the reconciliation job. Uses a Prisma transaction to atomically
  * update the order AND mark the webhook as processed.
  */
+/**
+ * Locate the RefundRequest a Razorpay refund webhook refers to.
+ *
+ * Prefers the refund id we stored when initiating. Falls back to the payment
+ * id, which is what makes the `refund.processed` recovery path work at all —
+ * in that case the local transaction never committed, so no refund id was
+ * ever persisted to match on.
+ */
+async function findRefundRequest(tx: any, refund: { id: string; payment_id?: string }) {
+  const byRefundId = await tx.refundRequest.findFirst({
+    where: { razorpayRefundId: refund.id },
+  });
+  if (byRefundId) return byRefundId;
+
+  if (!refund.payment_id) return null;
+
+  return tx.refundRequest.findFirst({
+    where: { order: { razorpayPaymentId: refund.payment_id } },
+  });
+}
+
 async function processWebhookEvent(eventType: string, event: any, eventId: string) {
   switch (eventType) {
     case 'payment.captured': {
@@ -431,6 +454,131 @@ async function processWebhookEvent(eventType: string, event: any, eventId: strin
           data: { processed: true, processedAt: new Date() },
         });
       });
+      break;
+    }
+
+    /**
+     * Razorpay confirms the refund actually settled.
+     *
+     * Normally a no-op: the admin resolve flow already recorded everything
+     * synchronously. It matters when that flow crashed *after* Razorpay
+     * accepted the refund but *before* the local transaction committed —
+     * leaving the request stuck in PROCESSING_REFUND with the student refunded
+     * and the shop's ledger untouched. Completing it here closes that window.
+     *
+     * The ledger write reuses `refund:<id>` as its eventId, so if the original
+     * transaction did commit this finds the existing entry and moves no money.
+     */
+    case 'refund.processed': {
+      const refund = event.payload.refund.entity;
+      const outboxIds: string[] = [];
+
+      await prisma.$transaction(async (tx) => {
+        const request = await findRefundRequest(tx, refund);
+
+        if (request && request.status === 'PROCESSING_REFUND') {
+          await tx.refundRequest.updateMany({
+            where: { id: request.id, status: 'PROCESSING_REFUND' },
+            data: {
+              status: 'RESOLVED_REFUNDED',
+              razorpayRefundId: refund.id,
+              adminResolvedAt: new Date(),
+              refundAmount: refund.amount,
+            },
+          });
+
+          await tx.order.updateMany({
+            where: { id: request.orderId },
+            data: { status: 'REFUNDED' },
+          });
+
+          await ledgerService.createLedgerEntry({
+            shopId: request.shopId,
+            type: 'REFUND_DEDUCTION',
+            amount: refund.amount,
+            description: `Refund for order ${request.orderId}`,
+            counterparty: 'STUDENT',
+            createdBy: 'SYSTEM',
+            orderId: request.orderId,
+            eventId: `refund:${request.id}`,
+            allowDebt: true,
+          }, tx, outboxIds);
+        }
+
+        await tx.webhookEvent.update({
+          where: { eventId },
+          data: { processed: true, processedAt: new Date() },
+        });
+      });
+
+      await realtimeService.publishQueued(outboxIds);
+      break;
+    }
+
+    /**
+     * Razorpay failed the refund after accepting it.
+     *
+     * The student's money never moved, so the shop must not stay charged. A
+     * compensating ADJUSTMENT credit reverses the deduction rather than
+     * deleting the original entry — the ledger stays append-only, so both the
+     * attempt and its reversal remain auditable.
+     *
+     * ADJUSTMENT is the exact mirror of REFUND_DEDUCTION: same CLEARING
+     * bucket, opposite direction. Credits pay down `debtAmount` first, which
+     * is what should happen when the refund had pushed the shop negative.
+     *
+     * The reversal's own `refund:<id>:reversal` eventId makes redelivery of
+     * this webhook harmless.
+     */
+    case 'refund.failed': {
+      const refund = event.payload.refund.entity;
+      const outboxIds: string[] = [];
+
+      await prisma.$transaction(async (tx) => {
+        const request = await findRefundRequest(tx, refund);
+
+        // Guarding on the statuses that imply a deduction was actually made
+        // stops a redelivered failure from crediting the shop twice.
+        if (request && ['RESOLVED_REFUNDED', 'PROCESSING_REFUND'].includes(request.status)) {
+          const deducted = await tx.ledgerEntry.findUnique({
+            where: { eventId: `refund:${request.id}` },
+          });
+
+          if (deducted) {
+            await ledgerService.createLedgerEntry({
+              shopId: request.shopId,
+              type: 'ADJUSTMENT',
+              amount: deducted.amount,
+              description: `Reversal — Razorpay refund failed for order ${request.orderId}`,
+              counterparty: 'PLATFORM',
+              createdBy: 'SYSTEM',
+              orderId: request.orderId,
+              eventId: `refund:${request.id}:reversal`,
+            }, tx, outboxIds);
+          }
+
+          await tx.refundRequest.updateMany({
+            where: { id: request.id, status: request.status },
+            data: { status: 'REFUND_FAILED' },
+          });
+
+          // The order was never actually refunded. Returning it to COMPLETED
+          // is the least-wrong terminal state: the print was delivered, and
+          // only the refund attempt failed. An admin retries from the
+          // REFUND_FAILED request.
+          await tx.order.updateMany({
+            where: { id: request.orderId, status: 'REFUNDED' },
+            data: { status: 'COMPLETED' },
+          });
+        }
+
+        await tx.webhookEvent.update({
+          where: { eventId },
+          data: { processed: true, processedAt: new Date() },
+        });
+      });
+
+      await realtimeService.publishQueued(outboxIds);
       break;
     }
 

@@ -127,6 +127,9 @@ enum RefundRequestStatus {
   RESOLVED_REFUNDED
   REFUND_SETTLED_OFFLINE
   RESOLVED_DENIED
+  /// Razorpay accepted the refund, then failed it asynchronously. The shop's
+  /// ledger deduction has been reversed and an admin must retry.
+  REFUND_FAILED
 }
 
 enum ReactivationRequestStatus {

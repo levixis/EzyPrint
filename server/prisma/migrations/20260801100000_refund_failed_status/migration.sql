@@ -1,0 +1,12 @@
+-- ─────────────────────────────────────────────────────────────
+-- Terminal state for an asynchronously failed refund
+--
+-- Razorpay accepts a refund synchronously and can still fail it minutes later
+-- via `refund.failed`. Until now that outcome had nowhere to live: the request
+-- sat in RESOLVED_REFUNDED, the order read REFUNDED, and the shop's balance
+-- stayed deducted — so the platform showed a student refunded who never got
+-- their money, and a shop charged for it.
+--
+-- IF NOT EXISTS so re-running against a partially migrated database is safe.
+-- ─────────────────────────────────────────────────────────────
+ALTER TYPE "RefundRequestStatus" ADD VALUE IF NOT EXISTS 'REFUND_FAILED';
