@@ -720,7 +720,15 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         });
         const loginResponse = result?.result;
         if (!loginResponse || loginResponse.responseType !== 'online' || !loginResponse.idToken) {
-          throw new Error('Native Google Sign-In returned no result.');
+          // Name what came back. "No result" is true of a dismissed sheet, a
+          // credential that was not a Google account, and an offline-mode
+          // response that carries a server auth code instead of an id token —
+          // three different problems that need three different fixes.
+          throw new Error(
+            `Native Google Sign-In returned no id token (responseType: ${
+              loginResponse?.responseType ?? 'none'
+            }).`
+          );
         }
         idToken = loginResponse.idToken;
       } else {
@@ -806,8 +814,23 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       const lower = errorMessage.toLowerCase();
-      const isCancellation = lower.includes('cancel') || lower.includes('popup-closed');
-      if (!isCancellation) {
+
+      // Always on the console, whatever we decide to show. On a device this is
+      // the only way to read the native exception, via chrome://inspect.
+      console.error('[auth] Google Sign-In failed:', err);
+
+      // Only the web popup is ever dismissed silently, and only because we
+      // author those rejection messages ourselves a few lines above.
+      //
+      // Native errors are always surfaced. Android's Credential Manager
+      // reports configuration problems, missing credentials and internal
+      // failures through exceptions whose text also contains "cancelled", so
+      // matching on that word swallowed every real fault and dropped the user
+      // back on the sign-in screen with nothing to act on.
+      const isDismissedPopup =
+        !isNative && (lower.includes('cancel') || lower.includes('popup-closed'));
+
+      if (!isDismissedPopup) {
         addNotification({ message: `Google Sign-In failed: ${errorMessage}`, type: 'error' });
       }
       setCurrentUserInternal(null);
