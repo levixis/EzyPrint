@@ -53,3 +53,12 @@ android/key.properties
 # Firebase CI tokens
 .firebaserc-ci
 functions/lib/
+
+# ── Local scratch ──
+# One-off debugging scripts, backups and captured diffs. They carry no history
+# worth keeping and one of them is a 300KB dump of an old working tree.
+*.bak
+*.patch
+check-console.cjs
+update_ticket_detail.cjs
+test-render.tsx
