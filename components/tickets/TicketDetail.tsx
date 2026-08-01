@@ -6,6 +6,7 @@ import { useAppContext } from '../../contexts/AppContext';
 import { uploadApi, adminApi } from '../../lib/queries';
 import { RefundOtpModal } from '../common/RefundOtpModal';
 import { RefundHistoryTracker } from '../common/RefundHistoryTracker';
+import { formatDateTime, formatDate } from '../../utils/datetime';
 
 interface TicketDetailProps {
   ticket: SupportTicket;
@@ -199,7 +200,7 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
                   {liveTicket.category.replace(/_/g, ' ')}
                 </span>
                 <span className="text-xs text-gray-400 dark:text-gray-500">
-                  • {new Date(liveTicket.createdAt).toLocaleDateString()}
+                  • {formatDate(liveTicket.createdAt)}
                 </span>
               </div>
             </div>
@@ -513,7 +514,7 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
                       <span className="font-semibold">{change.to.replace(/_/g, ' ')}</span>
                       {change.note && <span className="italic"> — "{change.note}"</span>}
                       <p className="text-gray-400 dark:text-gray-500 text-[10px] mt-0.5">
-                        {new Date(change.timestamp).toLocaleString()}
+                        {formatDateTime(change.createdAt ?? change.timestamp)}
                       </p>
                     </div>
                   ))}
@@ -569,7 +570,7 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
                       </p>
                       <p className="text-sm whitespace-pre-wrap leading-relaxed">{msg.message}</p>
                       <p className={`text-[10px] mt-1.5 ${isCurrentUser ? 'text-white/60' : 'text-gray-400 dark:text-gray-500'}`}>
-                        {new Date(msg.timestamp).toLocaleString()}
+                        {formatDateTime(msg.createdAt ?? msg.timestamp)}
                       </p>
                     </div>
                   </div>

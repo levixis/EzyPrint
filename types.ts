@@ -267,7 +267,9 @@ export interface TicketMessage {
   senderName: string;
   senderType: UserType; // STUDENT, SHOP_OWNER, or ADMIN
   message: string;
-  timestamp: string;
+  /** The server sends `createdAt`; `timestamp` is the older client-side name. */
+  createdAt?: string;
+  timestamp?: string;
 }
 
 export interface TicketStatusChange {
@@ -275,7 +277,9 @@ export interface TicketStatusChange {
   to: TicketStatus;
   changedBy: string;
   changedByName: string;
-  timestamp: string;
+  /** The server sends `createdAt`; `timestamp` is the older client-side name. */
+  createdAt?: string;
+  timestamp?: string;
   note?: string;
 }
 

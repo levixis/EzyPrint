@@ -1,6 +1,7 @@
 import React, { Suspense, lazy, useState } from 'react';
 import { SupportTicket, TicketStatus, TicketCategory, UserType } from '../../types';
 import { Card } from '../common/Card';
+import { formatDate } from '../../utils/datetime';
 
 const TicketDetail = lazy(() => import('./TicketDetail'));
 
@@ -69,7 +70,7 @@ const TicketList: React.FC<TicketListProps> = ({ tickets, title, showRaiserInfo 
                 <div className="flex items-center gap-3 text-xs text-gray-500 dark:text-gray-400">
                   <span>{categoryLabels[ticket.category]}</span>
                   {ticket.relatedOrderId && <span>• Order #{ticket.relatedOrderId.slice(-6)}</span>}
-                  <span>• {new Date(ticket.createdAt).toLocaleDateString()}</span>
+                  <span>• {formatDate(ticket.createdAt)}</span>
                   {showRaiserInfo && (
                     <>
                       <span>• {ticket.raisedByName}</span>
