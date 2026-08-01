@@ -1,6 +1,6 @@
 import { prisma } from '../utils/prisma';
 import * as storageService from './storage.service';
-import type { OrderStatus } from '@prisma/client';
+import type { OrderStatus, RefundRequestStatus } from '@prisma/client';
 
 /**
  * File retention — documents are deleted the moment they are no longer needed.
@@ -32,10 +32,55 @@ export function isTerminalForFiles(status: OrderStatus): boolean {
 }
 
 /**
+ * Refund states that are still being argued about.
+ *
+ * REFUND_FAILED counts as open: Razorpay rejected the transfer and an admin has
+ * to retry, so the claim is live even though the request looks finished.
+ */
+export const UNSETTLED_REFUND_STATUSES: RefundRequestStatus[] = [
+  'PENDING_SHOP',
+  'APPROVED_BY_SHOP',
+  'REJECTED_BY_SHOP',
+  'ESCALATED_TO_ADMIN',
+  'AUTO_ESCALATED',
+  'PROCESSING_REFUND',
+  'REFUND_FAILED',
+];
+
+/**
+ * Whether someone is still disputing this order.
+ *
+ * Deleting on completion is right for the ordinary case — the shop printed it
+ * and nobody needs the bytes again. It is wrong when a student is claiming the
+ * wrong thing was printed, because the file is the only evidence of what was
+ * actually sent, and destroying it turns the dispute into one person's word
+ * against another's.
+ *
+ * So the delete is deferred rather than scheduled: files go immediately unless
+ * a claim is open, and the sweep removes them once it closes. No blanket
+ * retention window, and no order keeps its documents for longer than the
+ * argument about it lasts.
+ */
+async function hasOpenDispute(orderId: string): Promise<boolean> {
+  const [refund, ticket] = await Promise.all([
+    prisma.refundRequest.findFirst({
+      where: { orderId, status: { in: UNSETTLED_REFUND_STATUSES } },
+      select: { id: true },
+    }),
+    prisma.ticket.findFirst({
+      where: { relatedOrderId: orderId, status: { in: ['OPEN', 'IN_REVIEW'] } },
+      select: { id: true },
+    }),
+  ]);
+
+  return Boolean(refund || ticket);
+}
+
+/**
  * Remove the stored documents for one order.
  *
  * The order row, its prices and its ledger entries all survive — those are
- * needed for reconciliation and disputes. Only the document bytes go.
+ * needed for reconciliation. Only the document bytes go.
  *
  * Each file is flagged individually right after its object is removed, so a
  * crash midway leaves every already-deleted file marked and the remainder for
@@ -43,6 +88,8 @@ export function isTerminalForFiles(status: OrderStatus): boolean {
  * a retry is harmless.
  */
 export async function purgeOrderFiles(orderId: string): Promise<number> {
+  if (await hasOpenDispute(orderId)) return 0;
+
   const files = await prisma.orderFile.findMany({
     where: { orderId, isFileDeleted: false, fileStoragePath: { not: null } },
     select: { id: true, fileStoragePath: true },
@@ -125,10 +172,28 @@ export interface SweepResult {
  * of the system considers gone.
  */
 export async function sweepUndeletedFiles(batchSize = 50): Promise<SweepResult> {
+  // Orders under an open complaint are excluded in the query rather than
+  // skipped after selection. Skipping would let a handful of long-running
+  // disputes occupy every slot in the batch and stall cleanup for everything
+  // else. `relatedOrderId` is a plain column rather than a relation, so open
+  // tickets are gathered first and excluded by id.
+  const disputedByTicket = await prisma.ticket.findMany({
+    where: { status: { in: ['OPEN', 'IN_REVIEW'] }, relatedOrderId: { not: null } },
+    select: { relatedOrderId: true },
+  });
+  const disputedOrderIds = disputedByTicket
+    .map((t) => t.relatedOrderId)
+    .filter((id): id is string => Boolean(id));
+
   const orders = await prisma.order.findMany({
     where: {
       status: { in: TERMINAL_ORDER_STATUSES },
       files: { some: { isFileDeleted: false, fileStoragePath: { not: null } } },
+      id: { notIn: disputedOrderIds },
+      OR: [
+        { refundRequest: null },
+        { refundRequest: { status: { notIn: UNSETTLED_REFUND_STATUSES } } },
+      ],
     },
     select: { id: true },
     take: batchSize,
