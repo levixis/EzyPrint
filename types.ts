@@ -306,7 +306,14 @@ export interface SupportTicket {
   status: TicketStatus;
   attachmentPaths?: string[]; // Legacy
   attachments?: TicketAttachment[];
-  messages: TicketMessage[];
+  /**
+   * Optional because the list endpoint does not send the full thread — only
+   * the detail endpoint does. Typing it as required let TicketList read
+   * `.length` on undefined and blank the whole page.
+   */
+  messages?: TicketMessage[];
+  /** Total messages, sent by the list endpoint so it need not ship the thread. */
+  messageCount?: number;
   statusHistory: TicketStatusChange[];
   createdAt: string;
   updatedAt: string;

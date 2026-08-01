@@ -139,6 +139,16 @@ export async function listTickets(
       where,
       include: {
         raiser: { select: { id: true, name: true, email: true } },
+        // The thread ships with the list because nothing ever fetches a ticket
+        // by id — TicketDetail renders straight from this data. Sending only a
+        // count meant the conversation was always empty and reading
+        // `messages.length` threw, blanking the page. Support ticket volume is
+        // low enough that this is cheaper than a second round trip per ticket.
+        messages: {
+          include: { sender: { select: { id: true, name: true, type: true } } },
+          orderBy: { createdAt: 'asc' },
+        },
+        attachments: true,
         _count: { select: { messages: true } },
       },
       skip: (page - 1) * limit,
@@ -149,7 +159,12 @@ export async function listTickets(
   ]);
 
   return {
-    tickets,
+    // `_count` is Prisma's shape, not the client's. Flattening it here keeps
+    // the wire format the frontend's SupportTicket type actually describes.
+    tickets: tickets.map(({ _count, ...ticket }) => ({
+      ...ticket,
+      messageCount: _count.messages,
+    })),
     pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
   };
 }

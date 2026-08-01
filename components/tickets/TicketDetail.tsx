@@ -117,7 +117,7 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [liveTicket.messages.length]);
+  }, [(liveTicket.messages ?? []).length]);
 
   // Resolve attachment storage paths to download URLs
   useEffect(() => {
@@ -534,14 +534,14 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
                   Conversation
                 </h5>
                 <span className="text-xs text-gray-400 dark:text-gray-500">
-                  ({liveTicket.messages.length} message{liveTicket.messages.length !== 1 ? 's' : ''})
+                  ({(liveTicket.messages ?? []).length} message{(liveTicket.messages ?? []).length !== 1 ? 's' : ''})
                 </span>
               </div>
             </div>
 
             {/* Messages Thread — takes remaining space */}
             <div className="flex-1 lg:overflow-y-auto py-4 space-y-3 min-h-[200px] lg:min-h-0 lg:max-h-full">
-              {liveTicket.messages.length === 0 && (
+              {(liveTicket.messages ?? []).length === 0 && (
                 <div className="flex flex-col items-center justify-center py-12 text-center">
                   <div className="w-14 h-14 rounded-full bg-gray-100 dark:bg-zinc-800 flex items-center justify-center mb-3">
                     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-7 h-7 text-gray-300 dark:text-gray-600">
@@ -552,7 +552,7 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
                   <p className="text-xs text-gray-400 dark:text-gray-600 mt-1">Start the conversation below</p>
                 </div>
               )}
-              {liveTicket.messages.map(msg => {
+              {(liveTicket.messages ?? []).map(msg => {
                 const isCurrentUser = msg.senderId === currentUser?.id;
                 const isAdminMsg = msg.senderType === UserType.ADMIN;
                 return (

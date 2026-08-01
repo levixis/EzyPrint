@@ -40,7 +40,17 @@ const TicketList: React.FC<TicketListProps> = ({ tickets, title, showRaiserInfo 
   return (
     <>
       <div className="space-y-3">
-        {tickets.map(ticket => (
+        {tickets.map(ticket => {
+          // The list endpoint sends a message *count* and at most the newest
+          // message, not the full thread — only the detail endpoint returns
+          // that. Reading `ticket.messages.length` here threw on the first
+          // ticket a user ever had and took the whole page down with it, since
+          // an uncaught render error unmounts the tree.
+          const messages = ticket.messages ?? [];
+          const lastMessage = messages.length > 0 ? messages[messages.length - 1] : null;
+          const messageCount = ticket.messageCount ?? messages.length;
+
+          return (
           <button
             key={ticket.id}
             onClick={() => setSelectedTicket(ticket)}
@@ -69,21 +79,22 @@ const TicketList: React.FC<TicketListProps> = ({ tickets, title, showRaiserInfo 
                     </>
                   )}
                 </div>
-                {ticket.messages.length > 0 && (
+                {lastMessage && (
                   <p className="text-xs text-gray-400 dark:text-gray-500 mt-1 truncate">
-                    Last: {ticket.messages[ticket.messages.length - 1].senderName} — "{ticket.messages[ticket.messages.length - 1].message.slice(0, 80)}..."
+                    Last: {lastMessage.senderName} — "{lastMessage.message.slice(0, 80)}..."
                   </p>
                 )}
               </div>
               <div className="flex flex-col items-end gap-1 flex-shrink-0">
-                <span className="text-xs text-gray-400 dark:text-gray-500">{ticket.messages.length} msgs</span>
+                <span className="text-xs text-gray-400 dark:text-gray-500">{messageCount} msgs</span>
                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4 text-gray-400 group-hover:text-brand-primary transition-colors">
                   <path fillRule="evenodd" d="M3 10a.75.75 0 0 1 .75-.75h10.638L10.23 5.29a.75.75 0 1 1 1.04-1.08l5.5 5.25a.75.75 0 0 1 0 1.08l-5.5 5.25a.75.75 0 1 1-1.04-1.08l4.158-3.96H3.75A.75.75 0 0 1 3 10Z" clipRule="evenodd" />
                 </svg>
               </div>
             </div>
           </button>
-        ))}
+          );
+        })}
       </div>
 
       {selectedTicket && (
