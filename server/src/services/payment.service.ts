@@ -850,7 +850,18 @@ export async function createStudentPassOrder(userId: string) {
  */
 export async function activateStudentPass(userId: string, paymentId: string): Promise<boolean> {
   const activated = await prisma.user.updateMany({
-    where: { id: userId, studentPassPaymentId: { not: paymentId } },
+    where: {
+      id: userId,
+      // The null branch is required, not defensive. `{ not: x }` compiles to a
+      // SQL inequality, and NULL <> 'x' is NULL rather than true, so a column
+      // that has never been set matches nothing — which is every first-time
+      // buyer. Without this the guard silently excluded exactly the case it was
+      // meant to allow, and a paid pass never activated.
+      OR: [
+        { studentPassPaymentId: null },
+        { studentPassPaymentId: { not: paymentId } },
+      ],
+    },
     data: {
       hasStudentPass: true,
       studentPassActivatedAt: new Date(),
