@@ -124,6 +124,20 @@ export const env = {
   PUSHER_SECRET: requireSecret('PUSHER_SECRET', process.env.PUSHER_SECRET, ''),
   PUSHER_CLUSTER: process.env.PUSHER_CLUSTER || 'ap2',
 
+  // ── Push notifications (FCM) ──
+  /**
+   * Firebase service account JSON, for FCM only — no Firestore, no Auth.
+   *
+   * Left optional deliberately. FCM is the one part of the notification path
+   * that cannot work without external credentials, and a missing key must
+   * degrade to "in-app notification only" rather than take the server down:
+   * the Notification row is the durable record, the push is a courtesy copy.
+   * Accepts either raw JSON or base64. Prefer base64: the private key is
+   * multi-line, and pasting it into a dashboard env field (Render, Railway)
+   * either mangles the newlines or silently truncates at the first one.
+   */
+  FIREBASE_SERVICE_ACCOUNT: process.env.FIREBASE_SERVICE_ACCOUNT || '',
+
   // ── Student Pass ──
   /** Price of a 30-day Student Pass, in paise. */
   STUDENT_PASS_PRICE_PAISE: intFromEnv('STUDENT_PASS_PRICE_PAISE', 4900),
@@ -147,6 +161,14 @@ export const env = {
   OUTBOX_DISPATCH_INTERVAL_MS: intFromEnv('OUTBOX_DISPATCH_INTERVAL_MS', 10 * 1000),
   /** How often to retry file deletions the inline purge missed. */
   FILE_RETENTION_SWEEP_INTERVAL_MS: intFromEnv('FILE_RETENTION_SWEEP_INTERVAL_MS', 60 * 60 * 1000),
+  /**
+   * How often to delete referral codes that expired unredeemed.
+   *
+   * Daily, not hourly: codes are issued with a 7-day expiry and then sit for a
+   * 30-day grace period, so nothing about this is time-sensitive to the hour,
+   * and every extra tick is Neon compute spent finding nothing.
+   */
+  REFERRAL_SWEEP_INTERVAL_MS: intFromEnv('REFERRAL_SWEEP_INTERVAL_MS', 24 * 60 * 60 * 1000),
 
   // ── Helpers ──
   isDev,

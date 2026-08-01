@@ -5,6 +5,7 @@ import { creditOrderEarning } from './settlement.service';
 import { enqueueShopEvent, publishQueued } from './realtime.service';
 import { claimCancellationRefund, settleClaimedRefund } from './refund.service';
 import { purgeOrderFiles, isTerminalForFiles } from './cleanup.service';
+import * as notify from './notify.service';
 import type { OrderStatus, PrintColor } from '@prisma/client';
 import crypto from 'crypto';
 
@@ -481,6 +482,28 @@ export async function updateOrderStatus(
   });
 
   await publishQueued(outboxIds);
+
+  // After commit, and never awaited into the caller's latency: the transition
+  // is what the student is waiting on, not the announcement of it.
+  notify.notifyOrderStatus({
+    orderId,
+    shopId: order.shopId,
+    studentUserId: order.userId,
+    ownerUserId: order.shop.ownerUserId,
+    newStatus,
+    actorUserId: requesterId,
+  });
+
+  // Completion is also the moment the shop gets paid, and money warrants a
+  // notification of its own rather than being folded into the status update.
+  if (newStatus === 'COMPLETED') {
+    notify.notifyEarningCredited({
+      shopId: order.shopId,
+      ownerUserId: order.shop.ownerUserId,
+      orderId,
+      amountPaise: order.pageCost,
+    });
+  }
 
   // The print job is done, so the documents are no longer needed. Deleting them
   // here rather than on a retention timer is deliberate: a student who wants the

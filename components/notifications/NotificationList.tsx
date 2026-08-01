@@ -32,7 +32,10 @@ const NotificationList: React.FC<NotificationListProps> = ({ notifications, onMa
       {notifications.length === 0 ? (
         <p className="text-brand-lightText text-center py-10 px-4 text-sm">You're all caught up! No new notifications.</p>
       ) : (
-        <div className="max-h-96 overflow-y-auto divide-y divide-brand-muted/20">
+        <div className="max-h-96 overflow-y-auto overscroll-contain divide-y divide-brand-muted/20">
+          {/* overscroll-contain above stops a flick at the end of this list
+              from chaining into the page behind it and scrolling the dashboard
+              out from under the open panel. */}
           {notifications.map(notification => (
             <NotificationItem 
               key={notification.id} 

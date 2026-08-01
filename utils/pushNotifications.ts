@@ -6,22 +6,59 @@ import { Capacitor } from '@capacitor/core';
 import * as api from '../lib/api';
 
 let pushRegistered = false;
+
+/**
+ * The token this device most recently registered.
+ *
+ * Held so logout can withdraw the specific token rather than guessing. Without
+ * it, signing out and handing the phone to someone else left the previous
+ * account's orders and support replies buzzing on a device it no longer owned.
+ */
+let currentToken: string | null = null;
+
+/** Listener handles, so logout can detach them individually. */
+type PluginListener = { remove: () => Promise<void> };
+let listeners: PluginListener[] = [];
+
+/**
+ * Incremented on every logout.
+ *
+ * Registration is asynchronous, so a user who signs out while it is still in
+ * flight would otherwise have listeners attach after the teardown that was
+ * meant to remove them. Signing back in would then attach a second set, and
+ * every foreground notification would appear twice. Attaching code compares
+ * this against the value it started with and discards its work if it lost.
+ */
+let registrationGeneration = 0;
+
 const debugLog = (...args: unknown[]) => {
   void args;
 };
+
+/** What to do when a notification is tapped — set by the app on registration. */
+export interface PushHandlers {
+  /** A push arrived while the app was open and in the foreground. */
+  onReceived?: (title: string, body: string, data?: Record<string, string>) => void;
+  /** The user tapped a notification. Payload carries orderId or ticketId. */
+  onTapped?: (data: Record<string, string>) => void;
+}
 
 /**
  * Register for push notifications on native platforms.
  * - Requests permission
  * - Gets the FCM device token
- * - Saves it to the user's Firestore document
+ * - Saves it to the user's record via the API
  * - Sets up listeners for incoming notifications
  *
- * Call this AFTER the user is authenticated.
+ * Call this AFTER the user is authenticated — the token is stored against
+ * whoever is signed in at the time.
+ *
+ * Android notification channels are NOT created here. They are created
+ * natively in MainActivity.java, which runs first; Android ignores a channel
+ * create for an ID that already exists, so anything configured from here would
+ * be silently discarded.
  */
-export async function registerPushNotifications(
-  onNotificationReceived?: (title: string, body: string, data?: Record<string, string>) => void
-): Promise<void> {
+export async function registerPushNotifications(handlers?: PushHandlers): Promise<void> {
   // Only run on native platforms (Android/iOS)
   if (!Capacitor.isNativePlatform()) {
     debugLog('[Push] Skipping push registration on web platform');
@@ -33,104 +70,123 @@ export async function registerPushNotifications(
     debugLog('[Push] Already registered');
     return;
   }
+  pushRegistered = true;
+  const generation = registrationGeneration;
+  /** True once a logout has overtaken this registration. */
+  const superseded = () => generation !== registrationGeneration;
 
   try {
     const { PushNotifications } = await import('@capacitor/push-notifications');
 
-    // Request permission
-    const permResult = await PushNotifications.requestPermissions();
+    // checkPermissions first: requestPermissions re-prompts only while the user
+    // has not made a decision, and on Android 13+ a second request after a
+    // denial returns 'denied' without showing anything.
+    let permission = await PushNotifications.checkPermissions();
+    if (permission.receive === 'prompt' || permission.receive === 'prompt-with-rationale') {
+      permission = await PushNotifications.requestPermissions();
+    }
 
-    if (permResult.receive === 'granted') {
-      debugLog('[Push] Permission granted');
+    if (permission.receive !== 'granted') {
+      debugLog('[Push] Permission not granted:', permission.receive);
+      pushRegistered = false;
+      return;
+    }
 
-      // Create a high-importance notification channel for Android
-      // This ensures notifications show as heads-up popups with sound
-      try {
-        await PushNotifications.createChannel({
-          id: 'ezyprint_orders',
-          name: 'Order Updates',
-          description: 'Notifications for order status changes, payments, and updates',
-          importance: 5, // IMPORTANCE_HIGH — shows as heads-up notification
-          visibility: 1, // PUBLIC
-          sound: 'default',
-          vibration: true,
-          lights: true,
-        });
-        debugLog('[Push] Android notification channel created');
-      } catch (channelErr) {
-        void channelErr;
-      }
+    // The permission prompt can sit on screen indefinitely. If the user signed
+    // out while it was up, everything below belongs to an account that is gone.
+    if (superseded()) return;
 
-      // Register with the native push service (FCM on Android, APNs on iOS)
-      await PushNotifications.register();
+    // Listeners must be attached before register(), or the registration event
+    // can fire before anything is listening for it and the token is lost.
+    const attached: PluginListener[] = [];
 
-      // Listen for successful registration — this gives us the FCM token
-      PushNotifications.addListener('registration', async (token) => {
-        debugLog('[Push] Device token:', token.value);
-
-        // Save token to user record via REST API
+    attached.push(
+      await PushNotifications.addListener('registration', async (token) => {
+        if (superseded()) return;
+        currentToken = token.value;
         try {
           await api.post('/users/me/push-token', { token: token.value });
           debugLog('[Push] Token saved via API');
         } catch (err) {
-          void err;
+          // Leave pushRegistered true — the listener is live and a token
+          // refresh will retry the save.
+          debugLog('[Push] Failed to save token:', err);
         }
-      });
+      })
+    );
 
-      // Listen for registration errors
-      PushNotifications.addListener('registrationError', (error) => {
-        void error;
-      });
+    attached.push(
+      await PushNotifications.addListener('registrationError', (error) => {
+        debugLog('[Push] Registration error:', error);
+      })
+    );
 
-      // Listen for incoming notifications while app is in foreground
-      PushNotifications.addListener('pushNotificationReceived', (notification) => {
-        debugLog('[Push] Notification received in foreground:', notification);
-        if (onNotificationReceived) {
-          onNotificationReceived(
-            notification.title || 'EzyPrint',
-            notification.body || '',
-            notification.data as Record<string, string> | undefined
-          );
-        }
-      });
+    attached.push(
+      await PushNotifications.addListener('pushNotificationReceived', (notification) => {
+        if (superseded()) return;
+        handlers?.onReceived?.(
+          notification.title || 'EzyPrint',
+          notification.body || '',
+          notification.data as Record<string, string> | undefined
+        );
+      })
+    );
 
-      // Listen for notification tap (user tapped the notification)
-      PushNotifications.addListener('pushNotificationActionPerformed', (action) => {
-        debugLog('[Push] Notification tapped:', action);
-        // The app is already open at this point — you could navigate to a specific order
-        const orderId = action.notification.data?.orderId;
-        if (orderId) {
-          debugLog('[Push] Should navigate to order:', orderId);
-          // Navigation can be handled by passing a callback or using a global event
-        }
-      });
+    attached.push(
+      await PushNotifications.addListener('pushNotificationActionPerformed', (action) => {
+        if (superseded()) return;
+        const data = (action.notification.data ?? {}) as Record<string, string>;
+        handlers?.onTapped?.(data);
+      })
+    );
 
-      pushRegistered = true;
-      debugLog('[Push] Registration complete');
-    } else {
-      debugLog('[Push] Permission denied by user');
+    // A logout that landed while the handles were being awaited has already run
+    // its teardown against an empty list, so these have to be undone here or
+    // they outlive the session and double every notification after re-login.
+    if (superseded()) {
+      await Promise.all(attached.map((listener) => listener.remove()));
+      return;
     }
+    listeners.push(...attached);
+
+    // Register with the native push service (FCM on Android, APNs on iOS)
+    await PushNotifications.register();
+    debugLog('[Push] Registration complete');
   } catch (error) {
-    void error;
+    pushRegistered = false;
+    debugLog('[Push] Registration failed:', error);
   }
 }
 
 /**
- * Remove the FCM token from Firestore when the user logs out.
- * This prevents sending notifications to a logged-out device.
+ * Withdraw this device's token on logout.
+ *
+ * The server drops it from the user's record, so a signed-out account stops
+ * receiving push here. Failure is tolerated — the token is also reclaimed
+ * server-side the next time a different account registers it.
  */
 export async function unregisterPushNotifications(): Promise<void> {
   if (!Capacitor.isNativePlatform()) return;
 
+  const token = currentToken;
+  currentToken = null;
+  pushRegistered = false;
+  // Anything still mid-registration is now stale and must not attach.
+  registrationGeneration += 1;
+
   try {
-    const { PushNotifications } = await import('@capacitor/push-notifications');
-    // We don't have an easy way to get the current token,
-    // so we just remove all listeners and reset the flag.
-    // The token will be overwritten on next login.
-    await PushNotifications.removeAllListeners();
-    pushRegistered = false;
-    debugLog('[Push] Unregistered push notifications');
+    if (token) {
+      await api.post('/users/me/push-token/remove', { token });
+    }
   } catch (error) {
-    void error;
+    debugLog('[Push] Failed to withdraw token:', error);
+  }
+
+  try {
+    await Promise.all(listeners.map((listener) => listener.remove()));
+  } catch (error) {
+    debugLog('[Push] Failed to detach listeners:', error);
+  } finally {
+    listeners = [];
   }
 }

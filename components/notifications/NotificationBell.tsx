@@ -1,21 +1,30 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useAppContext } from '../../contexts/AppContext';
 import NotificationList from './NotificationList';
+import { useBackDismiss } from '../../utils/backGesture';
 
 const NotificationBell: React.FC = () => {
-  const { getNotificationsForCurrentUser, markNotificationAsRead, currentUser } = useAppContext();
+  const { getNotificationsForCurrentUser, markNotificationAsRead, markAllNotificationsAsRead, currentUser } = useAppContext();
   const [isOpen, setIsOpen] = useState(false);
   const bellRef = useRef<HTMLDivElement>(null);
 
+  const close = useCallback(() => setIsOpen(false), []);
+
+  // The Android back gesture closes this panel before it changes views.
+  useBackDismiss(isOpen, close);
+
   useEffect(() => {
-    const handleClickOutside = (event: MouseEvent) => {
+    // pointerdown rather than mousedown: on touch, mousedown is synthesised
+    // several hundred milliseconds after the finger lands, so tapping outside
+    // left the panel open for a visible beat before it caught up.
+    const handlePointerDown = (event: PointerEvent) => {
       if (bellRef.current && !bellRef.current.contains(event.target as Node)) {
         setIsOpen(false);
       }
     };
-    document.addEventListener('mousedown', handleClickOutside);
+    document.addEventListener('pointerdown', handlePointerDown);
     return () => {
-      document.removeEventListener('mousedown', handleClickOutside);
+      document.removeEventListener('pointerdown', handlePointerDown);
     };
   }, []);
 
@@ -33,7 +42,7 @@ const NotificationBell: React.FC = () => {
   };
 
   const handleMarkAllAsRead = () => {
-    currentNotifications.filter(n => !n.read).forEach(n => markNotificationAsRead(n.id));
+    markAllNotificationsAsRead();
   };
 
   return (
@@ -58,7 +67,7 @@ const NotificationBell: React.FC = () => {
           notifications={currentNotifications}
           onMarkAsRead={handleMarkAsRead}
           onMarkAllAsRead={handleMarkAllAsRead}
-          onClose={() => setIsOpen(false)}
+          onClose={close}
         />
       )}
     </div>

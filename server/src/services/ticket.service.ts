@@ -2,6 +2,7 @@ import { prisma } from '../utils/prisma';
 import { ApiError } from '../utils/ApiError';
 import type { TicketCategory, TicketStatus } from '@prisma/client';
 import { purgeTicketAttachments } from './cleanup.service';
+import * as notify from './notify.service';
 
 /**
  * Ticket Service — support ticket system.
@@ -64,8 +65,8 @@ export async function createTicket(
     shopName = shop?.name ?? undefined;
   }
 
-  return prisma.$transaction(async (tx) => {
-    const ticket = await tx.ticket.create({
+  const ticket = await prisma.$transaction(async (tx) => {
+    const created = await tx.ticket.create({
       data: {
         raisedBy: raisedByUserId,
         raisedByType: user.type,
@@ -84,7 +85,7 @@ export async function createTicket(
     // Create the first message
     await tx.ticketMessage.create({
       data: {
-        ticketId: ticket.id,
+        ticketId: created.id,
         senderId: raisedByUserId,
         senderName: user.name || 'Unknown',
         senderType: user.type,
@@ -95,7 +96,7 @@ export async function createTicket(
     // Record status creation
     await tx.ticketStatusChange.create({
       data: {
-        ticketId: ticket.id,
+        ticketId: created.id,
         from: 'OPEN',
         to: 'OPEN',
         changedBy: raisedByUserId,
@@ -104,8 +105,20 @@ export async function createTicket(
       },
     });
 
-    return ticket;
+    return created;
   });
+
+  // After commit — the support desk should never be paged about a ticket whose
+  // transaction rolled back.
+  notify.notifyTicketCreated({
+    id: ticket.id,
+    subject: ticket.subject,
+    raisedBy: ticket.raisedBy,
+    raisedByName: ticket.raisedByName,
+    shopId: ticket.shopId,
+  });
+
+  return ticket;
 }
 
 export async function listTickets(
@@ -234,6 +247,16 @@ export async function addMessage(
     prisma.ticket.update({ where: { id: ticketId }, data: replyStamp }),
   ]);
 
+  // Everyone on the thread except whoever just typed.
+  notify.notifyTicketReply({
+    ticketId,
+    subject: ticket.subject,
+    raisedBy: ticket.raisedBy,
+    shopId: ticket.shopId,
+    senderId: senderUserId,
+    senderName: user?.name || 'Someone',
+  });
+
   return created;
 }
 
@@ -270,6 +293,15 @@ export async function updateTicketStatus(
       },
     }),
   ]);
+
+  notify.notifyTicketStatus({
+    ticketId,
+    subject: ticket.subject,
+    raisedBy: ticket.raisedBy,
+    shopId: ticket.shopId,
+    newStatus,
+    actorUserId: changedByUserId,
+  });
 
   // The dispute is over, so the evidence attached to it can go. The
   // conversation stays — that is the record of what was decided. Fired after

@@ -84,11 +84,14 @@ interface AppContextType {
 
   addNotification: (notification: Omit<NotificationMessage, 'id' | 'timestamp' | 'read'>) => void;
   markNotificationAsRead: (notificationId: string) => void;
+  /** Clears every unread notification in a single request. */
+  markAllNotificationsAsRead: () => void;
   getNotificationsForCurrentUser: () => NotificationMessage[];
 
   currentView: AppView;
   navigateTo: (view: AppView) => void;
-  goBack: () => void;
+  /** Returns false when there was nothing to go back to. */
+  goBack: () => boolean;
 
   // Admin subscription data
   studentPassHolders: { id: string; name?: string; email?: string; studentPassActivatedAt?: string; studentPassPaymentId?: string }[];
@@ -210,6 +213,10 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const addNotificationRef = useRef<(notification: Omit<NotificationMessage, 'id' | 'timestamp' | 'read'>) => void>(() => { });
   const shopsRef = useRef<ShopProfile[]>([]);
   const currentUserRef = useRef<User | null>(null);
+  // Held as refs so the push listeners can be attached once per login instead
+  // of being torn down and rebuilt every time either callback is recreated.
+  const fetchNotificationsRef = useRef<() => Promise<void>>(async () => { });
+  const navigateToRef = useRef<(view: AppView) => void>(() => { });
 
   const [shops, setShops] = useState<ShopProfile[]>([]);
   const [isLoadingShops, setIsLoadingShops] = useState<boolean>(true);
@@ -272,13 +279,21 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     window.scrollTo(0, 0);
   }, []);
 
-  const goBack = useCallback(() => {
+  /**
+   * Step back one view.
+   *
+   * Reports whether it actually moved, so the Android back handler can fall
+   * through to minimizing the app instead of swallowing the gesture. Silently
+   * doing nothing on an empty history is indistinguishable from a frozen app.
+   */
+  const goBack = useCallback((): boolean => {
     const history = viewHistoryRef.current;
-    if (history.length > 0) {
-      const previousView = history.pop()!;
-      setCurrentView(previousView);
-      window.scrollTo(0, 0);
-    }
+    if (history.length === 0) return false;
+
+    const previousView = history.pop()!;
+    setCurrentView(previousView);
+    window.scrollTo(0, 0);
+    return true;
   }, []);
 
   const addNotification = useCallback((notificationData: Omit<NotificationMessage, 'id' | 'timestamp' | 'read'>) => {
@@ -326,22 +341,38 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   useEffect(() => { addNotificationRef.current = addNotification; }, [addNotification]);
   useEffect(() => { shopsRef.current = shops; }, [shops]);
   useEffect(() => { currentUserRef.current = currentUser; }, [currentUser]);
+  useEffect(() => { navigateToRef.current = navigateTo; }, [navigateTo]);
 
   // Clear session-only notifications when the authenticated account changes
   useEffect(() => { setLocalNotifications([]); }, [currentUser?.id, currentUser?.shopId]);
 
   // Register for push notifications when user logs in (native platforms only)
   useEffect(() => {
-    if (currentUser?.id) {
-      registerPushNotifications((title, body) => {
+    if (!currentUser?.id) return;
+
+    registerPushNotifications({
+      onReceived: (title, body) => {
+        // The server wrote a Notification row alongside this push. Refetching
+        // is what puts it in the bell with a real id, so marking it read
+        // actually persists — a local-only copy would silently un-read itself
+        // on the next refresh.
         addNotificationRef.current({ message: body || title, type: 'info' });
-      });
-    }
-    return () => {
-      if (currentUser?.id) {
-        unregisterPushNotifications();
-      }
-    };
+        void fetchNotificationsRef.current();
+      },
+      onTapped: () => {
+        // Orders and tickets live as sections of the role's dashboard rather
+        // than as their own views, so there is nothing finer to deep-link to
+        // than the dashboard the user belongs on.
+        void fetchNotificationsRef.current();
+        const destination =
+          currentUserRef.current?.type === UserType.SHOP_OWNER ? 'shopDashboard'
+          : currentUserRef.current?.type === UserType.ADMIN ? 'adminDashboard'
+          : 'studentDashboard';
+        navigateToRef.current(destination);
+      },
+    });
+
+    return () => { unregisterPushNotifications(); };
   }, [currentUser?.id]);
 
   // Initialize audio context on first user interaction (required by mobile browsers)
@@ -425,6 +456,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       debugLog('[AppContext] Failed to fetch notifications:', err);
     }
   }, [currentUser, notificationsLimit]);
+
+  useEffect(() => { fetchNotificationsRef.current = fetchNotifications; }, [fetchNotifications]);
 
   // Fetch payouts
   const fetchPayouts = useCallback(async () => {
@@ -1345,6 +1378,27 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
   }, []);
 
+  /**
+   * Mark everything read in one request.
+   *
+   * The bell used to do this by looping markNotificationAsRead over every
+   * unread row. That was invisible while the server never created a single
+   * notification; now that it does, a user coming back to fifty of them would
+   * have fired fifty PATCHes and run straight into the rate limiter.
+   */
+  const markAllNotificationsAsRead = useCallback(() => {
+    setLocalNotifications(prev => prev.map(n => ({ ...n, read: true })));
+    setServerNotifications(prev => prev.map(n => ({ ...n, read: true })));
+
+    notificationApi.markAllAsRead().catch(err => {
+      debugLog('[AppContext] Failed to mark all notifications as read:', err);
+      // Put the optimistic update back — leaving the bell clear while the
+      // server still has them unread means they reappear on next refresh with
+      // no explanation.
+      void fetchNotifications();
+    });
+  }, [fetchNotifications]);
+
   const getNotificationsForCurrentUser = useCallback(() => notifications, [notifications]);
   const getOrdersForCurrentUser = useCallback(() => orders, [orders]);
 
@@ -1669,7 +1723,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     orders, allOrders, getOrdersForCurrentUser,
     notifications,
     addOrder, updateOrderStatus,
-    addNotification, markNotificationAsRead, getNotificationsForCurrentUser,
+    addNotification, markNotificationAsRead, markAllNotificationsAsRead, getNotificationsForCurrentUser,
     currentView, navigateTo, goBack, upgradeToStudentPass, cancelStudentPass,
     payouts, createPayout, approvePayout, markPayoutPaid, rejectPayout, cancelPayout, requestPayout, confirmPayout, disputePayout,
     approveShop, rejectShop, archiveShop, unarchiveShop, approvedShops,

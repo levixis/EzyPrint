@@ -6,6 +6,7 @@ import { env } from '../config/env';
 import * as ledgerService from './ledger.service';
 import * as realtimeService from './realtime.service';
 import * as orderService from './order.service';
+import * as notify from './notify.service';
 
 /**
  * Payment Service — Razorpay integration with production-grade safety.
@@ -24,6 +25,35 @@ import * as orderService from './order.service';
  * crashed request does not leave an order unpayable for long.
  */
 const PAYMENT_CLAIM_TTL_MS = 60 * 1000;
+
+/**
+ * Tell the shop a paid order has arrived.
+ *
+ * Three independent paths move an order into PENDING_APPROVAL — signature
+ * verification, the webhook, and reconciliation — and a slow client can make
+ * two of them race on the same order. Each guards its write on the previous
+ * status and only calls this when its own update actually applied, so the shop
+ * is told exactly once no matter which path got there first.
+ */
+async function announcePaidOrder(orderId: string): Promise<void> {
+  const order = await prisma.order.findUnique({
+    where: { id: orderId },
+    select: {
+      id: true,
+      shopId: true,
+      userName: true,
+      shop: { select: { ownerUserId: true } },
+    },
+  });
+  if (!order?.shop) return;
+
+  notify.notifyNewOrder({
+    id: order.id,
+    shopId: order.shopId,
+    userName: order.userName,
+    ownerUserId: order.shop.ownerUserId,
+  });
+}
 
 /**
  * Constant-time comparison of two hex digests.
@@ -307,7 +337,7 @@ export async function verifyPayment(
   // Guarded on the status read above. The webhook path may have committed the
   // same transition in the meantime; an unguarded update would overwrite what it
   // wrote instead of deferring to it.
-  await prisma.order.updateMany({
+  const applied = await prisma.order.updateMany({
     where: { id: orderId, status: 'PENDING_PAYMENT' },
     data: {
       status: 'PENDING_APPROVAL',
@@ -315,6 +345,8 @@ export async function verifyPayment(
       paymentVerifiedVia: 'signature',
     },
   });
+
+  if (applied.count === 1) await announcePaidOrder(orderId);
 
   const updatedOrder = await prisma.order.findUnique({ where: { id: orderId } });
   if (!updatedOrder) throw ApiError.notFound('Order not found');
@@ -472,6 +504,8 @@ async function processWebhookEvent(eventType: string, event: any, eventId: strin
         break;
       }
 
+      let paidOrderId: string | null = null;
+
       await prisma.$transaction(async (tx) => {
         const order = await tx.order.findFirst({
           where: { razorpayOrderId: rpOrderId },
@@ -498,14 +532,19 @@ async function processWebhookEvent(eventType: string, event: any, eventId: strin
 
         // Only process if order exists, is still pending payment, and the sum agrees
         if (order && order.status === 'PENDING_PAYMENT' && amountMatches) {
-          await tx.order.update({
-            where: { id: order.id },
+          // Guarded on the status rather than a bare update: the signature path
+          // may have committed the same transition between the read above and
+          // this write, and only the caller whose update actually lands may
+          // announce the order to the shop.
+          const applied = await tx.order.updateMany({
+            where: { id: order.id, status: 'PENDING_PAYMENT' },
             data: {
               status: 'PENDING_APPROVAL',
               razorpayPaymentId: rpPaymentId,
               paymentVerifiedVia: 'webhook',
             },
           });
+          if (applied.count === 1) paidOrderId = order.id;
         }
 
         // Mark webhook as processed (inside the same transaction)
@@ -514,6 +553,10 @@ async function processWebhookEvent(eventType: string, event: any, eventId: strin
           data: { processed: true, processedAt: new Date() },
         });
       });
+
+      // After commit — an announcement about a transaction that later rolled
+      // back would tell a shop to print an order that was never paid for.
+      if (paidOrderId) await announcePaidOrder(paidOrderId);
       break;
     }
 
@@ -741,16 +784,22 @@ export async function reconcilePayments(thresholdMinutes: number = 15) {
         );
 
         if (capturedPayment) {
-          await prisma.order.update({
-            where: { id: order.id },
+          // Guarded so a webhook that arrived while we were talking to Razorpay
+          // keeps ownership of the transition, and the shop is told once.
+          const applied = await prisma.order.updateMany({
+            where: { id: order.id, status: 'PENDING_PAYMENT' },
             data: {
               status: 'PENDING_APPROVAL',
               razorpayPaymentId: capturedPayment.id,
               paymentVerifiedVia: 'reconciliation',
             },
           });
-          reconciled++;
-          console.log(`🔄 Reconciled order ${order.id} — payment ${capturedPayment.id}`);
+
+          if (applied.count === 1) {
+            await announcePaidOrder(order.id);
+            reconciled++;
+            console.log(`🔄 Reconciled order ${order.id} — payment ${capturedPayment.id}`);
+          }
         }
       }
     } catch (error) {
