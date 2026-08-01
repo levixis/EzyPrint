@@ -10,6 +10,18 @@ import { Button } from '../common/Button';
 import { Modal } from '../common/Modal';
 
 const RAZORPAY_KEY_ID = import.meta.env.VITE_RAZORPAY_KEY_ID;
+
+/**
+ * Statuses a student may still cancel from.
+ *
+ * Mirrors TRANSITIONS_BY_ROLE.STUDENT on the server — the server is the
+ * authority and rejects the rest, this just avoids offering a button that
+ * would fail. If you change one, change the other.
+ */
+const STUDENT_CANCELLABLE: OrderStatus[] = [
+  OrderStatus.PENDING_PAYMENT,
+  OrderStatus.PENDING_APPROVAL,
+];
 const debugLog = (...args: unknown[]) => {
   void args;
 };
@@ -371,7 +383,11 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
               key={order.id}
               order={order}
               onPayNow={handlePayNow}
-              onCancelOrder={handleCancelOrder}
+              // Once the shop starts printing, paper and toner are already
+              // spent, so the order can no longer be cancelled — the server
+              // rejects it too. Anything after that goes through a refund
+              // request instead.
+              onCancelOrder={STUDENT_CANCELLABLE.includes(order.status) ? handleCancelOrder : undefined}
               isProcessingPayment={processingOrderId === order.id}
             />
           ))}

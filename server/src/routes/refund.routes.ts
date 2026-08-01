@@ -7,7 +7,7 @@ import { requestRefundSchema, respondRefundSchema, resolveRefundSchema } from '.
 import * as ledgerService from '../services/ledger.service';
 import * as realtimeService from '../services/realtime.service';
 import * as otpService from '../services/otp.service';
-import { env } from '../config/env';
+import * as refundService from '../services/refund.service';
 
 const router = Router();
 
@@ -151,94 +151,16 @@ router.post('/:id/resolve', authenticate, authorize('ADMIN'), validate(resolveRe
     });
     if (claim.count === 0) throw ApiError.badRequest('Refund request not found or invalid state');
 
-    const request = await prisma.refundRequest.findUnique({ where: { id }, include: { order: true } });
-    if (!request) throw ApiError.notFound();
-
-    let razorpayRefundId = request.razorpayRefundId;
-    let finalStatus = 'RESOLVED_REFUNDED';
-    const amount = request.refundAmount || request.order.totalPrice;
-
-    // 2. Network Call
-    if (request.order.razorpayPaymentId) {
-      if (!razorpayRefundId) {
-        // Authenticated REST request to Razorpay
-        const auth = Buffer.from(`${env.RAZORPAY_KEY_ID}:${env.RAZORPAY_KEY_SECRET}`).toString('base64');
-        const response = await fetch(`https://api.razorpay.com/v1/payments/${request.order.razorpayPaymentId}/refund`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Basic ${auth}`,
-            'X-Refund-Idempotency': request.id,
-          },
-          // `amount` is already paise, which is the unit Razorpay expects.
-          body: JSON.stringify({ amount, notes: { orderId: request.orderId } }),
-        });
-        const data = await response.json() as any;
-        
-        if (!response.ok) {
-          // If network failed, leave in PROCESSING_REFUND for retry or manual intervention
-          throw ApiError.internal(`Razorpay Refund Failed: ${data.error?.description || 'Unknown error'}`);
-        }
-        razorpayRefundId = data.id;
-      }
-    } else {
-      finalStatus = 'REFUND_SETTLED_OFFLINE';
-    }
-
-    // 3. Persist
-    // Collected inside the transaction, published once it commits.
-    const outboxIds: string[] = [];
-
-    const result = await prisma.$transaction(async (tx) => {
-      const updatedRequestCount = await tx.refundRequest.updateMany({
-        where: { id, status: 'PROCESSING_REFUND' },
-        data: {
-          status: finalStatus as any,
-          adminNote,
-          resolvedBy: req.user?.userId,
-          adminResolvedAt: new Date(),
-          refundAmount: amount,
-          razorpayRefundId,
-        }
-      });
-      
-      if (updatedRequestCount.count === 0) {
-        throw ApiError.badRequest('Refund already processed or invalid state');
-      }
-
-      await tx.order.updateMany({
-        where: { id: request.orderId },
-        data: { status: 'REFUNDED' }
-      });
-
-      // The student is refunded the full amount by Razorpay, but the shop is
-      // only liable for the part it actually received. The platform absorbs
-      // its own base fee rather than clawing it back from the shop.
-      const shopShare = await ledgerService.shopShareOfRefund(tx, request.orderId, amount);
-
-      if (shopShare > 0) {
-        await ledgerService.createLedgerEntry({
-          shopId: request.shopId,
-          type: 'REFUND_DEDUCTION',
-          amount: shopShare,
-          description: `Refund for order ${request.orderId}`,
-          counterparty: 'STUDENT',
-          createdBy: 'ADMIN',
-          orderId: request.orderId,
-          eventId: `refund:${request.id}`,
-          // The student has already been refunded by Razorpay at this point. If
-          // the shop's balance no longer covers it — because they were paid out
-          // in the meantime — the shortfall becomes debt offset against their
-          // future earnings. Refusing here would leave the platform out of pocket
-          // with no record of who owes it.
-          allowDebt: true,
-        }, tx, outboxIds);
-      }
-
-      return tx.refundRequest.findUnique({ where: { id } });
+    // 2 & 3. Network call, then persist. Shared with the automatic refund a
+    // cancellation triggers, so both paths agree on who absorbs what.
+    await refundService.settleClaimedRefund(id, {
+      setOrderRefunded: true,
+      createdBy: 'ADMIN',
+      adminNote,
+      resolvedBy: req.user.userId,
     });
 
-    await realtimeService.publishQueued(outboxIds);
+    const result = await prisma.refundRequest.findUnique({ where: { id } });
 
     res.json({ success: true, data: result });
   } catch (error) { next(error); }

@@ -3,6 +3,7 @@ import { ApiError } from '../utils/ApiError';
 import { calculateOrderPrice } from './pricing.service';
 import { creditOrderEarning } from './settlement.service';
 import { enqueueShopEvent, publishQueued } from './realtime.service';
+import { claimCancellationRefund, settleClaimedRefund } from './refund.service';
 import type { OrderStatus, PrintColor } from '@prisma/client';
 import crypto from 'crypto';
 
@@ -46,6 +47,44 @@ const orderSelect = {
   completedAt: true,
   files: true,
 } as const;
+
+/**
+ * Which transitions each role may drive.
+ *
+ * `VALID_TRANSITIONS` answers "is this a legal state change?"; this answers
+ * "is this person allowed to make it?". Having only the first meant any
+ * authenticated student could drive any order — including READY_FOR_PICKUP ->
+ * COMPLETED on a stranger's order, which credits that shop's ledger.
+ *
+ * A student's window closes when printing starts: paper and toner are spent by
+ * then, so the commitment is real. The shop keeps a cancel at every stage,
+ * because a jammed printer or an unreadable file has to be resolvable without
+ * involving an admin. ADMIN falls through to the full table.
+ */
+const TRANSITIONS_BY_ROLE: Record<string, Partial<Record<OrderStatus, OrderStatus[]>>> = {
+  STUDENT: {
+    PENDING_PAYMENT: ['CANCELLED', 'PAYMENT_FAILED'],
+    PENDING_APPROVAL: ['CANCELLED'],
+    PAYMENT_FAILED: ['PENDING_PAYMENT'],
+  },
+  SHOP_OWNER: {
+    PENDING_APPROVAL: ['PRINTING', 'CANCELLED'],
+    PRINTING: ['READY_FOR_PICKUP', 'CANCELLED'],
+    READY_FOR_PICKUP: ['COMPLETED', 'CANCELLED'],
+  },
+};
+
+/**
+ * Whether `role` may move an order from `from` to `to`.
+ *
+ * Exported for tests: these rules decide who can cancel a stranger's order and
+ * who can trigger the earning credit, so they are worth pinning down.
+ */
+export function canRoleTransition(role: string, from: OrderStatus, to: OrderStatus): boolean {
+  if (!(VALID_TRANSITIONS[from] || []).includes(to)) return false;
+  if (role === 'ADMIN') return true;
+  return (TRANSITIONS_BY_ROLE[role]?.[from] || []).includes(to);
+}
 
 // Valid status transitions — prevents invalid jumps
 const VALID_TRANSITIONS: Record<string, OrderStatus[]> = {
@@ -338,13 +377,29 @@ export async function updateOrderStatus(
   if (requesterType === 'SHOP_OWNER' && order.shop.ownerUserId !== requesterId) {
     throw ApiError.forbidden('You do not own this shop');
   }
+  // Without this a student could drive any order by id, not just their own.
+  if (requesterType === 'STUDENT' && order.userId !== requesterId) {
+    throw ApiError.forbidden('This is not your order');
+  }
 
-  // Validate status transition
-  const allowedTransitions = VALID_TRANSITIONS[order.status] || [];
-  if (!allowedTransitions.includes(newStatus)) {
+  // Legality of the transition, independent of who is asking.
+  const legalTransitions = VALID_TRANSITIONS[order.status] || [];
+  if (!legalTransitions.includes(newStatus)) {
     throw ApiError.badRequest(
-      `Cannot transition from ${order.status} to ${newStatus}. Allowed: ${allowedTransitions.join(', ') || 'none'}`
+      `Cannot transition from ${order.status} to ${newStatus}. Allowed: ${legalTransitions.join(', ') || 'none'}`
     );
+  }
+
+  // Then whether this role may make it.
+  if (requesterType !== 'ADMIN') {
+    const allowedForRole = TRANSITIONS_BY_ROLE[requesterType]?.[order.status] || [];
+    if (!allowedForRole.includes(newStatus)) {
+      throw ApiError.forbidden(
+        order.status === 'PRINTING' && newStatus === 'CANCELLED' && requesterType === 'STUDENT'
+          ? 'This order is already being printed and can no longer be cancelled. Please raise a refund request instead.'
+          : `You are not allowed to change this order from ${order.status} to ${newStatus}.`
+      );
+    }
   }
 
   // Build update data
@@ -361,6 +416,7 @@ export async function updateOrderStatus(
   }
 
   const outboxIds: string[] = [];
+  let refundRequestId: string | null = null;
 
   const updated = await prisma.$transaction(async (tx) => {
     // Compare-and-swap on the status we validated against. Two staff acting on
@@ -388,6 +444,20 @@ export async function updateOrderStatus(
       });
     }
 
+    // A cancelled order that was paid for must give the money back without the
+    // student having to ask. Claimed inside this transaction so the refund
+    // request cannot exist without the cancellation, nor the cancellation
+    // without a claim on the refund.
+    if (newStatus === 'CANCELLED') {
+      refundRequestId = await claimCancellationRefund(tx, {
+        id: order.id,
+        shopId: order.shopId,
+        userId: order.userId,
+        totalPrice: order.totalPrice,
+        razorpayPaymentId: order.razorpayPaymentId,
+      });
+    }
+
     const row = await tx.order.findUnique({ where: { id: orderId }, select: orderSelect });
 
     // Carries the shop's current version rather than a new one: an order status
@@ -406,6 +476,28 @@ export async function updateOrderStatus(
   });
 
   await publishQueued(outboxIds);
+
+  // Outside the transaction: this makes a network call to Razorpay, which must
+  // never run while holding database locks. The cancellation is already
+  // committed, so a failure here leaves the request in PROCESSING_REFUND for an
+  // admin to retry rather than rolling back a cancellation the user has
+  // already been told succeeded. The Razorpay idempotency key makes that retry
+  // safe.
+  if (refundRequestId) {
+    try {
+      await settleClaimedRefund(refundRequestId, {
+        setOrderRefunded: false,
+        createdBy: 'SYSTEM',
+        adminNote: 'Automatic refund for cancelled order',
+      });
+    } catch (error) {
+      console.error(
+        `[order] auto-refund failed for cancelled order ${orderId} ` +
+        `(refund request ${refundRequestId}) — left in PROCESSING_REFUND:`,
+        error
+      );
+    }
+  }
 
   if (!updated) throw ApiError.notFound('Order not found');
   return formatOrder(updated);
