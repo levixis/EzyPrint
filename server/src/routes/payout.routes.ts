@@ -8,9 +8,30 @@ import type { Request, Response, NextFunction } from 'express';
 import { requestPayoutSchema, otpGuardedSchema, manualPayoutWithOtpSchema } from '../validators/schemas';
 import * as otpService from '../services/otp.service';
 import * as realtimeService from '../services/realtime.service';
+import * as notifyService from '../services/notify.service';
 import { sensitiveLimiter } from '../middleware/rateLimiter';
 import { prisma } from '../utils/prisma';
 import type { Prisma } from '@prisma/client';
+
+/**
+ * Tell a shop about a payout change it did not make itself.
+ *
+ * Every one of these paths used to end silently: a shop requested a payout and
+ * no admin heard, an admin approved or rejected one and the shop found out by
+ * refreshing. `notifyPayoutUpdate` and `notifyAdmins` both existed and neither
+ * was called from here.
+ *
+ * Fire-and-forget on purpose — the notification helpers swallow their own
+ * failures, and a push provider having a bad minute must not fail a request
+ * that has already moved money.
+ */
+async function tellShop(shopId: string, message: string, type: 'info' | 'success' | 'warning' | 'error' = 'info') {
+  const shop = await prisma.shop.findUnique({ where: { id: shopId }, select: { ownerUserId: true } });
+  if (!shop) return;
+  notifyService.notifyPayoutUpdate({ shopId, ownerUserId: shop.ownerUserId, message, type });
+}
+
+const rupees = (paise: number) => `₹${(paise / 100).toFixed(2)}`;
 
 const router = Router();
 
@@ -178,6 +199,11 @@ router.post('/request', authenticate, authorize('SHOP_OWNER'), validate(requestP
 
     await realtimeService.publishQueued(outboxIds);
 
+    notifyService.notifyAdmins(
+      `${shop.name} requested a payout of ${rupees(Number(amount))}.`,
+      'warning'
+    );
+
     res.json({ success: true, data: result });
   } catch (error) { next(error); }
 });
@@ -228,6 +254,8 @@ router.post('/:id/approve', authenticate, authorize('ADMIN'), sensitiveLimiter, 
 
     await realtimeService.publishQueued(outboxIds);
 
+    await tellShop(result.shopId, `Your payout of ${rupees(result.amount)} was approved and is on its way.`, 'success');
+
     res.json({ success: true, data: result });
   } catch (error) { next(error); }
 });
@@ -268,6 +296,8 @@ router.post('/:id/mark-paid', authenticate, authorize('ADMIN'), sensitiveLimiter
     });
 
     await realtimeService.publishQueued(outboxIds);
+
+    await tellShop(result.shopId, `${rupees(result.amount)} has been sent to your bank account.`, 'success');
 
     res.json({ success: true, data: result });
   } catch (error) { next(error); }
@@ -310,6 +340,14 @@ router.post('/:id/reject', authenticate, authorize('ADMIN'), sensitiveLimiter, v
 
     await realtimeService.publishQueued(outboxIds);
 
+    // The reserved amount is back in the balance, so say so — otherwise the
+    // money quietly reappearing is the only signal the shop gets.
+    await tellShop(
+      result.shopId,
+      `Your payout request of ${rupees(result.amount)} was declined and the amount is back in your balance.`,
+      'warning'
+    );
+
     res.json({ success: true, data: result });
   } catch (error) { next(error); }
 });
@@ -322,10 +360,12 @@ router.post('/:id/cancel', authenticate, authorize('SHOP_OWNER', 'ADMIN'), sensi
     await otpService.consumeOtp(req.user.userId, `payout_${req.params.id}`, otp);
 
     const outboxIds: string[] = [];
+    let cancelled: { shopId: string; amount: number } | null = null;
 
     const result = await prisma.$transaction(async (tx) => {
       const payout = await tx.payout.findUnique({ where: { id: req.params.id as string } });
       if (!payout) throw ApiError.notFound('Payout not found');
+      cancelled = { shopId: payout.shopId, amount: payout.amount };
       
       if (req.user?.userType === 'SHOP_OWNER') {
         const shop = await tx.shop.findUnique({ where: { ownerUserId: req.user.userId } });
@@ -357,6 +397,18 @@ router.post('/:id/cancel', authenticate, authorize('SHOP_OWNER', 'ADMIN'), sensi
     });
 
     await realtimeService.publishQueued(outboxIds);
+
+    // Cancelling is open to both sides, so who hears depends on who acted.
+    // Telling someone about their own button press is noise, and a shop that
+    // buzzes at itself learns to ignore the one that matters.
+    if (cancelled) {
+      const { shopId: cancelledShopId, amount: cancelledAmount } = cancelled;
+      if (req.user?.userType === 'ADMIN') {
+        await tellShop(cancelledShopId, `Your payout request of ${rupees(cancelledAmount)} was cancelled by an admin.`, 'warning');
+      } else {
+        notifyService.notifyAdmins(`A shop cancelled its payout request of ${rupees(cancelledAmount)}.`);
+      }
+    }
 
     res.json({ success: true, data: result });
   } catch (error) { next(error); }
@@ -399,6 +451,11 @@ router.post('/:id/dispute', authenticate, authorize('SHOP_OWNER'), async (req, r
       data: { status: 'DISPUTED', shopOwnerNote }
     });
     if (updated.count === 0) throw ApiError.badRequest('Payout not found or invalid state');
+    notifyService.notifyAdmins(
+      `${shop.name} is disputing a payout of ${rupees(payout.amount)} — they say it never arrived.`,
+      'error'
+    );
+
     res.json({ success: true, data: updated });
   } catch (error) {
     next(error);
@@ -446,6 +503,8 @@ router.post('/manual', authenticate, authorize('ADMIN'), sensitiveLimiter, valid
     });
 
     await realtimeService.publishQueued(outboxIds);
+
+    await tellShop(shopId, `${rupees(Number(amount))} has been sent to your bank account.`, 'success');
 
     res.json({ success: true, data: result });
   } catch (error) { next(error); }
