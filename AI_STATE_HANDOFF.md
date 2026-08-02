@@ -1,5 +1,5 @@
 # AI STATE HANDOFF
-> **STATUS**: Green | **LAST UPDATE**: 2026-08-01 | **TESTS**: 134 server + 79 web | **TSC**: 0 errors (server + web) | **BUILD**: passing | **ANDROID**: compiles
+> **STATUS**: Green | **LAST UPDATE**: 2026-08-02 | **TESTS**: 223 server + 123 web | **TSC**: 0 errors (server + web) | **BUILD**: passing | **ANDROID**: compiles
 
 ## 1. METADATA & TECH STACK
 * **Project**: EzyPrint — campus print-order marketplace (students → shops)
@@ -9,7 +9,7 @@
   — see §5d. Comments in `server/src` still say "Railway"; that was the plan, not
   what shipped. What they describe holds on Render too, which also terminates at
   one edge proxy, so `TRUST_PROXY_HOPS=1` stays correct.
-* **Git Branch**: `migrate/new-backend`
+* **Git Branch**: `main`
 
 ## 2. THE BIG ONE — shops are now actually paid
 
@@ -140,23 +140,13 @@ swallowed), and there was no send path — no `firebase-admin`, nothing writing
 
 ## 5d. DEPLOYED — and what deploying changed
 
-**Supersedes the `Git Branch` and `Deploy target` lines in §1.** The migration branch
-is merged (`3da173a`); work is on `main`. The API runs on **Render**
-(`https://ezyprint-backend.onrender.com`) rather than Railway — a temporary choice,
-not a redesign. Web is on Vercel, DB on Neon, files on R2, as planned.
+The migration branch is merged (`3da173a`); work is on `main`. The API runs on
+**Render** (`https://ezyprint-backend.onrender.com`) rather than Railway — a temporary
+choice, not a redesign. Web is on Vercel, DB on Neon, files on R2, as planned.
 
-* **Render's free tier sleeps**, and a sleeping instance runs no scheduler. The
-  settlement sweep and the Razorpay reconciliation were moved to **hourly** to fit
-  Neon's free CU-hour budget (720 → ~60). This is a deliberate deviation from the
-  15-minute reconciliation the design assumed: a dropped webhook can now sit unnoticed
-  for up to an hour. The $7 Starter plan removes the sleep and the interval can go back
-  down.
-* **Schema drift blocked every migration**: `column "isRejected" already exists`
-  (P3018 / 42701), left by an earlier `prisma db push`. Resolved with
-  `prisma migrate resolve --applied` after confirming all 8 columns and 3 indexes were
-  actually present. It was caught on a **Neon branch, not production** — which is the
-  argument for §7.3.
-* The `pre-paise-backup` Neon branch still carries the pre-rotation password.
+* **Render's free tier sleeps**, and a sleeping instance runs no scheduler — the
+  settlement sweep, the Razorpay reconciliation and the outbox dispatcher all stop
+  until the next request wakes it. See §7.
 * A "CORS error" in the console was a **502**: the backend was down, and Render's own
   error page carries no `Access-Control-Allow-Origin`. Curl the endpoint before
   believing a CORS message.
@@ -278,9 +268,9 @@ Support was the least-exercised surface in the app and had four independent brea
 ## 6. VERIFICATION
 
 ```bash
-cd server && npm test          # 134/134
+cd server && npm test          # 223/223
 cd server && npx tsc --noEmit  # 0 errors
-npm test                       # 79/79 (web, vitest)
+npm test                       # 123/123 (web, vitest)
 npx tsc --noEmit               # 0 errors (web)
 npm run build                  # passes
 cd android && ./gradlew compileDebugJavaWithJavac   # compiles
@@ -292,53 +282,33 @@ indexes match exactly, and zero `DOUBLE PRECISION` columns remain.
 
 ## 7. NEXT STEPS
 
-1. [ ] **Set the new required env vars before deploying** — the server refuses
-   to boot in production without them: `GOOGLE_CLIENT_IDS`,
-   `RAZORPAY_WEBHOOK_SECRET`, `PUSHER_APP_ID`/`KEY`/`SECRET`, `DIRECT_URL`.
-   Web needs `VITE_PUSHER_KEY` and `VITE_PUSHER_CLUSTER`. See
-   `server/.env.example`.
-2. [ ] **`FIREBASE_SERVICE_ACCOUNT` on Render — push does not send until it is
-   set.** Done locally in `server/.env`; **not yet set on
-   `ezyprint-backend`**, so production reaches no device.
-   * The key is minted and verified against live FCM (key id `11a762e6…`, from
-     `firebase-adminsdk-fbsvc@ezyyprint.iam.gserviceaccount.com`). It lives at
-     `server/ezyyprint-firebase-adminsdk-fcm.json`, gitignored by the
-     `*-firebase-adminsdk-*.json` rule. **That file is the only copy** — a
-     service account private key cannot be re-downloaded, only re-minted.
-   * Set it as base64, not raw JSON; Render's env field truncates at the first
-     newline and the private key is multi-line:
-     `base64 -i server/ezyyprint-firebase-adminsdk-fcm.json | tr -d '\n' | pbcopy`
-   * The Render CLI (v2.22) has **no env-var subcommand** — dashboard or the
-     REST API (`PUT /v1/services/{id}/env-vars`) are the only routes.
-   * Optional by design: absence disables only the device buzz and leaves in-app
-     notifications working, so this is not a boot blocker.
-3. [ ] Run `prisma migrate deploy` against a staging copy first — the paise
-   migration rewrites every money column and is not reversible in place.
-4. [ ] Admin UI for the new `IN_TRANSIT` payout step (`POST
-   /payouts/:id/mark-paid` exists and `payoutApi.markPaid` is wired; the
-   dashboard still needs a button).
-5. [ ] Delete `.github/workflows/deploy.yml` and the legacy `functions/` +
-   Firestore rules once the Railway/Vercel pipeline is live. The workflow's
+1. [ ] **The `refund.*` Razorpay webhooks may never have been selected.**
+   `payment.authorized`, `payment.captured` and `payment.failed` are confirmed
+   arriving and processing (11 rows in `webhook_events`, all `processed`), but
+   `refund.processed` and `refund.failed` have **zero rows** despite three
+   `RESOLVED_REFUNDED` refund requests. Either they are not ticked in the
+   dashboard or those refunds never reached the gateway. Check both.
+2. [ ] Razorpay is still on `rzp_test_` keys.
+3. [ ] **Render's free tier sleeps, and a sleeping instance runs no scheduler** —
+   settlement, reconciliation and the outbox dispatcher silently stop. It also
+   blocks outbound SMTP on ports 25/465/587 — which is why OTP mail goes over
+   Resend's HTTP API (`email.service.ts`) rather than Gmail SMTP — and drops the
+   first request after idle. The $7 Starter plan is the fix for all three.
+4. [ ] Delete `.github/workflows/deploy.yml` and the legacy `functions/` +
+   `firestore.rules` / `storage.rules`. All still present; the workflow's
    automatic trigger is removed but the file remains. **Note:** `firebase-admin`
    on the server is now an FCM transport and is unrelated to that cleanup —
    removing it disables push.
-6. [ ] `server/.env.render` is a stale Render config pointing at a **non-pooled**
-   Neon endpoint. Replace with Railway config; do not copy it as-is.
-7. [ ] `notifyPayoutUpdate` and `notifyAdmins` exist in `notify.service.ts` but
-   are not yet called from the payout/refund/reactivation flows — those still
-   notify nobody. Orders and tickets are fully wired.
-8. [ ] **Select the four Razorpay webhook events in the dashboard** —
-   `payment.captured`, `payment.failed`, `refund.processed`, `refund.failed`,
-   pointed at `POST /api/v1/payments/webhook`. Until this is done, everything in
-   §5e is exercised by nothing.
-9. [ ] Razorpay is still on `rzp_test_` keys.
-10. [ ] **Render's free tier sleeps, and the hourly scheduler will not fire on a
-    sleeping instance** — settlement and reconciliation silently stop. $7 Starter,
-    or move to Railway as §1 intended, then restore the shorter interval.
-11. [ ] No CI runs either test suite. Both pass locally and nothing enforces that.
-12. [ ] `contexts/AppContext.tsx` (~1700 lines) has no tests — and it is where the
-    blank-page bugs in §5h originated.
-13. [ ] Rotate the Neon password on the `pre-paise-backup` branch; it still holds
-    the pre-rotation credential.
-14. [ ] Verify PDF preview on iOS Safari (§5i) before telling students it works
-    there.
+5. [ ] Delete `server/.env.render` — a stale config pointing at a **non-pooled**
+   Neon endpoint. It is not what the live service uses; do not copy it as-is.
+6. [ ] No CI runs either test suite. Both pass locally and nothing enforces that.
+7. [ ] `contexts/AppContext.tsx` (~1700 lines) has no tests — and it is where the
+   blank-page bugs in §5h originated.
+8. [ ] Rotate the Neon password on the `pre-paise-backup` branch; it still holds
+   the pre-rotation credential.
+9. [ ] Verify PDF preview on iOS Safari (§5i) before telling students it works
+   there.
+10. [ ] **`server/ezyyprint-firebase-adminsdk-fcm.json` is the only copy** of the
+    FCM service-account key (gitignored by `*-firebase-adminsdk-*.json`). A
+    service account private key cannot be re-downloaded, only re-minted. Back it
+    up somewhere that is not this laptop.
