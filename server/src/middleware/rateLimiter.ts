@@ -132,6 +132,33 @@ export const otpRequestLimiter = rateLimit({
 });
 
 /**
+ * Password reset requests — 3 per hour per email address.
+ *
+ * Much tighter than `authLimiter`'s 20/15min, and for a different threat. This
+ * endpoint makes us send mail to an address chosen by an anonymous caller, so
+ * the abuse is not guessing a credential — it is using EzyPrint to flood
+ * somebody's inbox, and burning the mail provider's quota and reputation while
+ * doing it. Three is more than anyone needs; a code lasts five minutes and the
+ * usual reason to ask twice is that the first went to spam.
+ *
+ * Keyed on the target address rather than the caller, because the address is
+ * what is being attacked and an attacker can change IP freely.
+ */
+export const passwordResetLimiter = rateLimit({
+  ...shared,
+  windowMs: 60 * 60 * 1000,
+  max: env.isDev ? 50 : 3,
+  keyGenerator: (req: Request) => {
+    const email = typeof req.body?.email === 'string' ? req.body.email.toLowerCase() : null;
+    return email ? `reset:${email}` : `ip:${clientKey(req)}`;
+  },
+  message: {
+    success: false,
+    message: 'Too many password reset requests for this email. Please try again later.',
+  },
+});
+
+/**
  * Webhook limiter — 60 requests per minute.
  * Razorpay won't exceed this for legitimate traffic. Prevents attackers from
  * flooding the endpoint with fake payloads that burn CPU on HMAC verification

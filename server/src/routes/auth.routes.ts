@@ -1,8 +1,15 @@
 import { Router } from 'express';
-import { authLimiter } from '../middleware/rateLimiter';
+import { authLimiter, passwordResetLimiter } from '../middleware/rateLimiter';
 import { authenticate } from '../middleware/auth';
 import { validate } from '../middleware/validate';
-import { registerSchema, loginSchema, googleAuthSchema, refreshSchema } from '../validators/schemas';
+import {
+  registerSchema,
+  loginSchema,
+  googleAuthSchema,
+  refreshSchema,
+  forgotPasswordSchema,
+  resetPasswordSchema,
+} from '../validators/schemas';
 import * as authController from '../controllers/auth.controller';
 
 const router = Router();
@@ -23,6 +30,34 @@ router.post('/register', validate(registerSchema), authController.register);
  * Zod validates: email format, password presence.
  */
 router.post('/login', validate(loginSchema), authController.login);
+
+/**
+ * POST /api/v1/auth/forgot-password
+ *
+ * `passwordResetLimiter` stacks on top of the router-wide `authLimiter`: this
+ * endpoint sends mail to an address the caller names, so the binding limit is
+ * 3/hour per address rather than 20/15min.
+ */
+router.post(
+  '/forgot-password',
+  passwordResetLimiter,
+  validate(forgotPasswordSchema),
+  authController.forgotPassword
+);
+
+/**
+ * POST /api/v1/auth/reset-password
+ * Zod validates: email format, 6-digit code, full password strength rules.
+ *
+ * Not behind `passwordResetLimiter` — submitting a code sends no mail, and
+ * wrong guesses are already bounded by the OTP lockout (3 then 15 minutes),
+ * which is per-account and so cannot be sidestepped by changing address.
+ */
+router.post(
+  '/reset-password',
+  validate(resetPasswordSchema),
+  authController.resetPasswordHandler
+);
 
 /**
  * POST /api/v1/auth/google

@@ -87,6 +87,25 @@ export const loginSchema = z.object({
   }),
 });
 
+export const forgotPasswordSchema = z.object({
+  body: z.object({
+    email,
+  }),
+});
+
+/**
+ * Reset uses the full `password` validator, not login's `min(1)`. The strength
+ * rules are enforced at registration, and a reset that skipped them would be a
+ * way to give any account a one-character password.
+ */
+export const resetPasswordSchema = z.object({
+  body: z.object({
+    email,
+    otp: z.string().regex(/^[0-9]{6}$/, 'The verification code is 6 digits'),
+    password,
+  }),
+});
+
 export const googleAuthSchema = z.object({
   body: z.object({
     idToken: z.string().min(1, 'Google ID token is required'),

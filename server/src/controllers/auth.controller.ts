@@ -8,6 +8,7 @@ import {
   logoutAll,
   getCurrentUser,
 } from '../services/auth.service';
+import { requestPasswordReset, resetPassword } from '../services/passwordReset.service';
 import { ApiError } from '../utils/ApiError';
 
 /**
@@ -62,6 +63,52 @@ export async function login(req: Request, res: Response, next: NextFunction) {
       success: true,
       message: 'Login successful',
       data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+/**
+ * POST /api/v1/auth/forgot-password
+ * Body: { email }
+ *
+ * Always 200, whether or not the address belongs to an account — see
+ * `requestPasswordReset`. The message is worded to be true either way: it
+ * promises what we did, not that an account was found.
+ */
+export async function forgotPassword(req: Request, res: Response, next: NextFunction) {
+  try {
+    await requestPasswordReset(req.body.email);
+
+    res.json({
+      success: true,
+      message: 'If that email has an EzyPrint account, a reset code is on its way.',
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+/**
+ * POST /api/v1/auth/reset-password
+ * Body: { email, otp, password }
+ *
+ * Deliberately returns no tokens. Signing the caller straight in would mean a
+ * successful reset both changes the password and hands out a session in one
+ * step, and the user has just proved they can reach the inbox — not that they
+ * are at a device we should keep trusting. They log in with the new password,
+ * which also confirms it is the one they think they set.
+ */
+export async function resetPasswordHandler(req: Request, res: Response, next: NextFunction) {
+  try {
+    const { email, otp, password } = req.body;
+
+    await resetPassword(email, otp, password);
+
+    res.json({
+      success: true,
+      message: 'Password updated. You have been signed out everywhere — please sign in again.',
     });
   } catch (error) {
     next(error);

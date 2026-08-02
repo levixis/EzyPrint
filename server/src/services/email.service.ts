@@ -139,6 +139,47 @@ async function deliver(message: Message): Promise<void> {
 }
 
 /**
+ * Send a password reset code.
+ *
+ * Separate from `sendOTPEmail` because the two say different things. That one
+ * confirms an action the reader just took and is already looking at; this one
+ * may be the first a reader hears of it, and if they did not ask for it that
+ * fact is the important part of the message — so it leads with what to do about
+ * an unexpected code rather than burying it in a footer.
+ */
+export async function sendPasswordResetEmail(
+  to: string,
+  otp: string,
+  name?: string | null
+): Promise<void> {
+  const greeting = name ? `Hi ${escapeHtml(name)},` : 'Hi,';
+  const plainGreeting = name ? `Hi ${name},` : 'Hi,';
+
+  await deliver({
+    to,
+    subject: `Reset your EzyPrint password — code ${otp}`,
+    text: `${plainGreeting}\n\nUse this code to set a new EzyPrint password: ${otp}\n\nIt expires in 5 minutes and can be used once.\n\nIf you did not ask to reset your password, you can ignore this email — your current password still works and nothing has changed.`,
+    html: `
+      <div style="font-family: 'Inter', sans-serif; max-width: 480px; margin: 0 auto; padding: 32px; background: #1a1a2e; border-radius: 16px; color: #e0e0e0;">
+        <div style="text-align: center; margin-bottom: 24px;">
+          <h1 style="color: #ef4444; font-size: 24px; margin: 0;">EzyPrint</h1>
+          <p style="color: #888; font-size: 12px; text-transform: uppercase; letter-spacing: 2px;">Password Reset</p>
+        </div>
+        <p style="margin-bottom: 16px;">${greeting}</p>
+        <p style="margin-bottom: 16px;">Use this code to set a new password:</p>
+        <div style="text-align: center; padding: 24px; background: #16213e; border-radius: 12px; margin: 24px 0;">
+          <p style="font-size: 36px; font-weight: 800; letter-spacing: 8px; color: #ef4444; margin: 0;">${otp}</p>
+        </div>
+        <p style="color: #888; font-size: 13px;">It expires in <strong>5 minutes</strong> and can be used once.</p>
+        <p style="color: #666; font-size: 11px; margin-top: 24px; border-top: 1px solid #333; padding-top: 16px;">
+          Didn't ask for this? Ignore this email — your current password still works and nothing has changed.
+        </p>
+      </div>
+    `,
+  });
+}
+
+/**
  * Send an OTP verification email for a sensitive admin/account action.
  */
 export async function sendOTPEmail(to: string, otp: string, actionLabel?: string): Promise<void> {

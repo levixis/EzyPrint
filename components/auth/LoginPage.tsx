@@ -6,6 +6,7 @@ import { Card } from '../common/Card';
 import { Input } from '../common/Input';
 import { Spinner } from '../common/Spinner';
 import { UserType } from '../../types';
+import { authApi } from '../../lib/queries';
 // Firebase removed — logout handled via AppContext
 
 const EzyPrintLogoIconLarge: React.FC = () => (
@@ -33,7 +34,7 @@ const MailIcon: React.FC = () => (
 const SESSION_STORAGE_INTENDED_TYPE_KEY = 'ezyprint_intendedUserType';
 const SESSION_STORAGE_AUTH_METHOD_KEY = 'ezyprint_authMethod';
 
-type LoginStep = 'pathSelection' | 'emailAuth' | 'shopOwnerDetails' | 'confirmGoogleUserName' | 'selectRoleForPendingProfile' | 'processing' | 'accountExists' | 'shopArchived';
+type LoginStep = 'pathSelection' | 'emailAuth' | 'shopOwnerDetails' | 'confirmGoogleUserName' | 'selectRoleForPendingProfile' | 'processing' | 'accountExists' | 'shopArchived' | 'forgotPassword' | 'resetPassword';
 type AuthMode = 'google' | 'email';
 type EmailSubMode = 'signin' | 'signup';
 
@@ -74,6 +75,10 @@ const LoginPage: React.FC = () => {
   const [intendedUserTypeForSignup, setIntendedUserTypeForSignup] = useState<UserType | null>(null);
   const [authMethodForSignup, setAuthMethodForSignup] = useState<'google' | 'email' | null>(null);
   const isCheckingShopOwnerRef = useRef(false);
+
+  const [resetCode, setResetCode] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [isResetBusy, setIsResetBusy] = useState(false);
 
   const clearSessionStorageAuthFlow = () => {
     sessionStorage.removeItem(SESSION_STORAGE_INTENDED_TYPE_KEY);
@@ -270,6 +275,64 @@ const LoginPage: React.FC = () => {
     }
   };
 
+  /**
+   * Ask for a reset code.
+   *
+   * Advances to the code screen regardless of the outcome, and the wording
+   * never claims the address was found. The server answers identically for a
+   * registered and an unregistered address on purpose — reporting "no such
+   * account" here would undo that and turn the login screen into a way to test
+   * which campus addresses are registered.
+   */
+  const handleForgotPasswordRequest = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(''); setMessage('');
+    if (!email.trim()) { setError("Enter the email you sign in with."); return; }
+
+    setIsResetBusy(true);
+    try {
+      await authApi.forgotPassword(email.trim());
+      setResetCode('');
+      setNewPassword('');
+      setStep('resetPassword');
+      setMessage(`If ${email.trim()} has an EzyPrint account, a 6-digit code is on its way. It expires in 5 minutes.`);
+    } catch (err) {
+      // Reaches here for a rate limit or a dead backend — both are worth
+      // showing, and neither reveals whether the account exists.
+      setError(err instanceof Error ? err.message : "Could not send a reset code. Please try again.");
+    } finally {
+      setIsResetBusy(false);
+    }
+  };
+
+  const handleResetPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(''); setMessage('');
+    if (!/^[0-9]{6}$/.test(resetCode.trim())) { setError("Enter the 6-digit code from the email."); return; }
+    // Mirrors the server's rules so a weak password is caught before a round
+    // trip — and, more to the point, before the one-use code is spent on it.
+    if (newPassword.length < 8) { setError("Password must be at least 8 characters."); return; }
+    if (!/[A-Z]/.test(newPassword)) { setError("Password must include at least one uppercase letter."); return; }
+    if (!/[a-z]/.test(newPassword)) { setError("Password must include at least one lowercase letter."); return; }
+    if (!/[0-9]/.test(newPassword)) { setError("Password must include at least one number."); return; }
+    if (!/[^A-Za-z0-9]/.test(newPassword)) { setError("Password must include at least one special character."); return; }
+
+    setIsResetBusy(true);
+    try {
+      await authApi.resetPassword(email.trim(), resetCode.trim(), newPassword);
+      setPassword('');
+      setResetCode('');
+      setNewPassword('');
+      setStep('emailAuth');
+      setEmailSubMode('signin');
+      setMessage("Password updated. Sign in with your new password.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not reset the password. Please try again.");
+    } finally {
+      setIsResetBusy(false);
+    }
+  };
+
   const handleGoogleStudentNameConfirm = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!nameForProfile.trim()) { setError("Name cannot be empty."); return; }
@@ -381,7 +444,12 @@ const LoginPage: React.FC = () => {
           </div>
         )}
 
-        {step !== 'processing' && step !== 'shopOwnerDetails' && step !== 'confirmGoogleUserName' && step !== 'selectRoleForPendingProfile' && (
+        {/*
+          Hidden during the reset flow as well as the profile sub-flows: those
+          screens carry their own way back, and a tab switch mid-reset would
+          silently drop a code the user is holding.
+        */}
+        {step !== 'processing' && step !== 'shopOwnerDetails' && step !== 'confirmGoogleUserName' && step !== 'selectRoleForPendingProfile' && step !== 'forgotPassword' && step !== 'resetPassword' && (
           <div className="flex border-b border-brand-muted/30 mb-1">
             <button
               onClick={() => switchAuthUIMode('google')}
@@ -427,6 +495,14 @@ const LoginPage: React.FC = () => {
                 <Button type="button" onClick={handleEmailPasswordSignIn} variant="primary" size="lg" fullWidth className="mt-5" leftIcon={<MailIcon />}>
                   Sign In
                 </Button>
+                <p className="text-center text-xs my-3">
+                  <button
+                    onClick={() => { setStep('forgotPassword'); setError(''); setMessage(''); }}
+                    className="font-semibold text-brand-primary hover:underline focus:outline-none"
+                  >
+                    Forgot password?
+                  </button>
+                </p>
                 <p className="text-center text-xs text-gray-500 dark:text-gray-400 my-3">
                   Don't have an account?{' '}
                   <button onClick={() => { setEmailSubMode('signup'); setError(''); }} className="font-semibold text-brand-primary hover:underline focus:outline-none">
@@ -454,6 +530,111 @@ const LoginPage: React.FC = () => {
               </>
             )}
           </div>
+        )}
+
+        {step === 'forgotPassword' && (
+          <form onSubmit={handleForgotPasswordRequest} className="space-y-4 p-4 pt-6">
+            <h2 className="text-xl font-semibold text-gray-900 dark:text-white text-center mb-1">Reset your password</h2>
+            <p className="text-sm text-gray-500 dark:text-gray-400 text-center mb-3">
+              We'll email you a 6-digit code.
+            </p>
+
+            {/*
+              The Google route first. Most people here signed up with Google and
+              have no password to reset — signing in is one tap and needs no
+              email at all. Offering the code to them anyway would be a slower
+              answer to a question they do not have.
+            */}
+            <div className="p-3 rounded-md bg-status-info/10 border border-status-info/30">
+              <p className="text-xs text-gray-600 dark:text-gray-300">
+                <strong className="text-gray-900 dark:text-white">Signed up with Google?</strong>{' '}
+                You don't have a password — just use Google and you're in.
+              </p>
+              <Button
+                type="button"
+                onClick={() => signInWithGoogle()}
+                variant="secondary"
+                size="sm"
+                fullWidth
+                className="mt-2"
+                leftIcon={<GoogleIcon />}
+              >
+                Sign in with Google
+              </Button>
+            </div>
+
+            <Input
+              label="Email Address"
+              id="forgotEmail"
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="you@example.com"
+              required
+            />
+            <Button type="submit" variant="primary" size="lg" fullWidth disabled={isResetBusy} leftIcon={<MailIcon />}>
+              {isResetBusy ? 'Sending…' : 'Send reset code'}
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              fullWidth
+              className="!text-xs"
+              onClick={() => { setStep('emailAuth'); setEmailSubMode('signin'); setError(''); setMessage(''); }}
+            >
+              Back to sign in
+            </Button>
+          </form>
+        )}
+
+        {step === 'resetPassword' && (
+          <form onSubmit={handleResetPassword} className="space-y-4 p-4 pt-6">
+            <h2 className="text-xl font-semibold text-gray-900 dark:text-white text-center mb-1">Enter your code</h2>
+            <p className="text-sm text-gray-500 dark:text-gray-400 text-center mb-3">
+              Check your inbox — and your spam folder.
+            </p>
+            <Input
+              label="6-digit code"
+              id="resetCode"
+              type="text"
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              maxLength={6}
+              value={resetCode}
+              onChange={(e) => setResetCode(e.target.value.replace(/[^0-9]/g, ''))}
+              placeholder="123456"
+              required
+            />
+            <Input
+              label="New Password"
+              id="newPassword"
+              type="password"
+              value={newPassword}
+              onChange={(e) => setNewPassword(e.target.value)}
+              placeholder="••••••••"
+              required
+            />
+            <p className="text-xs text-gray-500 dark:text-gray-400">
+              At least 8 characters, with an uppercase and lowercase letter, a number and a symbol.
+            </p>
+            <p className="text-xs text-gray-500 dark:text-gray-400">
+              Resetting signs you out on every device.
+            </p>
+            <Button type="submit" variant="primary" size="lg" fullWidth disabled={isResetBusy}>
+              {isResetBusy ? 'Updating…' : 'Set new password'}
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              fullWidth
+              className="!text-xs"
+              onClick={() => { setStep('forgotPassword'); setError(''); setMessage(''); }}
+            >
+              Didn't get a code? Send another
+            </Button>
+          </form>
         )}
 
         {step === 'selectRoleForPendingProfile' && pendingFirebaseProfileCreationUser && (

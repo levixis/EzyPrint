@@ -51,6 +51,18 @@ export const authApi = {
   googleAuth: (data: { idToken: string; userType?: 'STUDENT' | 'SHOP_OWNER'; shopName?: string; shopAddress?: string; referralCode?: string; }) =>
     api.post<AuthTokens | { isNewUser: true; email: string; name: string }>('/auth/google', data),
 
+  /**
+   * Ask for a reset code. Succeeds whether or not the address has an account —
+   * the server answers identically on purpose, so never present the result as
+   * confirmation that the email is registered.
+   */
+  forgotPassword: (email: string) =>
+    api.post<{ message: string }>('/auth/forgot-password', { email }),
+
+  /** Set a new password with the emailed code. Signs the account out everywhere. */
+  resetPassword: (email: string, otp: string, password: string) =>
+    api.post<{ message: string }>('/auth/reset-password', { email, otp, password }),
+
   refresh: (refreshToken: string) =>
     api.post<{ tokens: { accessToken: string; refreshToken: string } }>('/auth/refresh', { refreshToken }),
 

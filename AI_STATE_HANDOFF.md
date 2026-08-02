@@ -1,5 +1,5 @@
 # AI STATE HANDOFF
-> **STATUS**: Green | **LAST UPDATE**: 2026-08-02 | **TESTS**: 223 server + 123 web | **TSC**: 0 errors (server + web) | **BUILD**: passing | **ANDROID**: compiles
+> **STATUS**: Green | **LAST UPDATE**: 2026-08-02 | **TESTS**: 234 server + 123 web | **TSC**: 0 errors (server + web) | **BUILD**: passing | **ANDROID**: compiles
 
 ## 1. METADATA & TECH STACK
 * **Project**: EzyPrint — campus print-order marketplace (students → shops)
@@ -265,10 +265,57 @@ Support was the least-exercised surface in the app and had four independent brea
   frame**. "Open original" is the fallback. The fix, if it bites, is routing PDFs
   straight to a new tab on iOS rather than embedding.
 
+## 5j. A FORGOTTEN PASSWORD WAS A LOST ACCOUNT
+
+There was no reset anywhere — no endpoint, no link on the login screen, no
+`changePassword`. The only way back in was accidental: `loginWithGoogle` matches
+an existing account by **verified email** as well as `googleId`
+(`auth.service.ts:375`), so a Google user signs in past their own forgotten
+password. That covers people on a Google address and nobody else. In production
+every student and the admin were Google; the **one account with a password was
+the shop owner**, which is the account that holds money and requests payouts.
+
+`server/src/services/passwordReset.service.ts`, `POST /auth/forgot-password` and
+`POST /auth/reset-password`.
+
+* **A 6-digit code, not a reset link.** The app ships as a Capacitor Android
+  build as well as web, and a link in an email opens the phone's browser, not
+  the app — a link needs deep-link plumbing plus a hosted landing page to serve
+  one flow. A typed code works identically everywhere, and reuses `otp.service`,
+  which is already hardened: hashed at rest, single-use via one atomic
+  conditional DELETE, 3 wrong guesses then a 15-minute lockout.
+* **Both endpoints are enumeration-safe.** `forgot-password` answers 200 for an
+  address with no account, and swallows mail-delivery failures, because "we
+  could not send to that address" is the same disclosure by another route. An
+  unknown address given to `reset-password` throws the *exact* message
+  `consumeOtp` gives for an account that never requested one. Otherwise the
+  login screen becomes a way to test which of 30,000 campus addresses are
+  registered.
+* **A reset revokes every refresh token, in the same transaction as the password
+  write.** People reset precisely because they think someone else has their
+  password; that someone is signed in holding a refresh token which keeps
+  working forever regardless. Split across two round trips, a crash between them
+  leaves the password changed and the intruder's session alive.
+* **No tokens are returned** — a successful reset does not sign you in. Reaching
+  the inbox proves the account is yours, not that the device should be trusted.
+* `passwordResetLimiter` — **3/hour keyed on the target address**, much tighter
+  than `authLimiter`'s 20/15min and for a different threat: this endpoint makes
+  us send mail to an address an anonymous caller names, so the abuse is inbox
+  flooding and burning the provider's reputation, not credential guessing.
+  `reset-password` is deliberately *not* behind it, since submitting a code
+  sends no mail and the OTP lockout already bounds guessing.
+* Google-only accounts are allowed through, which sets a password where there
+  was none. That grants nothing: the code goes to the inbox, and whoever holds
+  the inbox already controls the Google account. Refusing them would mean
+  answering differently depending on how an account authenticates.
+* **Blocked on the domain.** `onboarding@resend.dev` only delivers to the Resend
+  account owner, so until a domain is verified this flow works for exactly one
+  mailbox. Same blocker as the payout/deletion OTPs.
+
 ## 6. VERIFICATION
 
 ```bash
-cd server && npm test          # 223/223
+cd server && npm test          # 234/234
 cd server && npx tsc --noEmit  # 0 errors
 npm test                       # 123/123 (web, vitest)
 npx tsc --noEmit               # 0 errors (web)
@@ -288,13 +335,18 @@ indexes match exactly, and zero `DOUBLE PRECISION` columns remain.
    `refund.processed` and `refund.failed` have **zero rows** despite three
    `RESOLVED_REFUNDED` refund requests. Either they are not ticked in the
    dashboard or those refunds never reached the gateway. Check both.
-2. [ ] Razorpay is still on `rzp_test_` keys.
-3. [ ] **Render's free tier sleeps, and a sleeping instance runs no scheduler** —
+2. [ ] **Buy and verify a domain with Resend (~₹800/yr).** `onboarding@resend.dev`
+   delivers *only* to the Resend account owner, so every emailed code reaches one
+   mailbox and nobody else: password resets (§5j), payout OTPs, account-deletion
+   OTPs. Three shipped features are inert until this is done — this is the
+   cheapest unblock on the list.
+3. [ ] Razorpay is still on `rzp_test_` keys.
+4. [ ] **Render's free tier sleeps, and a sleeping instance runs no scheduler** —
    settlement, reconciliation and the outbox dispatcher silently stop. It also
    blocks outbound SMTP on ports 25/465/587 — which is why OTP mail goes over
    Resend's HTTP API (`email.service.ts`) rather than Gmail SMTP — and drops the
    first request after idle. The $7 Starter plan is the fix for all three.
-4. [x] ~~Delete `.github/workflows/deploy.yml` and the legacy `functions/` +
+5. [x] ~~Delete `.github/workflows/deploy.yml` and the legacy `functions/` +
    `firestore.rules` / `storage.rules`.~~ **Done — repo side only.** Removed:
    `functions/`, `firestore.rules`, `firestore.indexes.json`, `storage.rules`,
    `database.rules.json`, `firebase.json`, `.firebaserc`, `.firebase/`,
@@ -323,16 +375,16 @@ indexes match exactly, and zero `DOUBLE PRECISION` columns remain.
    Auth, Storage, Hosting. **Do not delete the Google Cloud project** — it holds
    the FCM registration and the Google Sign-In OAuth client IDs
    (`283831997162-…`) that `GOOGLE_CLIENT_IDS` and `capacitor.config.ts` depend on.
-5. [ ] Delete `server/.env.render` — a stale config pointing at a **non-pooled**
+6. [ ] Delete `server/.env.render` — a stale config pointing at a **non-pooled**
    Neon endpoint. It is not what the live service uses; do not copy it as-is.
-6. [ ] No CI runs either test suite. Both pass locally and nothing enforces that.
-7. [ ] `contexts/AppContext.tsx` (~1700 lines) has no tests — and it is where the
+7. [ ] No CI runs either test suite. Both pass locally and nothing enforces that.
+8. [ ] `contexts/AppContext.tsx` (~1700 lines) has no tests — and it is where the
    blank-page bugs in §5h originated.
-8. [ ] Rotate the Neon password on the `pre-paise-backup` branch; it still holds
+9. [ ] Rotate the Neon password on the `pre-paise-backup` branch; it still holds
    the pre-rotation credential.
-9. [ ] Verify PDF preview on iOS Safari (§5i) before telling students it works
-   there.
-10. [ ] **`server/ezyyprint-firebase-adminsdk-fcm.json` is the only copy** of the
+10. [ ] Verify PDF preview on iOS Safari (§5i) before telling students it works
+    there.
+11. [ ] **`server/ezyyprint-firebase-adminsdk-fcm.json` is the only copy** of the
     FCM service-account key (gitignored by `*-firebase-adminsdk-*.json`). A
     service account private key cannot be re-downloaded, only re-minted. Back it
     up somewhere that is not this laptop.
