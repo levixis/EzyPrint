@@ -643,6 +643,17 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
                       placeholder={`Max ${formatMoney(redeemableAmount)}`}
                       className="w-full p-2.5 rounded-lg bg-white dark:bg-zinc-800 border border-gray-300 dark:border-zinc-600 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
                     />
+                    {/*
+                      A suggestion, not a rule — nothing validates against it and
+                      nothing blocks on it. Each transfer costs us a flat fee, so
+                      a stream of tiny withdrawals costs more to send than it
+                      moves; letting the shop see that is enough. Enforcing a
+                      floor would strand a shop whose balance is genuinely under
+                      it, which is a worse outcome than an uneconomic transfer.
+                    */}
+                    <p className="mt-1 text-[11px] text-gray-500 dark:text-gray-400">
+                      Payouts are usually requested in amounts of ₹500 or more.
+                    </p>
                   </div>
                   <div>
                     <label htmlFor="payoutNote" className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Note (optional)</label>

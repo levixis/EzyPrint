@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import rateLimit from 'express-rate-limit';
 import type { Request } from 'express';
 import { env } from '../config/env';
@@ -43,19 +44,81 @@ function clientKey(req: Request): string {
 }
 
 /** Key on the authenticated user when there is one, otherwise the client address. */
-function userOrClientKey(req: Request): string {
+export function userOrClientKey(req: Request): string {
   const userId = (req as Request & { user?: { userId?: string } }).user?.userId;
   return userId ? `user:${userId}` : `ip:${clientKey(req)}`;
 }
 
 /**
+ * Key on the bearer token presented, otherwise the client address.
+ *
+ * `userOrClientKey` is useless to any limiter mounted app-wide, because those
+ * run before `authenticate` and `req.user` does not exist yet. The token itself
+ * is available at that point, and it identifies a session as well as the user
+ * id it decodes to.
+ *
+ * Hashed, so a bucket key is never a credential — rate-limit state is held in
+ * memory and surfaced in logs and headers, and a raw JWT has no business in any
+ * of them.
+ *
+ * The token is not verified here, so a caller could mint gibberish tokens to
+ * get fresh buckets. That trade is worth taking: those requests die at
+ * `authenticate` with a 401 a moment later, whereas the alternative — one
+ * bucket per address — throttles an entire campus behind one NAT address to a
+ * hundred requests between them. Volumetric attacks are the platform's job,
+ * not this middleware's.
+ */
+export function tokenOrClientKey(req: Request): string {
+  const header = req.headers.authorization;
+  if (header?.startsWith('Bearer ')) {
+    const token = header.slice(7).trim();
+    if (token) {
+      return `tok:${crypto.createHash('sha256').update(token).digest('hex').slice(0, 32)}`;
+    }
+  }
+  return `ip:${clientKey(req)}`;
+}
+
+/**
+ * Whether a path is a liveness probe, which must never be throttled.
+ *
+ * Matched exactly rather than by substring: `/v1/shops/health-clinic` is a real
+ * endpoint and must stay counted.
+ *
+ * `path` is relative to where the limiter is mounted ('/api/'), which is why
+ * these start at '/v1'.
+ */
+export function isHealthCheckPath(path: string): boolean {
+  return path === '/v1/health' || path.startsWith('/v1/health/');
+}
+
+/**
  * General API rate limiter — 100 requests per 15 minutes.
- * Protects against abuse without affecting normal users.
+ *
+ * Keyed on the caller's session token, falling back to the address only for
+ * callers we cannot identify. Keying on the address alone is wrong for this
+ * product in a way that would have surfaced on day one: a campus puts its
+ * entire student body behind one institutional NAT address, so a shared bucket
+ * is 100 requests per fifteen minutes for thirty thousand people between them.
+ * The first busy hour would have looked like an outage, and the logs would have
+ * blamed the students for abuse.
+ *
+ * Unauthenticated traffic still shares by address, which is correct — that is
+ * mostly login and registration, and those have their own limiter keyed on the
+ * target account.
+ *
+ * Health checks are exempt. Render probes liveness far more often than once
+ * every nine seconds, so the probe alone exhausted the shared bucket; the
+ * platform then read our own 429 as the service being unhealthy and killed the
+ * instance. A liveness probe answering "too many requests" is not a signal
+ * anyone wants — it makes the limiter an outage rather than a protection.
  */
 export const generalLimiter = rateLimit({
   ...shared,
   windowMs: 15 * 60 * 1000,
   max: env.isDev ? 1000 : 100,
+  keyGenerator: tokenOrClientKey,
+  skip: (req: Request) => isHealthCheckPath(req.path),
   message: {
     success: false,
     message: 'Too many requests. Please try again after 15 minutes.',
