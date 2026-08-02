@@ -7,7 +7,11 @@ import * as shopController from '../controllers/shop.controller';
 const router = Router();
 
 router.get('/', optionalAuthenticate, shopController.listShops);
-router.get('/:shopId', shopController.getShop);
+// `optionalAuthenticate`, not none: an anonymous caller still gets the public
+// view of a shop, but a signed-in owner or admin is identified so the service
+// can widen the projection. Previously this had no authentication at all and
+// returned payout methods and balances to anyone holding a shop id.
+router.get('/:shopId', optionalAuthenticate, shopController.getShop);
 router.patch('/:shopId', authenticate, authorize('SHOP_OWNER', 'ADMIN'), validate(updateShopSchema), shopController.updateShopSettings);
 router.patch('/:shopId/approve', authenticate, authorize('ADMIN'), shopController.approveShop);
 router.patch('/:shopId/archive', authenticate, authorize('ADMIN'), validate(archiveShopSchema), shopController.archiveShop);

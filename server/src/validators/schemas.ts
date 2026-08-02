@@ -113,7 +113,25 @@ export const googleAuthSchema = z.object({
     shopName: z.string().min(1).max(200).optional(),
     shopAddress: z.string().min(1).max(500).optional(),
     referralCode: z.string().min(1).max(50).optional(),
-  }),
+  }).refine(
+    (data) => {
+      // `userType` is optional here in a way it is not on the password path: an
+      // existing user signing in sends none, and a new user who has not chosen
+      // yet is answered with `isNewUser` so the app can ask. Only a caller
+      // declaring themselves a shop owner has to bring the shop with them.
+      //
+      // Without this, a Google signup naming SHOP_OWNER and a referral code but
+      // no shop name or address created the user and silently skipped the shop
+      // — `if (userType === 'SHOP_OWNER' && shopName && shopAddress && ...)`.
+      // The result was an owner account with no shop, which every route that
+      // scopes by `shop.id` then has to defend against individually.
+      if (data.userType === 'SHOP_OWNER') {
+        return !!data.shopName && !!data.shopAddress && !!data.referralCode;
+      }
+      return true;
+    },
+    { message: 'Shop name, address, and referral code are required for SHOP_OWNER registration' }
+  ),
 });
 
 export const refreshSchema = z.object({

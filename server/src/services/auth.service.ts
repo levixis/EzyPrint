@@ -88,10 +88,12 @@ export async function registerWithEmail(
   // Create user (and shop if SHOP_OWNER) in a transaction
   let shopId: string | undefined = undefined;
   const user = await prisma.$transaction(async (tx) => {
-    // If registering as shop owner, validate and redeem the referral code atomically
+    // If registering as shop owner, validate and redeem the referral code
+    // atomically. All three are required, matching the guard on the shop
+    // creation below — see the note on the Google path.
     if (type === 'SHOP_OWNER') {
-      if (!referralCode) {
-        throw ApiError.badRequest('A referral code is required to open a shop.');
+      if (!referralCode || !shopName || !shopAddress) {
+        throw ApiError.badRequest('A shop name, address, and referral code are required to open a shop.');
       }
     }
 
@@ -409,8 +411,13 @@ export async function loginWithGoogle(
     // Create new user (and shop if applicable) inside a transaction
     user = (await prisma.$transaction(async (tx) => {
       if (userType === 'SHOP_OWNER') {
-        if (!referralCode) {
-          throw ApiError.badRequest('A referral code is required to open a shop.');
+        // All three, not just the code. The shop creation below is guarded on
+        // the same three values, so checking only `referralCode` here let a
+        // request with a code but no shop name fall through and create an owner
+        // account with no shop — a state every shop-scoped route then has to
+        // defend against, and one of them did not.
+        if (!referralCode || !shopName || !shopAddress) {
+          throw ApiError.badRequest('A shop name, address, and referral code are required to open a shop.');
         }
       }
 

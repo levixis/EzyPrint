@@ -18,7 +18,13 @@ export async function listShops(req: Request, res: Response, next: NextFunction)
 
 export async function getShop(req: Request, res: Response, next: NextFunction) {
   try {
-    const shop = await shopService.getShopById(req.params.shopId as string);
+    // Behind `optionalAuthenticate`, so `req.user` is present for a signed-in
+    // caller and absent otherwise. The service narrows the projection when it
+    // cannot establish that the caller owns the shop.
+    const shop = await shopService.getShopById(
+      req.params.shopId as string,
+      req.user ? { userId: req.user.userId, userType: req.user.userType } : undefined
+    );
     res.json({ success: true, data: { shop } });
   } catch (error) { next(error); }
 }

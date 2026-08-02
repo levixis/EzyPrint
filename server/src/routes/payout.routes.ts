@@ -10,6 +10,7 @@ import * as otpService from '../services/otp.service';
 import * as realtimeService from '../services/realtime.service';
 import * as notifyService from '../services/notify.service';
 import { sensitiveLimiter } from '../middleware/rateLimiter';
+import { clampListLimit } from '../utils/pagination';
 import { prisma } from '../utils/prisma';
 import type { Prisma, PayoutStatus } from '@prisma/client';
 
@@ -174,19 +175,49 @@ async function getShopOwnerId(shopId: string): Promise<string> {
   return shop.ownerUserId;
 }
 
+/**
+ * Which payouts this caller may read.
+ *
+ * Exported because it is an access-control decision, and the way it failed was
+ * invisible at a glance: it was `whereClause.shopId = shop?.id`, and Prisma
+ * drops an `undefined` from a where clause rather than matching nothing. So an
+ * owner with no shop row did not get an empty list — they got an unfiltered
+ * query, and read back every payout in the system: amounts, shop ids, admin
+ * notes. A SHOP_OWNER without a shop was reachable, not hypothetical; the
+ * Google signup path created exactly that.
+ *
+ * Fails closed, like the request and cancel routes below already do.
+ */
+export function payoutScopeFor(
+  userType: string | undefined,
+  ownShop: { id: string } | null,
+  requestedShopId?: string
+): { shopId?: string } {
+  if (userType === 'SHOP_OWNER') {
+    if (!ownShop) throw ApiError.notFound('Shop not found');
+    return { shopId: ownShop.id };
+  }
+
+  // Admin: optionally narrowed to one shop, otherwise everything, which is the
+  // point of the role.
+  return requestedShopId ? { shopId: requestedShopId } : {};
+}
+
 // Basic CRUD for payouts
 router.get('/', authenticate, authorize('ADMIN', 'SHOP_OWNER'), async (req, res, next) => {
   try {
-    const limit = Number(req.query.limit) || 20;
+    // Clamped like every other list endpoint (see user/ticket/ledger services).
+    // This one was unbounded, so `?limit=1000000` read out every payout row.
+    const limit = clampListLimit(req.query.limit);
     const shopId = req.query.shopId as string;
-    
-    const whereClause: any = {};
-    if (req.user?.userType === 'SHOP_OWNER') {
-      const shop = await prisma.shop.findUnique({ where: { ownerUserId: req.user.userId } });
-      whereClause.shopId = shop?.id;
-    } else if (shopId) {
-      whereClause.shopId = shopId;
-    }
+
+    const whereClause = payoutScopeFor(
+      req.user?.userType,
+      req.user?.userType === 'SHOP_OWNER'
+        ? await prisma.shop.findUnique({ where: { ownerUserId: req.user.userId } })
+        : null,
+      shopId
+    );
 
     const payouts = await prisma.payout.findMany({
       where: whereClause,
