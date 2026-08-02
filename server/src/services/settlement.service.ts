@@ -76,7 +76,16 @@ export function computeAvailableAt(from: Date = new Date()): Date {
  */
 export async function creditOrderEarning(
   tx: Prisma.TransactionClient,
-  order: { id: string; shopId: string; pageCost: number }
+  order: { id: string; shopId: string; pageCost: number },
+  /**
+   * When the money was earned. Defaults to now, which is right for the live
+   * path where this runs inside the completion itself.
+   *
+   * A backfill passes the order's actual completion time instead. Otherwise
+   * work finished last week would be scheduled to clear tomorrow, and the shop
+   * would wait out our delay on top of its own.
+   */
+  earnedAt: Date = new Date()
 ): Promise<void> {
   if (order.pageCost <= 0) return;
 
@@ -90,7 +99,7 @@ export async function creditOrderEarning(
       createdBy: 'SYSTEM',
       orderId: order.id,
       eventId: `earn:${order.id}`,
-      availableAt: computeAvailableAt(),
+      availableAt: computeAvailableAt(earnedAt),
     },
     tx
   );

@@ -79,6 +79,12 @@ const AdminShopCard: React.FC<AdminShopCardProps> = ({ shop, orders, payouts, on
   // Use canonical ledgerBalance from shop doc when available (accounts for debt, refunds, pending)
   // Fall back to the naive formula only if no ledger data exists
   const pendingAmount = Math.max(0, shop.ledgerBalance ?? (totalRevenue - totalPaidOut));
+  // Money earned but still inside the settlement window — withdrawable later,
+  // not now. Shown beside the withdrawable figure because the two together are
+  // what the shop is actually owed; `pendingAmount` alone reads as the whole
+  // debt and is always smaller than lifetime revenue, which invites the
+  // question of where the rest went.
+  const clearingAmount = Math.max(0, shop.pendingBalance ?? 0);
   const totalOrders = shopAggregate?.totalOrders ?? shopOrders.length;
   const activeOrderCount = shopAggregate?.activeOrders ?? activeOrders.length;
 
@@ -192,7 +198,10 @@ const AdminShopCard: React.FC<AdminShopCardProps> = ({ shop, orders, payouts, on
             </div>
             <div className="bg-green-50 dark:bg-green-900/20 rounded-lg p-3 text-center">
               <p className="text-2xl font-bold text-green-600 dark:text-green-400">{formatMoney(totalRevenue)}</p>
-              <p className="text-xs text-gray-500 dark:text-gray-400">Revenue</p>
+              {/* Lifetime and gross: it counts every paid order's page cost and
+                  never subtracts refunds, cancellations or payouts, so it will
+                  not tally with the balances below and should not claim to. */}
+              <p className="text-xs text-gray-500 dark:text-gray-400">Lifetime Earned (gross)</p>
             </div>
             <div className="bg-amber-50 dark:bg-amber-900/20 rounded-lg p-3 text-center">
               <p className="text-2xl font-bold text-amber-600 dark:text-amber-400">{activeOrderCount}</p>
@@ -200,8 +209,19 @@ const AdminShopCard: React.FC<AdminShopCardProps> = ({ shop, orders, payouts, on
             </div>
             <div className="bg-rose-50 dark:bg-rose-900/20 rounded-lg p-3 text-center">
               <p className="text-2xl font-bold text-rose-600 dark:text-rose-400">{formatMoney(pendingAmount)}</p>
-              <p className="text-xs text-gray-500 dark:text-gray-400">Pending Due</p>
+              <p className="text-xs text-gray-500 dark:text-gray-400">Available to Withdraw</p>
             </div>
+          </div>
+        )}
+
+        {/* Shown separately from the grid because it answers a different
+            question: not "what can they take out now" but "what is still on its
+            way". Without it the card looks like it has lost money whenever an
+            earning is mid-settlement. */}
+        {shop.isApproved && clearingAmount > 0 && (
+          <div className="flex items-center justify-between text-xs bg-gray-50 dark:bg-zinc-800/60 rounded-lg px-3 py-2 mb-4">
+            <span className="text-gray-500 dark:text-gray-400">Clearing (not yet withdrawable)</span>
+            <span className="font-semibold text-gray-700 dark:text-gray-200">{formatMoney(clearingAmount)}</span>
           </div>
         )}
 
