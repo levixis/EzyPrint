@@ -117,10 +117,36 @@ function refreshTokenOnce(): Promise<boolean> {
 }
 
 // ── Core fetch wrapper ──
+/**
+ * Whether a failed request may safely be sent again.
+ *
+ * A network failure tells us nothing about whether the server processed the
+ * request — only that we never heard back. Replaying a POST on that basis is
+ * how one payout request becomes two, and how a refresh whose rotation already
+ * landed presents a consumed token, trips reuse detection and revokes every
+ * session the user has.
+ *
+ * Reads are different: nothing changes on the server, so a second attempt costs
+ * a round trip and nothing else. That covers the case this exists for — a
+ * dashboard where every panel failed at once because the backend was
+ * mid-deploy.
+ *
+ * Writes deliberately do not retry. The user retries those, because only they
+ * can judge whether it is safe to.
+ */
+function isReplayable(method: string): boolean {
+  const verb = method.toUpperCase();
+  return verb === 'GET' || verb === 'HEAD';
+}
+
+/** How long to wait before the single retry. Long enough to clear a blip. */
+const RETRY_DELAY_MS = 500;
+
 async function apiFetch<T = unknown>(
   path: string,
   options: RequestInit = {},
-  retry = true
+  retry = true,
+  networkRetry = true
 ): Promise<T> {
   const url = `${API_BASE}${path}`;
 
@@ -155,7 +181,20 @@ async function apiFetch<T = unknown>(
   try {
     res = await fetch(url, { ...options, headers, signal: controller.signal });
   } catch (err) {
-    if (err instanceof DOMException && err.name === 'AbortError') {
+    clearTimeout(timer);
+
+    const timedOut = err instanceof DOMException && err.name === 'AbortError';
+    // `fetch` rejects with a TypeError when the request never completed at all
+    // — DNS, connection refused, or a response the browser discarded for want
+    // of CORS headers, which is what a Render instance mid-deploy produces.
+    const neverArrived = timedOut || err instanceof TypeError;
+
+    if (neverArrived && networkRetry && isReplayable(options.method ?? 'GET')) {
+      await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+      return apiFetch<T>(path, options, retry, false);
+    }
+
+    if (timedOut) {
       throw new ApiError(
         'The server did not respond. Please check your connection and try again.',
         408,
@@ -163,9 +202,8 @@ async function apiFetch<T = unknown>(
       );
     }
     throw err;
-  } finally {
-    clearTimeout(timer);
   }
+  clearTimeout(timer);
 
   // 401 → try refresh → retry once
   // But NOT for auth endpoints — a 401 on /auth/login means invalid credentials,
@@ -174,7 +212,9 @@ async function apiFetch<T = unknown>(
   if (res.status === 401 && retry && !isAuthEndpoint) {
     const refreshed = await refreshTokenOnce();
     if (refreshed) {
-      return apiFetch<T>(path, options, false);
+      // Network retry is granted afresh: the refreshed call is a new attempt
+      // and deserves the same tolerance for a blip as the first one.
+      return apiFetch<T>(path, options, false, true);
     }
     clearTokens();
     throw new ApiError('Session expired. Please log in again.', 401, 'AUTH_EXPIRED');
