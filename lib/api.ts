@@ -137,7 +137,35 @@ async function apiFetch<T = unknown>(
     headers['Authorization'] = `Bearer ${accessToken}`;
   }
 
-  const res = await fetch(url, { ...options, headers });
+  // Nothing here had a deadline, and `fetch` without a signal waits forever. A
+  // server that accepts a request and never answers — an SMTP call with no
+  // timeout of its own, say — left the button that started it spinning
+  // permanently, with no error and no way back except reloading the page.
+  //
+  // Generous rather than tight: a cold Render instance genuinely takes ~30s to
+  // answer its first request, and timing that out would break the first action
+  // after any quiet period. Uploads get longer still, since they are bounded by
+  // the student's connection rather than by us.
+  const isUpload = options.body instanceof FormData;
+  const timeoutMs = isUpload ? 180_000 : 45_000;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  let res: Response;
+  try {
+    res = await fetch(url, { ...options, headers, signal: controller.signal });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw new ApiError(
+        'The server did not respond. Please check your connection and try again.',
+        408,
+        'TIMEOUT'
+      );
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 
   // 401 → try refresh → retry once
   // But NOT for auth endpoints — a 401 on /auth/login means invalid credentials,

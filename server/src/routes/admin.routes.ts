@@ -39,7 +39,18 @@ router.post('/otp', authenticate, otpRequestLimiter, async (req: Request, res: R
       return;
     }
 
-    await sendOTPEmail(user.email, otp, actionId);
+    try {
+      await sendOTPEmail(user.email, otp, actionId);
+    } catch (mailError) {
+      // Surfaced as itself rather than a bare 500. The admin is staring at a
+      // verification dialog, and "internal server error" reads as a wrong code
+      // or a broken payout — sending them to look at the wrong thing entirely.
+      console.error('[admin/otp] could not send OTP email:', mailError);
+      throw ApiError.internal(
+        'Could not send the verification email. Check GMAIL_USER and GMAIL_APP_PASSWORD on the server, then try again.'
+      );
+    }
+
     res.json({ success: true, message: 'OTP sent successfully.' });
   } catch (error) {
     next(error);

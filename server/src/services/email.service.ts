@@ -14,6 +14,17 @@ function getTransporter(): nodemailer.Transporter {
         user: env.GMAIL_USER,
         pass: env.GMAIL_APP_PASSWORD,
       },
+      // Nodemailer's defaults are minutes long — two for a connection, ten for
+      // a socket. The OTP request awaits this before it answers, so an SMTP
+      // connection that stalls left the admin's "Sending OTP…" button spinning
+      // with no error, and the request holding a worker the whole time.
+      //
+      // Ten seconds is far longer than Gmail needs when it is reachable, and
+      // short enough that failure arrives while the admin is still looking at
+      // the screen.
+      connectionTimeout: 10_000,
+      greetingTimeout: 10_000,
+      socketTimeout: 15_000,
     });
   }
   return transporter;
