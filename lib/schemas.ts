@@ -126,6 +126,78 @@ export const refundRequestSchema = z.object({
 }).loose();
 
 // ──────────────────────────────────────────────
+// ADMIN COLLECTIONS
+// ──────────────────────────────────────────────
+
+/**
+ * Users, as the admin screens list them.
+ *
+ * The Student Pass panel reads this endpoint and maps over the result, so an
+ * absent `users` key blanks that tab.
+ */
+export const userSchema = z.object({
+  id: z.string(),
+  name: z.string().optional(),
+  email: z.string().optional(),
+  type: z.string().optional(),
+  studentPassActivatedAt: z.string().nullable().optional(),
+  studentPassPaymentId: z.string().nullable().optional(),
+}).loose();
+
+/** Referral codes, mapped over in the admin referrals screen. */
+export const referralCodeSchema = z.object({
+  id: z.string(),
+  code: z.string(),
+  usedBy: z.string().nullable().optional(),
+  usedAt: isoDate.nullable().optional(),
+  expiresAt: isoDate.nullable().optional(),
+}).loose();
+
+/**
+ * Shop reactivation requests.
+ *
+ * This endpoint returned its array at the top level and was typed straight into
+ * `ReactivationRequest[]` with nothing between — the only collection left with
+ * no defence of any kind, and it renders on the admin dashboard.
+ */
+export const reactivationRequestSchema = z.object({
+  id: z.string(),
+  shopId: z.string(),
+  shopName: z.string().catch('Unknown shop'),
+  status: z.string(),
+  requestedAt: isoDate.optional(),
+  rejectionReason: z.string().nullable().optional(),
+}).loose();
+
+// ──────────────────────────────────────────────
+// NOTIFICATIONS
+// ──────────────────────────────────────────────
+
+/**
+ * The bell.
+ *
+ * Its list is spread into an array alongside the session-local toasts
+ * (`[...localNotifications, ...serverNotifications]`) and then sorted on
+ * `timestamp`. Spreading `undefined` throws, so an endpoint that answered
+ * without a `notifications` key would take out every screen that renders the
+ * header — which is all of them.
+ *
+ * `timestamp` is defaulted rather than optional because the sort reads it
+ * unconditionally, and `new Date(undefined)` sorts as NaN, which silently
+ * scrambles the order rather than failing.
+ */
+export const notificationSchema = z.object({
+  id: z.string(),
+  message: z.string().catch(''),
+  timestamp: isoDate.catch(() => new Date(0).toISOString()),
+  read: z.boolean().catch(false),
+  type: z.string().optional(),
+  orderId: z.string().nullable().optional(),
+  targetUserId: z.string().nullable().optional(),
+  targetShopId: z.string().nullable().optional(),
+}).loose();
+
+// ──────────────────────────────────────────────
 // PARSING
 // ──────────────────────────────────────────────
 
@@ -150,7 +222,55 @@ export function parseResponse<T>(schema: z.ZodType<T>, data: unknown, context: s
   return data as T;
 }
 
-/** Parse a list response, dropping nothing and defaulting to empty. */
+/**
+ * Parse a list response, keeping every row that is usable.
+ *
+ * This was `parseResponse(z.array(schema).catch([]), ...)`, which had two
+ * problems that only show up together.
+ *
+ * The `.catch([])` recovered *before* `parseResponse` could inspect the
+ * failure, so nothing was ever logged — list drift was silent, which is the
+ * opposite of this module's first stated job.
+ *
+ * And zod validates an array as a unit: one unusable row failed the whole
+ * parse, and the catch then replaced *every* row with none. A single malformed
+ * ledger entry emptied a shop's entire ledger, so the dashboard showed no
+ * activity and "Today's Earnings ₹0" with nothing in the console. That is worse
+ * than the crash this module exists to prevent, because a crash gets noticed
+ * and an empty page that should not be empty does not.
+ *
+ * Row by row instead: good rows survive their neighbours, bad ones are dropped
+ * with their index and the reason, and the result is always an array.
+ */
 export function parseListResponse<T>(schema: z.ZodType<T>, data: unknown, context: string): T[] {
-  return parseResponse(z.array(schema).catch([]), data, context);
+  if (!Array.isArray(data)) {
+    console.error(
+      `[api] ${context}: expected a list, received ${data === null ? 'null' : typeof data}. ` +
+      `Rendering as empty.`
+    );
+    return [];
+  }
+
+  const kept: T[] = [];
+  const dropped: string[] = [];
+
+  data.forEach((row, index) => {
+    const result = schema.safeParse(row);
+    if (result.success) {
+      kept.push(result.data);
+      return;
+    }
+    dropped.push(
+      `[${index}] ${result.error.issues.map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`).join('; ')}`
+    );
+  });
+
+  if (dropped.length > 0) {
+    console.error(
+      `[api] ${context}: dropped ${dropped.length} of ${data.length} items that did not match the expected shape.`,
+      dropped
+    );
+  }
+
+  return kept;
 }

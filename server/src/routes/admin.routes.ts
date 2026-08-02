@@ -244,6 +244,27 @@ router.post('/action', authenticate, async (req: Request, res: Response, next: N
 
 // ────────────────────────────────────────────────────────────
 // POST /api/v1/admin/check-returning-shop
+//
+// NOT IMPLEMENTED — answers `{ exists: false }` to everything.
+//
+// The client calls this during Google sign-in (`checkReturningShopOwner` in
+// LoginPage) to spot an owner coming back to an archived shop. Because the
+// answer is a constant, that flow has never once triggered: a returning owner
+// is treated as a brand-new signup.
+//
+// Two things to know before implementing it:
+//
+//  1. It is the only route on this router with no `authenticate`, and it takes
+//     an email. Answering truthfully would turn it into an unauthenticated
+//     oracle for "does this address have an account", against a campus where
+//     the addresses are predictable. Whoever implements it has to decide the
+//     auth story first — the password-reset endpoints next door are
+//     deliberately enumeration-safe and are the precedent to follow.
+//  2. It is reached mid-sign-in, so adding `authenticate` is not free; the
+//     caller's token state at that point needs checking against LoginPage.
+//
+// Left inert rather than half-fixed: a stub that lies consistently is safer
+// than one that leaks, and the lie is at least confined to one feature.
 // ────────────────────────────────────────────────────────────
 router.post('/check-returning-shop', async (_req: Request, res: Response, next: NextFunction) => {
   try {
