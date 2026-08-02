@@ -1,5 +1,7 @@
 import { describe, test, expect } from 'vitest';
 import { LedgerEntryType, LedgerEntryStatus } from '../../types';
+import { sumTodayEarnings, type SummarisableEntry } from '../../utils/ledgerSummary';
+import { startOfTodayIST, msUntilNextIstMidnight } from '../../utils/datetime';
 
 /**
  * "Today's Earnings" against the shop's own ledger.
@@ -14,36 +16,18 @@ import { LedgerEntryType, LedgerEntryStatus } from '../../types';
  * absent, because it makes a shop owner distrust the one that is correct.
  */
 
-interface Entry {
-  type: LedgerEntryType;
-  status: LedgerEntryStatus;
-  amount: number;
-  createdAt: string;
-}
+type Entry = SummarisableEntry;
 
-/** Mirrors the memo in ShopDashboard. */
-function todayEarnings(entries: Entry[], todayStartIso: string): number {
-  const CLAWBACK_TYPES: LedgerEntryType[] = [
-    LedgerEntryType.REFUND_DEDUCTION,
-    LedgerEntryType.CLAWBACK,
-  ];
+/**
+ * The function the dashboard actually calls.
+ *
+ * This test used to hold its own copy of the arithmetic and assert against
+ * that, which passes forever no matter what the dashboard goes on to do. A
+ * test about a money figure has to exercise the figure the shop sees.
+ */
+const todayEarnings = sumTodayEarnings;
 
-  const today = entries.filter(e =>
-    e.status !== LedgerEntryStatus.VOID && e.amount > 0 && e.createdAt >= todayStartIso
-  );
-
-  const earned = today
-    .filter(e => e.type === LedgerEntryType.ORDER_EARNING)
-    .reduce((s, e) => s + e.amount, 0);
-
-  const takenBack = today
-    .filter(e => CLAWBACK_TYPES.includes(e.type))
-    .reduce((s, e) => s + e.amount, 0);
-
-  return Math.max(0, earned - takenBack);
-}
-
-const TODAY = '2026-08-01T18:30:00.000Z'; // local midnight IST, as the dashboard computes it
+const TODAY = '2026-08-01T18:30:00.000Z'; // midnight IST on 2 Aug, which is 18:30 UTC on 1 Aug
 
 const entry = (over: Partial<Entry>): Entry => ({
   type: LedgerEntryType.ORDER_EARNING,
@@ -125,5 +109,72 @@ describe('Boundaries', () => {
 
   test('a shop with no ledger activity shows nothing rather than NaN', () => {
     expect(todayEarnings([], TODAY)).toBe(0);
+  });
+});
+
+/**
+ * Where the day is drawn — the input the sum above trusts completely.
+ *
+ * The dashboard used to compute this as `new Date(y, m, d)`, which is midnight
+ * wherever the device happens to be. Every money boundary the server draws is
+ * midnight IST, so on any device not set to IST the card summed a window up to
+ * a day out of step with the balances printed directly beneath it. On an IST
+ * device the two are identical, which is exactly why nobody caught it.
+ */
+describe('The day is drawn at midnight IST, not on the device', () => {
+  test('an afternoon IST timestamp belongs to that IST day', () => {
+    // 09:51 IST on 2 Aug → the day began at 18:30 UTC on 1 Aug.
+    const start = startOfTodayIST(new Date('2026-08-02T04:21:00.000Z'));
+    expect(start.toISOString()).toBe('2026-08-01T18:30:00.000Z');
+  });
+
+  test('just before IST midnight still belongs to the old day', () => {
+    // 23:59 IST on 2 Aug is 18:29 UTC on 2 Aug.
+    const start = startOfTodayIST(new Date('2026-08-02T18:29:00.000Z'));
+    expect(start.toISOString()).toBe('2026-08-01T18:30:00.000Z');
+  });
+
+  test('just after IST midnight begins the new day', () => {
+    const start = startOfTodayIST(new Date('2026-08-02T18:31:00.000Z'));
+    expect(start.toISOString()).toBe('2026-08-02T18:30:00.000Z');
+  });
+
+  test('the boundary does not move with the device timezone', () => {
+    // The same instant, whatever the host is set to — this is a pure
+    // computation on epoch milliseconds, with no local-time call in it.
+    const instant = new Date('2026-08-02T04:21:00.000Z');
+    expect(startOfTodayIST(instant).getTime()).toBe(Date.parse('2026-08-01T18:30:00.000Z'));
+  });
+
+  test('an entry timestamped between UTC and IST midnight counts as today', () => {
+    // 19:17 UTC on 1 Aug is 00:47 IST on 2 Aug. Under a UTC-drawn boundary this
+    // entry falls on the previous day and vanishes from the card; under the IST
+    // boundary it is today's, which is what the ledger settles it as.
+    const start = startOfTodayIST(new Date('2026-08-02T04:21:00.000Z')).toISOString();
+    expect(todayEarnings([entry({ createdAt: '2026-08-01T19:17:00.000Z' })], start)).toBe(300);
+  });
+});
+
+/**
+ * Rolling over.
+ *
+ * `todayStart` was a `useMemo` with no dependencies, so it was fixed at mount.
+ * A print shop leaves this screen open all day; at 00:01 the card was still
+ * summing yesterday and stayed that way until someone reloaded the page.
+ */
+describe('The window re-arms at the next IST midnight', () => {
+  test('counts down to the coming midnight, not a fixed 24 hours', () => {
+    // 23:00 IST → one hour left in the day.
+    const ms = msUntilNextIstMidnight(new Date('2026-08-02T17:30:00.000Z'));
+    expect(ms).toBe(60 * 60 * 1000);
+  });
+
+  test('a moment after midnight waits nearly a full day', () => {
+    const ms = msUntilNextIstMidnight(new Date('2026-08-02T18:31:00.000Z'));
+    expect(ms).toBe(24 * 60 * 60 * 1000 - 60 * 1000);
+  });
+
+  test('never returns a negative delay, which would fire a timer in a loop', () => {
+    expect(msUntilNextIstMidnight(new Date('2026-08-02T18:30:00.000Z'))).toBeGreaterThan(0);
   });
 });
