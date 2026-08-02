@@ -52,6 +52,29 @@ const getErrorMessage = (err: unknown): string => {
   return 'An unexpected error occurred.';
 };
 
+/**
+ * The password typed at signup, or a clear failure.
+ *
+ * Registration is split across two steps — the form collects email and
+ * password, then the user picks Student or Shop Owner and only then does the
+ * account get created — so the password has to survive on the pending user in
+ * between. Both call sites previously fell back to `''` when it was missing,
+ * which sent an empty password to the server and came back as five simultaneous
+ * strength errors about a password the user had typed perfectly well. Every
+ * detail of that message pointed at the user; none of it pointed at us.
+ *
+ * Failing here instead names the real fault and stops before the request.
+ */
+export function requireSignupPassword(pendingUser: { _tempPassword?: string } | null | undefined): string {
+  const password = pendingUser?._tempPassword;
+  if (!password) {
+    throw new Error(
+      'Your password was not carried through from the previous step. Please enter it again.'
+    );
+  }
+  return password;
+}
+
 interface AppContextType {
   currentUser: User | null;
   isLoadingAuth: boolean;
@@ -204,14 +227,39 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [pendingProfileEmail, setPendingProfileEmail] = useState<string | null>(null);
   const [pendingProfileName, setPendingProfileName] = useState<string | null>(null);
   
-  const [pendingFirebaseProfileCreationUser, setPendingFirebaseProfileCreationUser] = useState<any | null>(null);
-  const [pendingGoogleToken, setPendingGoogleToken] = useState<string | null>(null);
+  const [pendingFirebaseProfileCreationUser, setPendingFirebaseProfileCreationUserState] = useState<any | null>(null);
+  const [pendingGoogleToken, setPendingGoogleTokenState] = useState<string | null>(null);
 
   // Refs to always have the latest values in callbacks (avoids stale closure issues with useMemo)
   const pendingGoogleTokenRef = useRef<string | null>(null);
   const pendingFirebaseProfileCreationUserRef = useRef<any | null>(null);
-  useEffect(() => { pendingGoogleTokenRef.current = pendingGoogleToken; }, [pendingGoogleToken]);
-  useEffect(() => { pendingFirebaseProfileCreationUserRef.current = pendingFirebaseProfileCreationUser; }, [pendingFirebaseProfileCreationUser]);
+
+  /**
+   * Write the ref synchronously, then the state.
+   *
+   * These were previously synced in a `useEffect`, which is a tick too late.
+   * React flushes a child's effects before its parent's, so `LoginPage`'s
+   * effect — which reacts to `pendingFirebaseProfileCreationUser` and calls
+   * `completeStudentProfileCreation` — ran while this provider's sync effect
+   * was still pending. The ref it read was the previous value, `null`.
+   *
+   * That is why email signup could never work: the password stashed on the
+   * pending user was unreadable at exactly the moment registration needed it,
+   * and `|| ''` turned the miss into an empty string, so the server rejected
+   * every password rule at once for a password the user had typed correctly.
+   *
+   * A ref exists to be readable immediately. Deferring the write gives up the
+   * only property that made it worth having.
+   */
+  const setPendingFirebaseProfileCreationUser = useCallback((user: any | null) => {
+    pendingFirebaseProfileCreationUserRef.current = user;
+    setPendingFirebaseProfileCreationUserState(user);
+  }, []);
+
+  const setPendingGoogleToken = useCallback((token: string | null) => {
+    pendingGoogleTokenRef.current = token;
+    setPendingGoogleTokenState(token);
+  }, []);
 
   // --- Pagination State ---
   const [ordersLimit, setOrdersLimit] = useState(100);
@@ -976,7 +1024,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       // Call the backend register endpoint with STUDENT type
       const tokens = await authApi.register({
         email,
-        password: pendingUser?._tempPassword || '',
+        password: requireSignupPassword(pendingUser),
         name,
         type: 'STUDENT',
       });
@@ -1052,15 +1100,13 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
       const registerPayload = {
         email,
-        password: pendingUser?._tempPassword || '',
+        password: requireSignupPassword(pendingUser),
         name,
         type: 'SHOP_OWNER' as const,
         shopName: trimmedShopName,
         shopAddress: shopDetails.shopAddress,
         referralCode: shopDetails.referralCode,
       };
-      console.log('[DEBUG] Register payload:', { ...registerPayload, password: registerPayload.password ? `[${registerPayload.password.length} chars]` : 'EMPTY' });
-      console.log('[DEBUG] pendingUser ref:', pendingUser);
       console.log('[DEBUG] pendingGoogleToken ref:', googleToken);
 
       const tokens = await authApi.register(registerPayload);
