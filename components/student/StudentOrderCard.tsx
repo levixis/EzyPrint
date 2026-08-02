@@ -65,6 +65,10 @@ const StudentOrderCard: React.FC<StudentOrderCardProps> = ({ order, onPayNow, on
 
   const existingRefundRequest = refundRequests?.find(r => r.orderId === id);
 
+  // Money actually changed hands, so cancelling sends it back rather than just
+  // making the order disappear. The two cases want different wording.
+  const isPaid = !!order.razorpayPaymentId && priceDetails.totalPrice > 0;
+
   return (
     <Card className={`border-l-4 ${statusStyle.border} transition-all hover:shadow-2xl bg-opacity-80 backdrop-blur-sm ${status === OrderStatus.PENDING_PAYMENT || status === OrderStatus.PAYMENT_FAILED ? 'ring-2 ring-brand-primaryDark' : ''}`}>
       <div className="flex flex-col sm:flex-row justify-between sm:items-start mb-4 pb-4 border-b border-brand-muted/30">
@@ -151,11 +155,6 @@ const StudentOrderCard: React.FC<StudentOrderCardProps> = ({ order, onPayNow, on
           <Button onClick={() => onPayNow(order)} variant="primary" size="md" fullWidth className="my-1" disabled={isProcessingPayment || isCancelling}>
             {isProcessingPayment ? 'Processing...' : (status === OrderStatus.PENDING_PAYMENT ? `Pay Now ${formatMoney(priceDetails.totalPrice)}` : `Retry Payment ${formatMoney(priceDetails.totalPrice)}`)}
           </Button>
-          {onCancelOrder && (
-            <Button onClick={() => onCancelOrder(order)} variant="ghost" size="sm" fullWidth className="text-status-error hover:bg-status-error/10 border border-transparent hover:border-status-error/20 mt-1" disabled={isCancelling}>
-              {isCancelling ? 'Cancelling...' : 'Cancel & Hide Order'}
-            </Button>
-          )}
         </div>
       )}
 
@@ -172,8 +171,24 @@ const StudentOrderCard: React.FC<StudentOrderCardProps> = ({ order, onPayNow, on
         </div>
       )}
 
-      {/* Raise Issue / Support Button */}
-      <div className="mt-4 pt-4 border-t border-brand-muted/30 text-right">
+      {/* Order actions.
+          Cancel used to live inside the Pay Now box, which only renders for an
+          unpaid order — so a paid order awaiting the shop offered no way to
+          cancel at all, even though both the server and StudentOrderList allow
+          it. Rendering it here instead means it appears for every status the
+          parent says is cancellable. */}
+      <div className="mt-4 pt-4 border-t border-brand-muted/30 flex items-center justify-between gap-2">
+        {onCancelOrder ? (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => onCancelOrder(order)}
+            disabled={isCancelling}
+            className="text-status-error hover:bg-status-error/10 border border-transparent hover:border-status-error/20"
+          >
+            {isCancelling ? 'Cancelling...' : (isPaid ? 'Cancel Order' : 'Cancel & Hide Order')}
+          </Button>
+        ) : <span />}
         <Button variant="ghost" size="sm" onClick={() => setIsTicketFormOpen(true)}>
           Raise Issue
         </Button>

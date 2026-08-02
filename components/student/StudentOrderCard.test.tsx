@@ -31,7 +31,7 @@ beforeEach(async () => {
   StudentOrderCard = (await import('./StudentOrderCard')).default;
 });
 
-const order = {
+const makeOrder = (overrides: Record<string, unknown> = {}) => ({
   id: 'order_1',
   shopId: 'shop_1',
   userId: 'student_1',
@@ -41,17 +41,64 @@ const order = {
   uploadedAt: '2026-08-01T10:00:00.000Z',
   printOptions: { pages: 12, copies: 1, color: PrintColor.BLACK_WHITE, doubleSided: false },
   priceDetails: { totalPrice: 2400, pageCost: 2000, baseFee: 400 },
-} as unknown as DocumentOrder;
+  ...overrides,
+} as unknown as DocumentOrder);
 
-const renderCard = (isCancelling?: boolean) =>
+/** Unpaid, awaiting payment. */
+const order = makeOrder();
+
+/** Paid and waiting on the shop — the case that had no cancel button at all. */
+const paidOrder = makeOrder({
+  status: OrderStatus.PENDING_APPROVAL,
+  razorpayPaymentId: 'pay_abc123',
+});
+
+const renderCard = (isCancelling?: boolean, subject: DocumentOrder = order) =>
   render(
     <StudentOrderCard
-      order={order}
+      order={subject}
       onPayNow={vi.fn()}
       onCancelOrder={vi.fn()}
       isCancelling={isCancelling}
     />
   );
+
+
+describe('A paid order awaiting the shop can still be cancelled', () => {
+  /**
+   * The regression this pins: cancel used to render only inside the Pay Now
+   * box, which a PENDING_APPROVAL order never shows. The server allows the
+   * transition and StudentOrderList passes the callback, so the button was the
+   * only thing missing — and nothing asserted it was there.
+   */
+  test('the cancel button is rendered', () => {
+    renderCard(false, paidOrder);
+
+    expect(screen.getByRole('button', { name: /cancel order/i })).toBeTruthy();
+  });
+
+  test('it does not offer to merely hide an order that was paid for', () => {
+    // "Hide" describes an unpaid order vanishing. This one sends money back.
+    renderCard(false, paidOrder);
+
+    expect(screen.queryByRole('button', { name: /hide/i })).toBeNull();
+  });
+
+  test('there is no Pay Now button to confuse it with', () => {
+    renderCard(false, paidOrder);
+
+    expect(screen.queryByRole('button', { name: /pay now|retry payment/i })).toBeNull();
+  });
+
+  test('the in-flight state reaches the paid path too', () => {
+    // This is the path that does a network round trip and then moves money, so
+    // it is the one where a dead-looking tap matters most.
+    renderCard(true, paidOrder);
+
+    const cancel = screen.getByRole<HTMLButtonElement>('button', { name: /cancelling/i });
+    expect(cancel.disabled).toBe(true);
+  });
+});
 
 describe('Cancel button feedback', () => {
   test('it invites the tap when nothing is in flight', () => {

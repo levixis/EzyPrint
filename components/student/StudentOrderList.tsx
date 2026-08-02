@@ -306,7 +306,14 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
       }
     }
 
-    setPendingCancelOrder({ order, requiresRefund: false });
+    // Reached for an order that is already paid and waiting on the shop, where
+    // the check above does not apply. Cancelling it still sends money back, and
+    // asking "are you sure?" without saying so hides the part the student most
+    // needs to know before confirming.
+    setPendingCancelOrder({
+      order,
+      requiresRefund: !!order.razorpayPaymentId && order.priceDetails.totalPrice > 0,
+    });
   };
 
   const confirmCancelOrder = async (order: DocumentOrder) => {
