@@ -602,6 +602,43 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     };
   }, [currentUser, fetchOrders, fetchNotifications, fetchShops, fetchPayouts, fetchTickets, fetchRefundRequests, fetchReactivationRequests]);
 
+  /**
+   * Refetch orders the moment the app comes back to the foreground.
+   *
+   * Android throttles timers in the background, so the poll above cannot be
+   * relied on to have kept up. A student who backgrounds the app mid-cancel
+   * returns to a list that may still show the old status — which, for a refund
+   * that settled while they were away, reads as nothing having happened.
+   *
+   * Registered once per signed-in user and read through a ref, for the same
+   * reason the back handler is: the removal function is assigned two promises
+   * deep, so an effect that re-ran on every fetchOrders identity change would
+   * leak listeners that keep firing.
+   */
+  const fetchOrdersRef = useRef(fetchOrders);
+  useEffect(() => { fetchOrdersRef.current = fetchOrders; });
+
+  useEffect(() => {
+    if (!currentUser || !Capacitor.isNativePlatform()) return;
+
+    let remove: (() => void) | undefined;
+    let cancelled = false;
+
+    import('@capacitor/app').then(({ App }) =>
+      App.addListener('appStateChange', ({ isActive }) => {
+        if (isActive) void fetchOrdersRef.current();
+      }).then(handle => {
+        if (cancelled) handle.remove();
+        else remove = () => handle.remove();
+      })
+    ).catch(err => { void err; });
+
+    return () => {
+      cancelled = true;
+      remove?.();
+    };
+  }, [currentUser]);
+
   // Archived shop detection
   useEffect(() => {
     if (!currentUser || currentUser.type !== UserType.SHOP_OWNER || !currentUser.shopId) {

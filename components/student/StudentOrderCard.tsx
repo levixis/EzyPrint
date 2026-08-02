@@ -13,6 +13,9 @@ interface StudentOrderCardProps {
   onPayNow: (order: DocumentOrder) => void;
   onCancelOrder?: (order: DocumentOrder) => void;
   isProcessingPayment?: boolean;
+  /** Cancel is in flight — covers the payment-status check as well as the
+   *  cancellation itself, since both are network round trips. */
+  isCancelling?: boolean;
 }
 
 const getStatusStyles = (status: OrderStatus): { text: string; border: string; bg: string; icon?: React.ReactNode } => {
@@ -47,7 +50,7 @@ const FileIcon: React.FC<{ fileType: string }> = ({ fileType }) => {
 };
 
 
-const StudentOrderCard: React.FC<StudentOrderCardProps> = ({ order, onPayNow, onCancelOrder, isProcessingPayment }) => {
+const StudentOrderCard: React.FC<StudentOrderCardProps> = ({ order, onPayNow, onCancelOrder, isProcessingPayment, isCancelling }) => {
   const { getShopById, refundRequests } = useAppContext();
   const { printOptions, status, priceDetails, uploadedAt, id, pickupCode, shopNotes, shopId } = order;
   const [showInvoice, setShowInvoice] = React.useState(false);
@@ -145,12 +148,12 @@ const StudentOrderCard: React.FC<StudentOrderCardProps> = ({ order, onPayNow, on
       {(status === OrderStatus.PENDING_PAYMENT || status === OrderStatus.PAYMENT_FAILED) && (
         <div className={`my-2 p-3 ${status === OrderStatus.PAYMENT_FAILED ? 'bg-status-error/20 border-status-error' : 'bg-transparent'} rounded-lg border text-center flex flex-col gap-2`}>
           {status === OrderStatus.PAYMENT_FAILED && <p className="text-status-error font-semibold mb-2">Payment Failed. Please try again.</p>}
-          <Button onClick={() => onPayNow(order)} variant="primary" size="md" fullWidth className="my-1" disabled={isProcessingPayment}>
+          <Button onClick={() => onPayNow(order)} variant="primary" size="md" fullWidth className="my-1" disabled={isProcessingPayment || isCancelling}>
             {isProcessingPayment ? 'Processing...' : (status === OrderStatus.PENDING_PAYMENT ? `Pay Now ${formatMoney(priceDetails.totalPrice)}` : `Retry Payment ${formatMoney(priceDetails.totalPrice)}`)}
           </Button>
           {onCancelOrder && (
-            <Button onClick={() => onCancelOrder(order)} variant="ghost" size="sm" fullWidth className="text-status-error hover:bg-status-error/10 border border-transparent hover:border-status-error/20 mt-1">
-              Cancel & Hide Order
+            <Button onClick={() => onCancelOrder(order)} variant="ghost" size="sm" fullWidth className="text-status-error hover:bg-status-error/10 border border-transparent hover:border-status-error/20 mt-1" disabled={isCancelling}>
+              {isCancelling ? 'Cancelling...' : 'Cancel & Hide Order'}
             </Button>
           )}
         </div>

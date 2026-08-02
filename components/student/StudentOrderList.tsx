@@ -46,6 +46,9 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
   const [showOverlay, setShowOverlay] = useState(false);
   const [infoDialog, setInfoDialog] = useState<{ title: string; message: string } | null>(null);
   const [pendingCancelOrder, setPendingCancelOrder] = useState<{ order: DocumentOrder; requiresRefund: boolean } | null>(null);
+  // Which order has a cancel round trip in flight. Purely for feedback — the
+  // server's compare-and-swap is what actually prevents a double cancel.
+  const [cancellingOrderId, setCancellingOrderId] = useState<string | null>(null);
   const { updateOrderStatus, currentUser, refreshOrders } = useAppContext();
 
   // Clear optimistic statuses once Firestore catches up with the real status
@@ -267,6 +270,18 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
   };
 
   const handleCancelOrder = async (order: DocumentOrder) => {
+    if (cancellingOrderId) return;
+    // The payment check below is a network round trip before any dialog opens,
+    // so without this the tap looks like it did nothing at all.
+    setCancellingOrderId(order.id);
+    try {
+      await runCancelPrecheck(order);
+    } finally {
+      setCancellingOrderId(null);
+    }
+  };
+
+  const runCancelPrecheck = async (order: DocumentOrder) => {
     // SAFETY: Before cancelling, check if the payment was actually captured
     // (handles case where verification failed but money was taken)
     if ((order.status === OrderStatus.PAYMENT_FAILED || order.status === OrderStatus.PENDING_PAYMENT) && order.razorpayOrderId) {
@@ -295,6 +310,7 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
   };
 
   const confirmCancelOrder = async (order: DocumentOrder) => {
+    setCancellingOrderId(order.id);
     try {
       const result = await updateOrderStatus(order.id, OrderStatus.CANCELLED, {
         actingUserType: UserType.STUDENT
@@ -311,6 +327,8 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
         title: 'Cancellation Failed',
         message: 'Failed to cancel order. Please check your connection and try again.',
       });
+    } finally {
+      setCancellingOrderId(null);
     }
   };
 
@@ -403,6 +421,7 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
               // request instead.
               onCancelOrder={STUDENT_CANCELLABLE.includes(order.status) ? handleCancelOrder : undefined}
               isProcessingPayment={processingOrderId === order.id}
+              isCancelling={cancellingOrderId === order.id}
             />
           ))}
           {activeTab === 'recent' && activeOrders.length > 5 && (
