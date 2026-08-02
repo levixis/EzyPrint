@@ -132,12 +132,36 @@ export async function settleClaimedRefund(
     if (updated.count === 0) return;
     settledHere = true;
 
-    if (options.setOrderRefunded) {
-      await tx.order.updateMany({
-        where: { id: request.orderId },
-        data: { status: 'REFUNDED' },
-      });
-    }
+    // Record the outcome on the order itself, whatever terminal state it keeps.
+    //
+    // `Order.refundId` / `refundStatus` / `refundAmount` survived the migration
+    // from Firebase, where the legacy functions wrote them. Nothing on this side
+    // ever did — they were read and never populated. The admin dashboard derives
+    // its payment badge from them (`getPaymentTrackingStatus`), so its check for
+    // "cancelled, paid, and no refund recorded" was true for every cancelled
+    // order forever: two orders that had been refunded down to the paisa, with
+    // Razorpay refund ids against them, sat on the admin's screen labelled
+    // "Needs Refund".
+    //
+    // Written here rather than at the call sites because this is the one place
+    // every settlement path reaches — admin resolution, shop self-refund, and
+    // the automatic refund behind a cancellation.
+    await tx.order.updateMany({
+      where: { id: request.orderId },
+      data: {
+        // `setOrderRefunded` stays the sole control over the *status*. A
+        // cancellation keeps CANCELLED, which is the more meaningful record of
+        // why the order ended, and VALID_TRANSITIONS has no CANCELLED ->
+        // REFUNDED edge anyway.
+        ...(options.setOrderRefunded ? { status: 'REFUNDED' as const } : {}),
+        // Falls back to the request id when nothing went through the gateway,
+        // so an offline settlement is still recorded as settled rather than
+        // reading as unrefunded.
+        refundId: razorpayRefundId ?? request.id,
+        refundStatus: 'processed',
+        refundAmount: amount,
+      },
+    });
 
     // The student is refunded in full, but the shop is liable only for what it
     // actually received — the platform absorbs its own base fee.

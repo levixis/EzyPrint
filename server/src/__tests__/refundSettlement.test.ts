@@ -163,3 +163,37 @@ describe('A repeat delivery stays silent', () => {
     expect(mockOrderUpdateMany).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * The refund has to be legible on the order, not only on the request row.
+ *
+ * `Order.refundId` / `refundStatus` / `refundAmount` survived the migration
+ * from Firebase, where the legacy functions populated them. Nothing on this
+ * side ever did — they were selected and never written. The admin dashboard
+ * derives its payment badge from them, and its "cancelled, paid, nothing
+ * refunded" branch was therefore true for every cancelled order forever: two
+ * orders refunded to the paisa, each with a Razorpay refund id against it, sat
+ * on the admin's screen marked "Needs Refund" indefinitely.
+ */
+describe('The order records the refund', () => {
+  test('a cancellation refund is stamped on the order without changing its status', async () => {
+    await settleClaimedRefund('refund_1', { setOrderRefunded: false, createdBy: 'SYSTEM' });
+
+    const data = mockOrderUpdateMany.mock.calls[0][0].data;
+    expect(data.refundId).toBe('rfnd_existing');
+    expect(data.refundStatus).toBe('processed');
+    expect(data.refundAmount).toBe(12500);
+    // CANCELLED is the more meaningful terminal state, and there is no
+    // CANCELLED -> REFUNDED edge in VALID_TRANSITIONS.
+    expect(data.status).toBeUndefined();
+  });
+
+  test('an admin resolution stamps the refund and marks the order REFUNDED', async () => {
+    await settleClaimedRefund('refund_1', { setOrderRefunded: true, createdBy: 'ADMIN' });
+
+    const data = mockOrderUpdateMany.mock.calls[0][0].data;
+    expect(data.status).toBe('REFUNDED');
+    expect(data.refundId).toBe('rfnd_existing');
+    expect(data.refundStatus).toBe('processed');
+  });
+});
