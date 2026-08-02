@@ -1,5 +1,6 @@
 import { prisma } from '../utils/prisma';
 import { sendPushToUser, type PushChannel } from './push.service';
+import { sendNoticeEmail } from './email.service';
 import type { NotificationType, OrderStatus, TicketStatus } from '@prisma/client';
 
 /**
@@ -29,6 +30,44 @@ interface NotifyInput {
   targetShopId?: string;
   /** Extra key/values for the push payload, used for deep-linking on tap. */
   data?: Record<string, string>;
+  /**
+   * Also send an email. Present on a minority of events, by design.
+   *
+   * The bell and the push assume someone opens the app. That assumption holds
+   * for orders, which are minutes long and watched. It fails exactly where the
+   * stakes are highest: a shop owner waiting on their application has no reason
+   * to open the app for days, and a payout decision concerns money that has
+   * already left. Those people need to be reached where they already are.
+   *
+   * It is opt-in per event rather than on by default because the same reasoning
+   * inverts for order updates — a student ordering twice a week would get
+   * hundreds of emails a term, and an inbox that noisy gets filtered, taking
+   * the payout emails with it.
+   */
+  email?: {
+    subject: string;
+    heading: string;
+    lines: string[];
+    detail?: string;
+    tone?: 'good' | 'bad';
+  };
+}
+
+/**
+ * Email one user, if we have an address for them.
+ *
+ * Never throws and is never awaited by a business flow. `User.email` is
+ * nullable, and an account without one is not an error — it just cannot be
+ * emailed, and the in-app row already recorded the event either way.
+ */
+async function emailUser(userId: string, content: NonNullable<NotifyInput['email']>): Promise<void> {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { email: true },
+  });
+  if (!user?.email) return;
+
+  await sendNoticeEmail({ to: user.email, ...content });
 }
 
 /**
@@ -57,6 +96,13 @@ async function notifyUser(userId: string, input: NotifyInput): Promise<void> {
       ...(input.orderId ? { orderId: input.orderId } : {}),
     },
   });
+
+  // Same contract as push: a courtesy copy that cannot delay or fail the row.
+  if (input.email) {
+    void emailUser(userId, input.email).catch((error) =>
+      console.error('[notify] email copy failed:', error)
+    );
+  }
 }
 
 /**
@@ -389,12 +435,77 @@ export function notifyRefundSettled(params: {
   );
 }
 
-/** A payout changed state — the shop always cares about its own money. */
+/**
+ * An admin approved or rejected a shop's application.
+ *
+ * Nothing announced this before — not in-app, not push, not email. A shop owner
+ * who registered had no way to learn the outcome except opening the app and
+ * inferring it from what the dashboard let them do. That is the single longest
+ * wait anyone has in this product, and it ended in silence.
+ *
+ * Emailed rather than pushed alone: an applicant may not have the app installed
+ * on the device they registered from, and may not open it for days.
+ */
+export function notifyShopDecision(params: {
+  shopId: string;
+  ownerUserId: string;
+  shopName: string;
+  approved: boolean;
+  /** The admin's reason. Only meaningful on a rejection. */
+  reason?: string | null;
+}): void {
+  const message = params.approved
+    ? `${params.shopName} has been approved. You can start accepting orders.`
+    : `${params.shopName} was not approved.${params.reason ? ` ${params.reason}` : ''}`;
+
+  guard(
+    notifyUser(params.ownerUserId, {
+      message,
+      title: params.approved ? 'Shop approved' : 'Shop application update',
+      type: params.approved ? 'success' : 'warning',
+      channel: 'ezyprint_account',
+      targetShopId: params.shopId,
+      email: params.approved
+        ? {
+            subject: `${params.shopName} is approved on EzyPrint`,
+            heading: 'Your shop has been approved',
+            lines: [
+              `${params.shopName} is live and students can now find it and place orders.`,
+              'Open EzyPrint to set your pricing and opening hours before your first order arrives.',
+            ],
+            tone: 'good',
+          }
+        : {
+            subject: `About your EzyPrint application for ${params.shopName}`,
+            heading: 'Your shop application was not approved',
+            lines: [
+              `We could not approve ${params.shopName} at this time.`,
+              'If you think this is a mistake, reply to this email or raise a support ticket in the app.',
+            ],
+            // Without the reason this email creates a support ticket instead of
+            // resolving one, so it is the part most worth getting through.
+            detail: params.reason ?? undefined,
+            tone: 'bad',
+          },
+    }),
+    'shop decision'
+  );
+}
+
+/**
+ * A payout changed state — the shop always cares about its own money.
+ *
+ * `emailSubject` is set by the caller for admin-driven changes only. A shop
+ * requesting, disputing or confirming its own payout does not need an email
+ * telling it what it just did.
+ */
 export function notifyPayoutUpdate(params: {
   shopId: string;
   ownerUserId: string;
   message: string;
   type?: NotificationType;
+  emailSubject?: string;
+  emailDetail?: string;
 }): void {
   guard(
     notifyUser(params.ownerUserId, {
@@ -403,6 +514,15 @@ export function notifyPayoutUpdate(params: {
       type: params.type ?? 'info',
       channel: 'ezyprint_account',
       targetShopId: params.shopId,
+      email: params.emailSubject
+        ? {
+            subject: params.emailSubject,
+            heading: 'Payout update',
+            lines: [params.message, 'Open EzyPrint to see your balance and payout history.'],
+            detail: params.emailDetail,
+            tone: params.type === 'warning' || params.type === 'error' ? 'bad' : 'good',
+          }
+        : undefined,
     }),
     'payout update'
   );

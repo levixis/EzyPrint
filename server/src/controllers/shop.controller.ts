@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import * as shopService from '../services/shop.service';
+import * as notifyService from '../services/notify.service';
 import { ApiError } from '../utils/ApiError';
 
 export async function listShops(req: Request, res: Response, next: NextFunction) {
@@ -45,12 +46,31 @@ export async function updateShopSettings(req: Request, res: Response, next: Next
 
 export async function approveShop(req: Request, res: Response, next: NextFunction) {
   try {
-    const { approved } = req.body;
+    const { approved, rejectionReason } = req.body;
+
     if (approved === false) {
-      const shop = await shopService.rejectShop(req.params.shopId as string);
+      // `rejectionReason` was destructured away here, so `rejectShop`'s reason
+      // parameter never received the admin's words and every rejected owner
+      // read the same generic sentence. It is the only thing in this response
+      // that tells them what to fix.
+      const shop = await shopService.rejectShop(req.params.shopId as string, rejectionReason);
+      notifyService.notifyShopDecision({
+        shopId: shop.id,
+        ownerUserId: shop.ownerUserId,
+        shopName: shop.name,
+        approved: false,
+        reason: shop.rejectionReason,
+      });
       return res.json({ success: true, message: 'Shop rejected', data: { shop } });
     }
+
     const shop = await shopService.approveShop(req.params.shopId as string);
+    notifyService.notifyShopDecision({
+      shopId: shop.id,
+      ownerUserId: shop.ownerUserId,
+      shopName: shop.name,
+      approved: true,
+    });
     res.json({ success: true, message: 'Shop approved', data: { shop } });
   } catch (error) { next(error); }
 }

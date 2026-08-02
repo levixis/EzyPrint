@@ -25,10 +25,23 @@ import type { Prisma, PayoutStatus } from '@prisma/client';
  * failures, and a push provider having a bad minute must not fail a request
  * that has already moved money.
  */
-async function tellShop(shopId: string, message: string, type: 'info' | 'success' | 'warning' | 'error' = 'info') {
+async function tellShop(
+  shopId: string,
+  message: string,
+  type: 'info' | 'success' | 'warning' | 'error' = 'info',
+  /**
+   * Subject line for an email copy. Set on admin decisions only.
+   *
+   * Every current caller is an admin acting on someone else's money, so all of
+   * them pass one. It stays a parameter rather than becoming the default
+   * because the shop-driven routes — request, dispute, confirm — must not mail
+   * a shop about a button it just pressed itself.
+   */
+  emailSubject?: string
+) {
   const shop = await prisma.shop.findUnique({ where: { id: shopId }, select: { ownerUserId: true } });
   if (!shop) return;
-  notifyService.notifyPayoutUpdate({ shopId, ownerUserId: shop.ownerUserId, message, type });
+  notifyService.notifyPayoutUpdate({ shopId, ownerUserId: shop.ownerUserId, message, type, emailSubject });
 }
 
 const rupees = (paise: number) => `₹${(paise / 100).toFixed(2)}`;
@@ -274,7 +287,7 @@ router.post('/:id/approve', authenticate, authorize('ADMIN'), sensitiveLimiter, 
 
     await realtimeService.publishQueued(outboxIds);
 
-    await tellShop(result.shopId, `Your payout of ${rupees(result.amount)} was approved and is on its way.`, 'success');
+    await tellShop(result.shopId, `Your payout of ${rupees(result.amount)} was approved and is on its way.`, 'success', 'Your EzyPrint payout has been sent');
 
     res.json({ success: true, data: result });
   } catch (error) { next(error); }
@@ -317,7 +330,7 @@ router.post('/:id/mark-paid', authenticate, authorize('ADMIN'), sensitiveLimiter
 
     await realtimeService.publishQueued(outboxIds);
 
-    await tellShop(result.shopId, `${rupees(result.amount)} has been sent to your bank account.`, 'success');
+    await tellShop(result.shopId, `${rupees(result.amount)} has been sent to your bank account.`, 'success', 'Your EzyPrint payout has been sent');
 
     res.json({ success: true, data: result });
   } catch (error) { next(error); }
@@ -365,7 +378,8 @@ router.post('/:id/reject', authenticate, authorize('ADMIN'), sensitiveLimiter, v
     await tellShop(
       result.shopId,
       `Your payout request of ${rupees(result.amount)} was declined and the amount is back in your balance.`,
-      'warning'
+      'warning',
+      'Your EzyPrint payout request was declined'
     );
 
     res.json({ success: true, data: result });
@@ -453,7 +467,7 @@ router.post('/:id/cancel', authenticate, authorize('SHOP_OWNER', 'ADMIN'), sensi
     if (cancelled) {
       const { shopId: cancelledShopId, amount: cancelledAmount } = cancelled;
       if (req.user?.userType === 'ADMIN') {
-        await tellShop(cancelledShopId, `Your payout request of ${rupees(cancelledAmount)} was cancelled by an admin.`, 'warning');
+        await tellShop(cancelledShopId, `Your payout request of ${rupees(cancelledAmount)} was cancelled by an admin.`, 'warning', 'Your EzyPrint payout request was cancelled');
       } else {
         notifyService.notifyAdmins(`A shop cancelled its payout request of ${rupees(cancelledAmount)}.`);
       }
@@ -553,7 +567,7 @@ router.post('/manual', authenticate, authorize('ADMIN'), sensitiveLimiter, valid
 
     await realtimeService.publishQueued(outboxIds);
 
-    await tellShop(shopId, `${rupees(Number(amount))} has been sent to your bank account.`, 'success');
+    await tellShop(shopId, `${rupees(Number(amount))} has been sent to your bank account.`, 'success', 'Your EzyPrint payout has been sent');
 
     res.json({ success: true, data: result });
   } catch (error) { next(error); }

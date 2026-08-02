@@ -139,6 +139,54 @@ async function deliver(message: Message): Promise<void> {
 }
 
 /**
+ * A decision the recipient did not make and needs to know about.
+ *
+ * Deliberately plain. These arrive unannounced — a shop owner is not sitting in
+ * the app waiting to hear whether their application passed — so the subject has
+ * to carry the outcome on its own, and the body has to be readable in a preview
+ * pane on a phone. One heading, a few lines, and where relevant the reason,
+ * because "rejected" without a reason just generates a support ticket.
+ */
+export async function sendNoticeEmail(params: {
+  to: string;
+  subject: string;
+  heading: string;
+  lines: string[];
+  /** Quoted verbatim under the lines — a rejection reason or an admin's note. */
+  detail?: string;
+  tone?: 'good' | 'bad';
+}): Promise<void> {
+  const accent = params.tone === 'bad' ? '#f59e0b' : '#22c55e';
+  const safeLines = params.lines.map(escapeHtml);
+
+  const detailHtml = params.detail
+    ? `<div style="padding:16px;background:#16213e;border-left:3px solid ${accent};border-radius:8px;margin:20px 0;">
+         <p style="color:#888;font-size:11px;text-transform:uppercase;letter-spacing:1px;margin:0 0 6px;">Reason</p>
+         <p style="margin:0;color:#e0e0e0;">${escapeHtml(params.detail)}</p>
+       </div>`
+    : '';
+
+  await deliver({
+    to: params.to,
+    subject: params.subject,
+    text: [params.heading, '', ...params.lines, ...(params.detail ? ['', `Reason: ${params.detail}`] : [])].join('\n'),
+    html: `
+      <div style="font-family: 'Inter', sans-serif; max-width: 480px; margin: 0 auto; padding: 32px; background: #1a1a2e; border-radius: 16px; color: #e0e0e0;">
+        <div style="text-align: center; margin-bottom: 24px;">
+          <h1 style="color: #ef4444; font-size: 24px; margin: 0;">EzyPrint</h1>
+        </div>
+        <h2 style="color:#fff;font-size:18px;margin:0 0 16px;">${escapeHtml(params.heading)}</h2>
+        ${safeLines.map((line) => `<p style="margin:0 0 12px;line-height:1.5;">${line}</p>`).join('')}
+        ${detailHtml}
+        <p style="color:#666;font-size:11px;margin-top:24px;border-top:1px solid #333;padding-top:16px;">
+          You are receiving this because you have an EzyPrint account. Open the app for full details.
+        </p>
+      </div>
+    `,
+  });
+}
+
+/**
  * Send a password reset code.
  *
  * Separate from `sendOTPEmail` because the two say different things. That one
