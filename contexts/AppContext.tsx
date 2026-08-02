@@ -20,6 +20,8 @@ export { calculateBaseFee, calculateOrderPrice, calculateMultiFileOrderPrice, is
 // Push notification registration for native mobile
 import { registerPushNotifications, unregisterPushNotifications } from '../utils/pushNotifications';
 import { formatMoney } from '../utils/money';
+import { createFetchGuard } from '../utils/fetchGuard';
+import { applyOverrides, retireConfirmedOverrides, type StatusOverrides } from '../utils/optimisticStatus';
 
 /**
  * The web OAuth client id, used on every platform.
@@ -300,15 +302,33 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
    * reflects what the server confirmed, because a figure that appears and then
    * vanishes reads as lost money.
    */
-  const [optimisticOrderStatus, setOptimisticOrderStatus] = useState<Record<string, OrderStatus>>({});
+  const [optimisticOrderStatus, setOptimisticOrderStatus] = useState<StatusOverrides>({});
 
   const orders = useMemo(
-    () => rawOrders.map(order => {
-      const pending = optimisticOrderStatus[order.id];
-      return pending && pending !== order.status ? { ...order, status: pending } : order;
-    }),
+    () => applyOverrides(rawOrders, optimisticOrderStatus),
     [rawOrders, optimisticOrderStatus]
   );
+
+  /**
+   * Retire an override once the server agrees with it.
+   *
+   * The overlay used to be cleared by whichever call made the change, straight
+   * after its own refetch. That assumed the refetch published — and it may not,
+   * if a poll or the foreground handler started a newer one in the meantime.
+   * Clearing anyway showed the pre-change status until the winning response
+   * arrived: the shop owner's own tap appearing to undo itself, which is the
+   * exact thing the overlay exists to prevent.
+   *
+   * Keyed on evidence instead. An override survives until `rawOrders` carries
+   * the same status, whichever fetch happens to bring it, and disappears
+   * silently at that point because the memo above has already stopped applying
+   * it. A rejected change is still rolled back explicitly at the call site —
+   * that one is known to be wrong immediately and should not wait for a fetch.
+   */
+  useEffect(() => {
+    // Returns the same object when nothing matured, so this cannot loop.
+    setOptimisticOrderStatus(prev => retireConfirmedOverrides(prev, rawOrders));
+  }, [rawOrders]);
 
   const setOrders = setRawOrders;
   const [allOrders, setAllOrders] = useState<DocumentOrder[]>([]); // Admin: all orders
@@ -459,32 +479,60 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const knownOrderStatusesRef = useRef<Map<string, string> | null>(null);
   const isFirstOrderLoadRef = useRef(true);
 
+  /**
+   * Guards every fetch below against publishing a superseded response.
+   *
+   * See `utils/fetchGuard.ts` for what went wrong without it. `useShopLedger`
+   * already guarded its own refetches this way; this applies the same idea to
+   * the collections that never had it.
+   *
+   * Bound to the user id, so a response cannot be written into a session other
+   * than the one that asked for it.
+   */
+  const fetchGuardRef = useRef(
+    createFetchGuard(() => currentUserRef.current?.id ?? null)
+  );
+  const claimFetch = useCallback((key: string) => fetchGuardRef.current(key), []);
+
   // Fetch shops
   const fetchShops = useCallback(async () => {
+    const isCurrent = claimFetch('shops');
     try {
       const fetchedShops = await shopApi.list({ limit: shopsLimit });
+      if (!isCurrent()) return;
       setShops(fetchedShops);
       setIsLoadingShops(false);
     } catch (err) {
       debugLog('[AppContext] Failed to fetch shops:', err);
-      setIsLoadingShops(false);
+      // Still clears the spinner: a failed load has finished loading. Guarded
+      // so a stale failure cannot unblock a newer request's spinner.
+      if (isCurrent()) setIsLoadingShops(false);
     }
-  }, [shopsLimit]);
+  }, [shopsLimit, claimFetch]);
 
   // Fetch orders
   const fetchOrders = useCallback(async () => {
     if (!currentUser) { setOrders([]); setAllOrders([]); return; }
 
+    const isCurrent = claimFetch('orders');
+
     try {
       let fetchedOrders: DocumentOrder[];
       if (currentUser.type === UserType.ADMIN) {
         fetchedOrders = await orderApi.listAll({ limit: ordersLimit });
+        if (!isCurrent()) return;
         setAllOrders(fetchedOrders);
       } else {
         fetchedOrders = await orderApi.list({ limit: ordersLimit });
+        if (!isCurrent()) return;
       }
 
-      // Paid-order sound for shop owners (web only)
+      // Paid-order sound for shop owners (web only).
+      //
+      // After the staleness check, deliberately: a superseded response carries
+      // an older view of the world, and comparing it against the known statuses
+      // would announce orders that are not new — or overwrite the map with
+      // stale entries so the next genuine arrival goes unannounced.
       if (currentUser.type === UserType.SHOP_OWNER && !Capacitor.isNativePlatform()) {
         const currentStatuses = new Map(fetchedOrders.map(o => [o.id, o.status]));
         if (isFirstOrderLoadRef.current) {
@@ -509,18 +557,20 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     } catch (err) {
       debugLog('[AppContext] Failed to fetch orders:', err);
     }
-  }, [currentUser, ordersLimit]);
+  }, [currentUser, ordersLimit, claimFetch]);
 
   // Fetch notifications
   const fetchNotifications = useCallback(async () => {
     if (!currentUser) { setServerNotifications([]); return; }
+    const isCurrent = claimFetch('notifications');
     try {
       const fetched = await notificationApi.list({ limit: notificationsLimit });
+      if (!isCurrent()) return;
       setServerNotifications(fetched);
     } catch (err) {
       debugLog('[AppContext] Failed to fetch notifications:', err);
     }
-  }, [currentUser, notificationsLimit]);
+  }, [currentUser, notificationsLimit, claimFetch]);
 
   useEffect(() => { fetchNotificationsRef.current = fetchNotifications; }, [fetchNotifications]);
 
@@ -531,39 +581,45 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       setPayouts([]);
       return;
     }
+    const isCurrent = claimFetch('payouts');
     try {
       const params: { shopId?: string; limit?: number } = { limit: payoutsLimit };
       if (currentUser.type === UserType.SHOP_OWNER && currentUser.shopId) {
         params.shopId = currentUser.shopId;
       }
       const fetched = await payoutApi.list(params);
+      if (!isCurrent()) return;
       setPayouts(fetched);
     } catch (err) {
       debugLog('[AppContext] Failed to fetch payouts:', err);
     }
-  }, [currentUser, payoutsLimit]);
+  }, [currentUser, payoutsLimit, claimFetch]);
 
   // Fetch tickets
   const fetchTickets = useCallback(async () => {
     if (!currentUser) { setTickets([]); return; }
+    const isCurrent = claimFetch('tickets');
     try {
       const fetched = await ticketApi.list();
+      if (!isCurrent()) return;
       setTickets(fetched);
     } catch (err) {
       debugLog('[AppContext] Failed to fetch tickets:', err);
     }
-  }, [currentUser]);
+  }, [currentUser, claimFetch]);
 
   // Fetch refund requests
   const fetchRefundRequests = useCallback(async () => {
     if (!currentUser) { setRefundRequests([]); return; }
+    const isCurrent = claimFetch('refundRequests');
     try {
       const fetched = await refundApi.list();
+      if (!isCurrent()) return;
       setRefundRequests(fetched);
     } catch (err) {
       debugLog('[AppContext] Failed to fetch refund requests:', err);
     }
-  }, [currentUser]);
+  }, [currentUser, claimFetch]);
 
   // Fetch reactivation requests (admin only)
   const fetchReactivationRequests = useCallback(async () => {
@@ -571,13 +627,15 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       setReactivationRequests([]);
       return;
     }
+    const isCurrent = claimFetch('reactivationRequests');
     try {
       const fetched = await reactivationApi.list();
+      if (!isCurrent()) return;
       setReactivationRequests(fetched);
     } catch (err) {
       debugLog('[AppContext] Failed to fetch reactivation requests:', err);
     }
-  }, [currentUser]);
+  }, [currentUser, claimFetch]);
 
   // Fetch student pass holders (admin only)
   const fetchStudentPassHolders = useCallback(async () => {
@@ -585,13 +643,15 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       setStudentPassHolders([]);
       return;
     }
+    const isCurrent = claimFetch('studentPassHolders');
     try {
       const fetched = await adminApi.getStudentPassHolders();
+      if (!isCurrent()) return;
       setStudentPassHolders(fetched);
     } catch (err) {
       debugLog('[AppContext] Failed to fetch student pass holders:', err);
     }
-  }, [currentUser]);
+  }, [currentUser, claimFetch]);
 
   // Initial data load when user changes
   useEffect(() => {
@@ -616,6 +676,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       setReactivationRequests([]);
       setStudentPassHolders([]);
       setIsLoadingShops(false);
+      // An override outlives the orders it described otherwise. Ids will not
+      // collide across accounts, so nothing was visibly wrong — it just grew.
+      setOptimisticOrderStatus({});
       knownOrderStatusesRef.current = null;
       isFirstOrderLoadRef.current = true;
     }
@@ -1347,7 +1410,12 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       // Show the new status straight away. The shop owner is standing at the
       // counter with a customer; waiting on a round trip to see their own tap
       // register makes the app feel broken.
-      setOptimisticOrderStatus(prev => ({ ...prev, [orderId]: status }));
+      // `from` is recorded alongside so the override can retire on evidence —
+      // see `retireConfirmedOverrides`.
+      setOptimisticOrderStatus(prev => ({
+        ...prev,
+        [orderId]: { from: currentOrderData.status, to: status },
+      }));
 
       let updatedOrder: DocumentOrder | undefined;
       try {
@@ -1395,15 +1463,15 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         }
       }
 
-      // Refresh from the server, then drop the overlay so the confirmed status
-      // takes over. Clearing it before the refetch lands would flash the old
-      // status back for a frame.
+      // Refresh from the server. The overlay is not dropped here: this refetch
+      // can be superseded by one that started later — a poll, or the foreground
+      // handler — in which case it publishes nothing, and clearing on the way
+      // out would expose the pre-change list until the winning response lands.
+      //
+      // The effect beside `optimisticOrderStatus` retires the override the
+      // moment the server's own view agrees with it, so this clears on evidence
+      // rather than on the timing of one particular request.
       await fetchOrders();
-      setOptimisticOrderStatus(prev => {
-        const next = { ...prev };
-        delete next[orderId];
-        return next;
-      });
 
       return updatedOrder;
     } catch (err: unknown) {
@@ -1435,7 +1503,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     if (!currentUser || currentUser.type !== UserType.ADMIN) return { success: false, message: "Only admins can approve payouts." };
     try {
       await payoutApi.approve(payoutId, otp, adminNote);
-      addNotification({ message: `Payout marked as paid.`, type: 'success' });
+      // "Paid" is the next step, not this one — approving moves the payout to
+      // IN_TRANSIT, and `markPayoutPaid` is what confirms it landed. Saying
+      // "paid" here told an admin the money had arrived while it was still
+      // moving, and left them no reason to come back and confirm it.
+      addNotification({ message: `Payout approved and sent. Confirm it once it reaches the shop's account.`, type: 'success' });
       fetchPayouts();
       return { success: true };
     } catch (err: unknown) {
@@ -1528,11 +1600,18 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     if (notificationId.startsWith('local_')) {
       setLocalNotifications(prev => prev.map(n => (n.id === notificationId ? { ...n, read: true } : n)));
     } else {
+      // Optimistic, then reconciled — the same treatment
+      // `markAllNotificationsAsRead` gives, and for the same reason. Swallowing
+      // the failure left the bell clear while the server still had the row
+      // unread, so it reappeared on the next poll with nothing to explain it.
+      setServerNotifications(prev => prev.map(n => (n.id === notificationId ? { ...n, read: true } : n)));
+
+      // Through the ref, so this callback stays stable — the identity of
+      // `fetchNotifications` changes whenever the user or the page limit does.
       notificationApi.markAsRead(notificationId).catch(err => {
         debugLog("[AppContext] Failed to mark notification as read:", err);
+        void fetchNotificationsRef.current();
       });
-      // Optimistic update
-      setServerNotifications(prev => prev.map(n => (n.id === notificationId ? { ...n, read: true } : n)));
     }
   }, []);
 
@@ -1582,7 +1661,10 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     if (!currentUser || currentUser.type !== UserType.ADMIN) return { success: false, message: "Only admins can reject shops." };
     try {
       await shopApi.reject(shopId, reason);
-      addNotification({ message: `Shop rejected and removed.`, type: 'info' });
+      // Nothing is removed: `rejectShop` sets isRejected, closes the shop and
+      // records the reason so the owner can read it and reapply. Telling an
+      // admin the shop was deleted describes a different, irreversible action.
+      addNotification({ message: `Shop rejected. The owner has been told why.`, type: 'info' });
       fetchShops();
       return { success: true };
     } catch (err: unknown) {
