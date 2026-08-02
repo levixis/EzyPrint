@@ -275,7 +275,7 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
 
   const tabs = [
     { key: 'orders' as const, label: 'Orders', badge: pendingOrders.length > 0 ? pendingOrders.length : undefined },
-    { key: 'payouts' as const, label: 'Payouts', badge: shopPayouts.filter(p => p.status === PayoutStatus.PAID).length > 0 ? shopPayouts.filter(p => p.status === PayoutStatus.PAID).length : undefined },
+    { key: 'payouts' as const, label: 'Payouts', badge: shopPayouts.filter(p => p.status === PayoutStatus.PAID || p.status === PayoutStatus.IN_TRANSIT).length > 0 ? shopPayouts.filter(p => p.status === PayoutStatus.PAID || p.status === PayoutStatus.IN_TRANSIT).length : undefined },
     { key: 'support' as const, label: 'Support', badge: tickets.filter(t => t.status !== 'CLOSED' && t.status !== 'RESOLVED').length > 0 ? tickets.filter(t => t.status !== 'CLOSED' && t.status !== 'RESOLVED').length : undefined },
   ];
 
@@ -718,7 +718,7 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
                     <p className="text-xs opacity-80 mt-1.5">Note: {payout.adminNote}</p>
                   )}
 
-                  {payout.status === PayoutStatus.PAID && (
+                  {(payout.status === PayoutStatus.PAID || payout.status === PayoutStatus.IN_TRANSIT) && (
                     <>
                       {/* The admin has said they sent it; whether it arrived is
                           the only part they cannot know. Asking plainly beats

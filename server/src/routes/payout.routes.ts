@@ -235,12 +235,18 @@ router.post('/:id/approve', authenticate, authorize('ADMIN'), sensitiveLimiter, 
     const outboxIds: string[] = [];
 
     const result = await prisma.$transaction(async (tx) => {
-      // IN_TRANSIT, not PAID: approval means the transfer has been initiated,
-      // not that the funds have landed. Collapsing the two is what makes a shop
-      // owner think money is missing when their bank hasn't credited it yet.
+      // Approving and sending are one act here. The separate IN_TRANSIT step
+      // existed for an operation that authorises a batch in the morning and
+      // makes the transfers in the afternoon; a single admin sending UPI has no
+      // gap between the two, so the second step only asked them to re-assert
+      // something already true — and cost another OTP to do it.
+      //
+      // PAID means "we have sent this", which is the last thing an admin can
+      // truthfully claim. Whether it arrived is the shop's to say, and that is
+      // what CONFIRMED and DISPUTED are for.
       const updated = await tx.payout.updateMany({
         where: { id: payoutId, status: 'PENDING' },
-        data: { status: 'IN_TRANSIT', adminNote },
+        data: { status: 'PAID', paidAt: new Date(), adminNote },
       });
       if (updated.count === 0) throw ApiError.badRequest('Payout not found or invalid state');
 
@@ -259,7 +265,7 @@ router.post('/:id/approve', authenticate, authorize('ADMIN'), sensitiveLimiter, 
 
       outboxIds.push(await enqueuePayoutEvent(tx, payout.shopId, {
         payoutId: payout.id,
-        status: 'IN_TRANSIT',
+        status: 'PAID',
         amount: payout.amount,
       }));
 
@@ -468,7 +474,7 @@ router.post('/:id/confirm', authenticate, authorize('SHOP_OWNER'), async (req, r
     if (!shop || shop.id !== payout.shopId) throw ApiError.forbidden('Payout does not belong to your shop');
     
     const updated = await prisma.payout.updateMany({
-      where: { id: req.params.id as string, status: 'PAID' },
+      where: { id: req.params.id as string, status: { in: ['PAID', 'IN_TRANSIT'] } },
       data: { status: 'CONFIRMED', confirmedAt: new Date() }
     });
     if (updated.count === 0) throw ApiError.badRequest('Payout not found or invalid state');
@@ -490,7 +496,7 @@ router.post('/:id/dispute', authenticate, authorize('SHOP_OWNER'), async (req, r
     if (!shop || shop.id !== payout.shopId) throw ApiError.forbidden('Payout does not belong to your shop');
     
     const updated = await prisma.payout.updateMany({
-      where: { id: req.params.id as string, status: 'PAID' },
+      where: { id: req.params.id as string, status: { in: ['PAID', 'IN_TRANSIT'] } },
       data: { status: 'DISPUTED', shopOwnerNote }
     });
     if (updated.count === 0) throw ApiError.badRequest('Payout not found or invalid state');

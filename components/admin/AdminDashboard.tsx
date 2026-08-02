@@ -31,17 +31,20 @@ const PAYOUT_ACTION_COPY: Record<PayoutAction, {
   title: string; verb: string; confirm: string; tone: string; note: string;
 }> = {
   APPROVE_PAYOUT: {
-    title: 'Approve Payout',
-    verb: 'APPROVE',
-    confirm: 'Confirm Approval',
+    title: 'Approve & Mark Sent',
+    verb: 'APPROVE AND MARK SENT',
+    confirm: 'Confirm Sent',
     tone: 'text-emerald-600',
-    note: "This marks the transfer as initiated. The shop's ledger balance was already deducted when they requested it.",
+    note: "Do this once you have made the bank transfer. The shop is then asked to confirm it arrived, or to dispute it if it never does. Their balance was already deducted when they requested it.",
   },
   // Sent, not received. An admin knows when they made the transfer; only the
   // shop knows when it arrived, and the shop confirms that itself at this
   // stage. Asking the admin to wait for the money to land also deadlocked the
   // flow — the shop's Confirm button only appears once a payout is PAID, so a
   // payout left IN_TRANSIT could never be confirmed by anyone.
+  // Retained for payouts approved under the old two-step flow, which sit in
+  // IN_TRANSIT and would otherwise have no way forward. New approvals go
+  // straight to PAID and never reach this.
   MARK_PAID: {
     title: 'Mark Payout as Sent',
     verb: 'MARK AS SENT',
