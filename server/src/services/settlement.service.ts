@@ -27,26 +27,35 @@ import { enqueueShopEvent, publishQueued } from './realtime.service';
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000; // IST is UTC+5:30 year-round, no DST.
 
 /**
- * When money earned at `from` becomes withdrawable: at least
- * SETTLEMENT_DELAY_HOURS later, rounded up to the next daily release hour.
+ * When money earned at `from` becomes withdrawable: the release hour, N days
+ * after the day it was earned. T+1 by default, the settlement language every
+ * payment provider already uses.
+ *
+ * This deliberately does not add a fixed number of hours and then round up to
+ * the release hour. Doing both compounds them and puts a cliff at
+ * (release hour − delay): with a 24-hour hold, work finished at 05:59 cleared
+ * the next morning and work finished at 06:01 waited a further full day. Two
+ * minutes apart, double the wait, and nothing on the dashboard explaining it —
+ * with afternoon shops, which is most of them, always on the wrong side.
+ * Shortening the hold only moves the cliff to a different hour.
+ *
+ * Keyed on the IST calendar day, so the boundary is midnight — the one place a
+ * shop owner already expects one. "Everything you earn today is available
+ * tomorrow at 6" is a sentence that needs no further explanation, and it holds
+ * whatever time the order was completed.
  */
 export function computeAvailableAt(from: Date = new Date()): Date {
-  const earliest = from.getTime() + env.SETTLEMENT_DELAY_HOURS * 60 * 60 * 1000;
-
-  // Shift into IST so "6 AM" means 6 AM where the shops actually are.
-  const ist = new Date(earliest + IST_OFFSET_MS);
-  const releaseSameDay = Date.UTC(
-    ist.getUTCFullYear(),
-    ist.getUTCMonth(),
-    ist.getUTCDate(),
-    env.SETTLEMENT_RELEASE_HOUR_IST,
-    0, 0, 0
-  ) - IST_OFFSET_MS;
+  // Shift into IST so both "which day" and "6 AM" mean what the shops mean.
+  const ist = new Date(from.getTime() + IST_OFFSET_MS);
 
   return new Date(
-    releaseSameDay >= earliest
-      ? releaseSameDay
-      : releaseSameDay + 24 * 60 * 60 * 1000
+    Date.UTC(
+      ist.getUTCFullYear(),
+      ist.getUTCMonth(),
+      ist.getUTCDate() + env.SETTLEMENT_DELAY_DAYS,
+      env.SETTLEMENT_RELEASE_HOUR_IST,
+      0, 0, 0
+    ) - IST_OFFSET_MS
   );
 }
 

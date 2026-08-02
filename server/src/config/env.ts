@@ -143,8 +143,16 @@ export const env = {
   STUDENT_PASS_PRICE_PAISE: intFromEnv('STUDENT_PASS_PRICE_PAISE', 4900),
 
   // ── Settlement ──
-  /** Hours an earning stays in "clearing" before becoming withdrawable. */
-  SETTLEMENT_DELAY_HOURS: intFromEnv('SETTLEMENT_DELAY_HOURS', 24),
+  /**
+   * Days after the day it was earned that money becomes withdrawable. T+1.
+   *
+   * Replaces SETTLEMENT_DELAY_HOURS, which was added to the earning time and
+   * then rounded up to the release hour. Compounding the two put a cliff at
+   * (release hour − delay): work finished at 05:59 cleared next morning, work
+   * finished at 06:01 waited a further day. Shortening the hold only moved the
+   * cliff — see computeAvailableAt for why counting days is the fix.
+   */
+  SETTLEMENT_DELAY_DAYS: intFromEnv('SETTLEMENT_DELAY_DAYS', 1),
   /**
    * Hour of day (IST, 0-23) at which cleared earnings are released.
    *

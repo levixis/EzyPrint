@@ -91,11 +91,18 @@ describe('Balance movement', () => {
 });
 
 describe('Settlement timing', () => {
-  test('earnings are never available before the configured delay', () => {
-    const now = new Date('2026-08-01T10:00:00Z');
-    const availableAt = computeAvailableAt(now);
-    const delayMs = env.SETTLEMENT_DELAY_HOURS * 60 * 60 * 1000;
-    expect(availableAt.getTime()).toBeGreaterThanOrEqual(now.getTime() + delayMs);
+  test('earnings are released the configured number of days later, not hours', () => {
+    // This asserted a minimum hour-hold, which T+1 deliberately drops: money
+    // earned at 23:59 is available six hours later, and money earned a minute
+    // after midnight waits thirty. The guarantee is the calendar day, not a
+    // duration — see settlementTiming.test.ts for why compounding an
+    // hour-delay with a fixed release hour created a cliff.
+    const earned = new Date('2026-08-01T10:00:00Z');
+    const availableAt = computeAvailableAt(earned);
+
+    expect(availableAt.getTime()).toBeGreaterThan(earned.getTime());
+    const daysApart = (availableAt.getTime() - earned.getTime()) / (24 * 60 * 60 * 1000);
+    expect(daysApart).toBeLessThanOrEqual(env.SETTLEMENT_DELAY_DAYS + 1);
   });
 
   test('availability lands on the configured release hour in IST', () => {
