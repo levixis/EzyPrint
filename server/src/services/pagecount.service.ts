@@ -16,6 +16,45 @@ import { PDFDocument } from 'pdf-lib';
 /** Anything that isn't a PDF is a single page — images print one to a sheet. */
 const SINGLE_PAGE_MIME_PREFIXES = ['image/'];
 
+const PPTX_MIME = 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+
+/**
+ * Count slides in a PPTX.
+ *
+ * A .pptx is a zip; each slide is one `ppt/slides/slideN.xml` entry, and only
+ * the entry names are needed, so nothing is decompressed. This is deliberately
+ * the same algorithm as `parseDocument` in `components/student/FileUploadForm.tsx`
+ * — the student is quoted from the browser's count and charged from this one,
+ * and two different ways of counting the same deck is how the quote and the
+ * charge come to disagree.
+ *
+ * Without this, PPTX was accepted by the picker and by upload but could not be
+ * priced, so `repriceFromVerifiedPages` reported it unverifiable and checkout
+ * refused with "please re-upload this file" — advice that could never work,
+ * because re-uploading produced the same result. PPTX orders were unpayable.
+ */
+async function countPptxSlides(buffer: Buffer): Promise<PageCountResult> {
+  try {
+    const { default: JSZip } = await import('jszip');
+    const zip = await JSZip.loadAsync(buffer);
+
+    let slides = 0;
+    zip.folder('ppt/slides/')?.forEach((relativePath, entry) => {
+      if (!entry.dir && relativePath.startsWith('slide') && relativePath.endsWith('.xml')) {
+        slides++;
+      }
+    });
+
+    // A presentation with no slide parts is not something we can price from —
+    // it is either corrupt or not really a deck. Zero would price as free.
+    return slides > 0 ? { pages: slides, counted: true } : { pages: 0, counted: false };
+  } catch {
+    // Not a readable zip. The shop may still be able to open it, so the upload
+    // stands; it just cannot be priced from.
+    return { pages: 0, counted: false };
+  }
+}
+
 export interface PageCountResult {
   pages: number;
   /** False when the format is one we cannot introspect. */
@@ -25,13 +64,22 @@ export interface PageCountResult {
 /**
  * Count the pages in an uploaded file.
  *
- * Returns `counted: false` for formats we cannot parse (Office documents, plain
- * text). Callers decide what to do about that — pricing treats an uncounted
+ * Covers every format the student-facing picker offers: PDF, PPTX and images.
+ * Returns `counted: false` for anything else (Word, Excel, plain text — types
+ * the upload middleware still accepts for ticket attachments, which are never
+ * priced). Callers decide what to do about that; pricing treats an uncounted
  * file as unverifiable rather than silently trusting the client.
+ *
+ * Anything added to `SUPPORTED_FILE_TYPES` in `constants.ts` needs a branch
+ * here too, or it can be uploaded and then never paid for.
  */
 export async function countPages(buffer: Buffer, mimeType: string): Promise<PageCountResult> {
   if (SINGLE_PAGE_MIME_PREFIXES.some((prefix) => mimeType.startsWith(prefix))) {
     return { pages: 1, counted: true };
+  }
+
+  if (mimeType === PPTX_MIME) {
+    return countPptxSlides(buffer);
   }
 
   if (mimeType === 'application/pdf') {
