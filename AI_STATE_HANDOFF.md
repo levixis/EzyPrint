@@ -294,11 +294,35 @@ indexes match exactly, and zero `DOUBLE PRECISION` columns remain.
    blocks outbound SMTP on ports 25/465/587 — which is why OTP mail goes over
    Resend's HTTP API (`email.service.ts`) rather than Gmail SMTP — and drops the
    first request after idle. The $7 Starter plan is the fix for all three.
-4. [ ] Delete `.github/workflows/deploy.yml` and the legacy `functions/` +
-   `firestore.rules` / `storage.rules`. All still present; the workflow's
-   automatic trigger is removed but the file remains. **Note:** `firebase-admin`
-   on the server is now an FCM transport and is unrelated to that cleanup —
-   removing it disables push.
+4. [x] ~~Delete `.github/workflows/deploy.yml` and the legacy `functions/` +
+   `firestore.rules` / `storage.rules`.~~ **Done — repo side only.** Removed:
+   `functions/`, `firestore.rules`, `firestore.indexes.json`, `storage.rules`,
+   `database.rules.json`, `firebase.json`, `.firebaserc`, `.firebase/`,
+   `cors.json`, `firebase.ts.bak`, the workflow, and the unread `VITE_FIREBASE_*`
+   block in `.env.local`. **`firebase-admin` on the server is untouched** — it is
+   the FCM transport; removing it disables push.
+
+   **Still open, and it is the part that matters:** the legacy functions may
+   still be *deployed*. Deleting the source does not undeploy them. They hold a
+   divergent copy of the ledger/settlement logic and `functions/.env` shows they
+   ran against the **live** Razorpay key (`rzp_live_…`) while `server/.env` here
+   uses a test key. Schedulers keep firing on their own: `settleShopEarnings`,
+   `cleanupAbandonedOrders`, `autoEscalateRefundRequests` (12h),
+   `autoCloseResolvedTickets` (24h), `cleanupOldNotifications`, `cleanupOldTickets`,
+   `scheduledFirestoreExport`. The `onCall` refund entry points remain reachable
+   by any old APK still installed. Verify with
+   `firebase functions:list --project ezyyprint` and delete before disabling
+   Firestore — a function that loses its database mid-write is worse than one
+   that is gone.
+
+   `functions/.env` was **kept on disk** (gitignored, now the directory's only
+   file): it is the only local copy of the live Razorpay secret. Move it to a
+   password manager, then delete the directory.
+
+   Firebase products safe to disable once the functions are gone: Firestore,
+   Auth, Storage, Hosting. **Do not delete the Google Cloud project** — it holds
+   the FCM registration and the Google Sign-In OAuth client IDs
+   (`283831997162-…`) that `GOOGLE_CLIENT_IDS` and `capacitor.config.ts` depend on.
 5. [ ] Delete `server/.env.render` — a stale config pointing at a **non-pooled**
    Neon endpoint. It is not what the live service uses; do not copy it as-is.
 6. [ ] No CI runs either test suite. Both pass locally and nothing enforces that.

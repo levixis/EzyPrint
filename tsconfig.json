@@ -24,6 +24,6 @@
     "types": ["vite/client"] 
   },
   "include": ["src/**/*.ts", "src/**/*.tsx", "components/**/*.ts", "components/**/*.tsx", "contexts/**/*.ts", "contexts/**/*.tsx", "lib/**/*.ts", "hooks/**/*.ts"],
-  "exclude": ["vite.config.ts", "server", "functions", "android", "ios", "node_modules"],
+  "exclude": ["vite.config.ts", "server", "android", "ios", "node_modules"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

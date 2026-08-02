@@ -6,10 +6,10 @@ const config: CapacitorConfig = {
   webDir: 'dist',
   server: {
     // Allow navigation to external URLs (Google auth, Razorpay checkout, etc.)
+    // Sign-in goes through Google Identity Services directly, not Firebase Auth,
+    // so only the accounts.google.com / googleapis.com hosts are needed here.
     allowNavigation: [
       '*.razorpay.com',
-      '*.web.app',
-      '*.firebaseapp.com',
       '*.google.com',
       '*.googleapis.com',
       'accounts.google.com',
