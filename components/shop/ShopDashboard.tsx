@@ -187,17 +187,42 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
     () => [...ledgerEntries].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()),
     [ledgerEntries]
   );
-  const todayEarnings = useMemo(
-    () => sortedLedgerEntries
-      .filter(entry =>
-        entry.type === LedgerEntryType.ORDER_EARNING &&
-        entry.status !== LedgerEntryStatus.VOID &&
-        entry.amount > 0 &&
-        entry.createdAt >= todayStartIso
-      )
-      .reduce((sum, entry) => sum + entry.amount, 0),
-    [sortedLedgerEntries, todayStartIso]
-  );
+  /**
+   * What today actually earned, after anything taken back today.
+   *
+   * This summed ORDER_EARNING alone, so an order that was earned and then
+   * refunded on the same day still counted in full — the shop read a number it
+   * was never going to be paid, while "Where your money is" showed the truth
+   * one card below. Two figures on one screen disagreeing about money is worse
+   * than either being absent.
+   *
+   * Clamped at zero rather than shown negative: a clawback for an order earned
+   * on an earlier day would otherwise make "Today's Earnings" read as a loss,
+   * which is not what the card is answering. The balance panel is where a
+   * negative movement belongs, and it reports it.
+   */
+  const todayEarnings = useMemo(() => {
+    const CLAWBACK_TYPES: LedgerEntryType[] = [
+      LedgerEntryType.REFUND_DEDUCTION,
+      LedgerEntryType.CLAWBACK,
+    ];
+
+    const today = sortedLedgerEntries.filter(entry =>
+      entry.status !== LedgerEntryStatus.VOID &&
+      entry.amount > 0 &&
+      entry.createdAt >= todayStartIso
+    );
+
+    const earned = today
+      .filter(entry => entry.type === LedgerEntryType.ORDER_EARNING)
+      .reduce((sum, entry) => sum + entry.amount, 0);
+
+    const takenBack = today
+      .filter(entry => CLAWBACK_TYPES.includes(entry.type))
+      .reduce((sum, entry) => sum + entry.amount, 0);
+
+    return Math.max(0, earned - takenBack);
+  }, [sortedLedgerEntries, todayStartIso]);
   const recentLedgerEntries = useMemo(() => sortedLedgerEntries.slice(0, 6), [sortedLedgerEntries]);
   const lastSettlementAt = useMemo(() => {
     const settledEntry = [...sortedLedgerEntries]

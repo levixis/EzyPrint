@@ -272,8 +272,22 @@ export async function getShopAggregate(shopId: string, ownerUserId: string, isAd
       _count: true,
       _sum: { totalPrice: true, baseFee: true },
     }),
+    /**
+     * Everything that has actually left, whoever has acknowledged it.
+     *
+     * This counted `PAID` alone, so money stopped being "paid out" the moment
+     * a shop confirmed receiving it — the one event that proves it arrived.
+     * A shop with one confirmed payout saw "Paid Out ₹0", and because
+     * `lifetimeNetEarned` is built from this number, their lifetime earnings
+     * read ₹0 as well.
+     *
+     * `IN_TRANSIT` is here for rows created before approve and mark-sent were
+     * collapsed into one step. The same three statuses are what the dashboard,
+     * `AdminShopCard` and `AdminPayoutModal` already treat as sent, and this
+     * was the only place that disagreed.
+     */
     prisma.payout.aggregate({
-      where: { shopId, status: 'PAID' },
+      where: { shopId, status: { in: ['PAID', 'IN_TRANSIT', 'CONFIRMED'] } },
       _sum: { amount: true },
       _count: true,
     }),
