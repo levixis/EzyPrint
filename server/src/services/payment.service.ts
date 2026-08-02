@@ -1,5 +1,6 @@
 import Razorpay from 'razorpay';
 import crypto from 'crypto';
+import type { OrderStatus } from '@prisma/client';
 import { prisma } from '../utils/prisma';
 import { ApiError } from '../utils/ApiError';
 import { env } from '../config/env';
@@ -7,6 +8,7 @@ import * as ledgerService from './ledger.service';
 import * as realtimeService from './realtime.service';
 import * as orderService from './order.service';
 import * as notify from './notify.service';
+import { isStudentPassActive } from './pricing.service';
 
 /**
  * Payment Service — Razorpay integration with production-grade safety.
@@ -95,6 +97,119 @@ interface CreatePaymentResult {
   currency: string;
   orderId: string;     // our internal order ID
   key: string;       // Razorpay key ID for frontend
+  /**
+   * True when this order turned out to be paid already and no checkout should
+   * be opened. The client must show a confirmation instead of charging again.
+   */
+  paid?: boolean;
+  /** True when that payment was discovered here rather than already recorded. */
+  recovered?: boolean;
+  /** Human-readable reason, shown when `paid` is true. */
+  message?: string;
+}
+
+/**
+ * What the gateway had to say about an order we still consider unpaid.
+ *
+ * `unpaid` and `needs_review` must never be collapsed into one "not recovered"
+ * answer. They look similar — neither ends with the order marked paid — but
+ * they call for opposite handling: `unpaid` means no money moved and the
+ * student may safely be sent back to checkout, while `needs_review` means money
+ * *did* move and sending them back to checkout would ask them to pay twice.
+ */
+type RecoveryOutcome =
+  | { outcome: 'recovered'; paymentId: string }
+  | { outcome: 'unpaid' }
+  | { outcome: 'claimed_elsewhere' }
+  | { outcome: 'needs_review'; reason: string };
+
+/**
+ * Flag an order as needing a human, and tell the admins — once.
+ *
+ * The reconciliation sweep revisits the same stuck order every run, so an
+ * unguarded alert here would mail the admins about one order every fifteen
+ * minutes forever, which trains them to ignore the alert that matters. The
+ * marker write is the dedup: `paymentVerifiedVia` is set only when it is not
+ * already set to this value, and only the call whose update lands announces.
+ */
+async function flagForReview(orderId: string, reason: string): Promise<void> {
+  const marked = await prisma.order.updateMany({
+    where: { id: orderId, paymentVerifiedVia: { not: 'amount_mismatch' } },
+    data: { paymentVerifiedVia: 'amount_mismatch' },
+  });
+
+  if (marked.count === 0) return;
+
+  console.error(`⚠️ Order ${orderId} needs review: ${reason}`);
+  notify.notifyAdmins(`Payment on order ${orderId} needs review — ${reason}`, 'warning');
+}
+
+/**
+ * Adopt a payment Razorpay already captured for an order we still consider
+ * unpaid.
+ *
+ * A capture can end up stranded whenever the client stops listening before the
+ * verify call lands — the checkout was dismissed and then the UPI collect was
+ * approved a minute later, the app was killed, the network dropped. The money
+ * is gone from the student's account either way, so the only question is
+ * whether we notice.
+ *
+ * Guarded on the status we read, so a webhook that arrives while we are talking
+ * to Razorpay keeps ownership of the transition and the shop is told once.
+ */
+async function adoptCapturedPayment(order: {
+  id: string;
+  status: OrderStatus;
+  razorpayOrderId: string;
+  totalPrice: number;
+}): Promise<RecoveryOutcome> {
+  const razorpay = getRazorpay();
+
+  const rpOrder = await razorpay.orders.fetch(order.razorpayOrderId);
+  if (rpOrder.status !== 'paid') return { outcome: 'unpaid' };
+
+  const payments = await razorpay.orders.fetchPayments(order.razorpayOrderId);
+  const captured = (payments as any).items?.find((p: any) => p.status === 'captured');
+
+  // Razorpay considers the order paid but shows us no captured payment. Money
+  // is somewhere in that gap, so this is not a green light to charge again.
+  if (!captured) {
+    await flagForReview(
+      order.id,
+      `Razorpay reports order ${order.razorpayOrderId} paid but lists no captured payment`
+    );
+    return { outcome: 'needs_review', reason: 'the gateway reports this order as paid' };
+  }
+
+  // The same check the webhook makes: a capture proves money moved, not that
+  // the right amount moved. Anything else is left for a human — and critically,
+  // is not treated as "unpaid", because it is not.
+  if (captured.amount !== order.totalPrice) {
+    await flagForReview(
+      order.id,
+      `captured ${captured.amount} paise but the order costs ${order.totalPrice} ` +
+      `(payment ${captured.id})`
+    );
+    return { outcome: 'needs_review', reason: 'the amount received does not match this order' };
+  }
+
+  const applied = await prisma.order.updateMany({
+    where: { id: order.id, status: order.status },
+    data: {
+      status: 'PENDING_APPROVAL',
+      razorpayPaymentId: captured.id,
+      paymentVerifiedVia: 'recovery',
+    },
+  });
+
+  // Another path committed the same transition while we were at the gateway.
+  // The order is paid, just not by us — so still never reopen it.
+  if (applied.count === 0) return { outcome: 'claimed_elsewhere' };
+
+  await announcePaidOrder(order.id);
+  console.log(`🔄 Recovered order ${order.id} from ${order.status} — payment ${captured.id}`);
+
+  return { outcome: 'recovered', paymentId: captured.id as string };
 }
 
 /**
@@ -114,6 +229,94 @@ export async function createPaymentOrder(
   if (!preflight) throw ApiError.notFound('Order not found');
   if (preflight.userId !== userId) throw ApiError.forbidden('This is not your order');
 
+  // ── Retrying after a failed attempt ──
+  //
+  // A failed attempt leaves the order in PAYMENT_FAILED, and every write below
+  // — like verify, the webhook and reconciliation — is guarded on
+  // PENDING_PAYMENT. Without this the "Retry Payment" button answered "Order is
+  // in PAYMENT_FAILED status, not PENDING_PAYMENT" forever, so a declined card
+  // or a dismissed UPI prompt made the order permanently unpayable.
+  //
+  // Ask the gateway before reopening. PAYMENT_FAILED is set by the client the
+  // moment the checkout closes, which is a guess about what the student did
+  // next: a UPI collect approved after that reads as a failure here and a
+  // capture there. Charging again without looking would take the money twice.
+  if (preflight.status === 'PAYMENT_FAILED') {
+    // Only worth asking when an attempt actually reached the gateway. Without a
+    // Razorpay order there is nothing that could have been captured.
+    if (preflight.razorpayOrderId) {
+      const razorpayOrderId = preflight.razorpayOrderId;
+
+      const recovery = await adoptCapturedPayment({
+        id: preflight.id,
+        status: preflight.status,
+        razorpayOrderId,
+        totalPrice: preflight.totalPrice,
+      }).catch((error): RecoveryOutcome => {
+        // A gateway lookup that fails must not block the retry — the student is
+        // standing there wanting to pay. Treating an outage as `unpaid` reopens
+        // the order, and the same Razorpay order is reused below, so a capture
+        // that did happen is still found by the reconciliation sweep. Razorpay
+        // also refuses a second payment against an order it already considers
+        // paid, so the gateway itself backstops the double charge.
+        console.error(`[payment] could not check ${razorpayOrderId} before retry:`, error);
+        return { outcome: 'unpaid' };
+      });
+
+      // Anything other than a clean "no money moved" must not send the student
+      // back to checkout. `recovered` and `claimed_elsewhere` mean the order is
+      // paid; `needs_review` means money moved in a way we cannot reconcile.
+      // Reopening on any of them is how one payment becomes two.
+      if (recovery.outcome === 'recovered' || recovery.outcome === 'claimed_elsewhere') {
+        return {
+          razorpayOrderId,
+          amount: preflight.totalPrice,
+          currency: 'INR',
+          orderId,
+          key: env.RAZORPAY_KEY_ID,
+          paid: true,
+          recovered: recovery.outcome === 'recovered',
+          message: 'Your earlier payment did go through. The order has been sent to the shop.',
+        };
+      }
+
+      if (recovery.outcome === 'needs_review') {
+        // Deliberately a hard stop rather than a retry. The student is told the
+        // truth — their money is accounted for and a human is looking — instead
+        // of being invited to pay a second time for an order that already took
+        // one payment.
+        throw ApiError.conflict(
+          `We have found a payment against this order but ${recovery.reason}. ` +
+          `Our team has been alerted and will sort this out — please do not pay again.`
+        );
+      }
+    }
+
+    // Genuinely unpaid — reopen it. PAYMENT_FAILED -> PENDING_PAYMENT is
+    // already a legal edge in VALID_TRANSITIONS; the payment path just never
+    // took it. Any existing Razorpay order is kept and reused: an order stays
+    // open across failed attempts, and minting a new one would orphan the old
+    // id that a late webhook still refers to.
+    const reopened = await prisma.order.updateMany({
+      where: { id: orderId, status: 'PAYMENT_FAILED' },
+      data: { status: 'PENDING_PAYMENT' },
+    });
+
+    if (reopened.count === 0) {
+      // Something else moved it while we were at the gateway. Everything below
+      // re-reads the row, so it decides on what is true now.
+      console.log(`[payment] order ${orderId} left PAYMENT_FAILED during retry setup`);
+    }
+  }
+
+  // Re-read once the retry path may have reopened the order, so the repricing
+  // decision below sees the status this request actually operates on rather
+  // than the one it walked in with.
+  const current = preflight.status === 'PAYMENT_FAILED'
+    ? await prisma.order.findUnique({ where: { id: orderId } })
+    : preflight;
+  if (!current) throw ApiError.notFound('Order not found');
+
   // ── Price the order from pages the server counted, before charging ──
   //
   // `pageCount` reaches the order from the browser and is the multiplier in
@@ -126,7 +329,7 @@ export async function createPaymentOrder(
   // can still move without a student having been charged. If it moves we stop
   // rather than charging the corrected figure: the amount taken must be the
   // amount that was on screen when they agreed to it.
-  if (!preflight.razorpayOrderId && preflight.status === 'PENDING_PAYMENT') {
+  if (!current.razorpayOrderId && current.status === 'PENDING_PAYMENT') {
     const repriced = await orderService.repriceFromVerifiedPages(orderId);
 
     if (repriced.unverifiable.length > 0) {
@@ -505,6 +708,8 @@ async function processWebhookEvent(eventType: string, event: any, eventId: strin
       }
 
       let paidOrderId: string | null = null;
+      let mismatchedOrderId: string | null = null;
+      let mismatchReason = '';
 
       await prisma.$transaction(async (tx) => {
         const order = await tx.order.findFirst({
@@ -524,20 +729,33 @@ async function processWebhookEvent(eventType: string, event: any, eventId: strin
         const amountMatches = order ? payment.amount === order.totalPrice : false;
 
         if (order && !amountMatches) {
-          console.error(
-            `⚠️ Amount mismatch on order ${order.id}: paid ${payment.amount}, ` +
-            `expected ${order.totalPrice} (payment ${rpPaymentId}) — leaving unpaid for review.`
-          );
+          // Money moved and we are declining to fulfil against it, so somebody
+          // has to be told. A console line in a log nobody reads is how a
+          // student ends up out of pocket with the order still showing unpaid.
+          mismatchedOrderId = order.id;
+          mismatchReason =
+            `captured ${payment.amount} paise but the order costs ${order.totalPrice} ` +
+            `(payment ${rpPaymentId})`;
         }
 
-        // Only process if order exists, is still pending payment, and the sum agrees
-        if (order && order.status === 'PENDING_PAYMENT' && amountMatches) {
+        // Only process if the order exists, has not been paid already, and the
+        // sum agrees.
+        //
+        // PAYMENT_FAILED is accepted as well as PENDING_PAYMENT: the client
+        // writes that status when the checkout sheet closes, which routinely
+        // happens before a UPI collect is approved. Razorpay is the authority on
+        // whether money moved, and it is telling us here that it did — refusing
+        // on the strength of our own guess is how a captured payment ended up
+        // attached to a dead order.
+        const claimable = order?.status === 'PENDING_PAYMENT' || order?.status === 'PAYMENT_FAILED';
+
+        if (order && claimable && amountMatches) {
           // Guarded on the status rather than a bare update: the signature path
           // may have committed the same transition between the read above and
           // this write, and only the caller whose update actually lands may
           // announce the order to the shop.
           const applied = await tx.order.updateMany({
-            where: { id: order.id, status: 'PENDING_PAYMENT' },
+            where: { id: order.id, status: order.status },
             data: {
               status: 'PENDING_APPROVAL',
               razorpayPaymentId: rpPaymentId,
@@ -555,8 +773,11 @@ async function processWebhookEvent(eventType: string, event: any, eventId: strin
       });
 
       // After commit — an announcement about a transaction that later rolled
-      // back would tell a shop to print an order that was never paid for.
+      // back would tell a shop to print an order that was never paid for. The
+      // same applies to the review flag, which writes to the order row and
+      // would otherwise be raising an alarm about work that never happened.
       if (paidOrderId) await announcePaidOrder(paidOrderId);
+      if (mismatchedOrderId) await flagForReview(mismatchedOrderId, mismatchReason);
       break;
     }
 
@@ -748,60 +969,52 @@ async function processWebhookEvent(eventType: string, event: any, eventId: strin
 export async function reconcilePayments(thresholdMinutes: number = 15) {
   const threshold = new Date(Date.now() - thresholdMinutes * 60 * 1000);
 
-  // Find orders stuck in PENDING_PAYMENT with a Razorpay order ID
-  // that were created more than `thresholdMinutes` ago
+  // Orders that reached the gateway but never landed as paid here, more than
+  // `thresholdMinutes` ago.
+  //
+  // PAYMENT_FAILED is included deliberately. That status is written by the
+  // client the instant the checkout sheet closes, which is a guess: a student
+  // who dismissed the sheet and then approved the UPI collect in their bank app
+  // is recorded as failed here and captured at Razorpay. Sweeping only
+  // PENDING_PAYMENT left exactly those payments stranded — money taken, order
+  // dead, and nothing in the system looking for it.
   const stuckOrders = await prisma.order.findMany({
     where: {
-      status: 'PENDING_PAYMENT',
+      status: { in: ['PENDING_PAYMENT', 'PAYMENT_FAILED'] },
       razorpayOrderId: { not: null },
       paymentAttemptedAt: { lt: threshold },
     },
     select: {
       id: true,
+      status: true,
       razorpayOrderId: true,
       totalPrice: true,
     },
   });
 
-  if (stuckOrders.length === 0) {
-    return { reconciled: 0, checked: 0, retriedWebhooks: 0 };
-  }
-
-  const razorpay = getRazorpay();
+  // No early return when there is nothing stuck. There used to be one, and it
+  // skipped the unprocessed-webhook retry below with it — so a webhook that
+  // died mid-processing was only ever retried on a sweep that happened to also
+  // find a stuck order. The two halves of this job are independent, and the
+  // webhook half is the one that recovers events nothing else will.
   let reconciled = 0;
+  let flagged = 0;
 
   for (const order of stuckOrders) {
     try {
-      // Ask Razorpay: "What's the actual status of this order?"
-      const rpOrder = await razorpay.orders.fetch(order.razorpayOrderId!);
+      // Same helper the retry path uses, so the two cannot come to different
+      // conclusions about what counts as a recoverable payment — including the
+      // amount check, which is the part that matters. Anything needing a human
+      // has already alerted the admins from inside, once.
+      const recovery = await adoptCapturedPayment({
+        id: order.id,
+        status: order.status,
+        razorpayOrderId: order.razorpayOrderId!,
+        totalPrice: order.totalPrice,
+      });
 
-      if (rpOrder.status === 'paid') {
-        // Razorpay says paid but our DB says pending — the webhook was missed.
-        // Fetch the payment details to get the payment ID
-        const payments = await razorpay.orders.fetchPayments(order.razorpayOrderId!);
-        const capturedPayment = (payments as any).items?.find(
-          (p: any) => p.status === 'captured'
-        );
-
-        if (capturedPayment) {
-          // Guarded so a webhook that arrived while we were talking to Razorpay
-          // keeps ownership of the transition, and the shop is told once.
-          const applied = await prisma.order.updateMany({
-            where: { id: order.id, status: 'PENDING_PAYMENT' },
-            data: {
-              status: 'PENDING_APPROVAL',
-              razorpayPaymentId: capturedPayment.id,
-              paymentVerifiedVia: 'reconciliation',
-            },
-          });
-
-          if (applied.count === 1) {
-            await announcePaidOrder(order.id);
-            reconciled++;
-            console.log(`🔄 Reconciled order ${order.id} — payment ${capturedPayment.id}`);
-          }
-        }
-      }
+      if (recovery.outcome === 'recovered') reconciled++;
+      if (recovery.outcome === 'needs_review') flagged++;
     } catch (error) {
       // Don't let one failed reconciliation kill the whole batch
       console.error(`❌ Reconciliation failed for order ${order.id}:`, error);
@@ -829,6 +1042,8 @@ export async function reconcilePayments(thresholdMinutes: number = 15) {
   return {
     checked: stuckOrders.length,
     reconciled,
+    /** Payments that moved money we could not match to an order. Admins alerted. */
+    flagged,
     retriedWebhooks: unprocessedEvents.length,
   };
 }
@@ -836,14 +1051,6 @@ export async function reconcilePayments(thresholdMinutes: number = 15) {
 // ────────────────────────────────────────────────────────────
 // STUDENT PASS
 // ────────────────────────────────────────────────────────────
-
-/** How long a pass lasts. Mirrors isStudentPassActive in order.service.ts. */
-const PASS_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
-
-function passIsActive(hasPass: boolean, activatedAt: Date | null): boolean {
-  if (!hasPass || !activatedAt) return false;
-  return Date.now() < activatedAt.getTime() + PASS_DURATION_MS;
-}
 
 /**
  * Create a Razorpay order for a Student Pass.
@@ -862,7 +1069,7 @@ export async function createStudentPassOrder(userId: string) {
 
   // Refusing rather than stacking: a second pass bought while one is live would
   // silently reset the 30 days and lose the remainder the student paid for.
-  if (passIsActive(user.hasStudentPass, user.studentPassActivatedAt)) {
+  if (isStudentPassActive(user.hasStudentPass, user.studentPassActivatedAt)) {
     throw ApiError.badRequest('Your Student Pass is still active.');
   }
 

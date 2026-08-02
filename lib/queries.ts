@@ -11,11 +11,17 @@
 
 import * as api from './api';
 import {
+  parseResponse,
   parseListResponse,
   supportTicketSchema,
   orderSchema,
   payoutSchema,
   refundRequestSchema,
+  ledgerEntrySchema,
+  notificationSchema,
+  userSchema,
+  referralCodeSchema,
+  reactivationRequestSchema,
 } from './schemas';
 import type {
   User, ShopProfile, DocumentOrder, NotificationMessage,
@@ -89,7 +95,8 @@ export const userApi = {
     if (params?.limit) query.set('limit', String(params.limit));
     if (params?.offset) query.set('offset', String(params.offset));
     const qs = query.toString();
-    return api.get<{ users: User[], pagination: any }>(`/users${qs ? `?${qs}` : ''}`).then(r => r.users);
+    return api.get<{ users: unknown; pagination: any }>(`/users${qs ? `?${qs}` : ''}`)
+      .then(r => parseListResponse(userSchema, r.users, 'usersApi.list') as unknown as User[]);
   },
 };
 
@@ -178,11 +185,16 @@ export const orderApi = {
     if (params?.limit) query.set('limit', String(params.limit));
     if (params?.offset) query.set('offset', String(params.offset));
     const qs = query.toString();
-    return api.get<{ orders: DocumentOrder[] }>(`/orders/admin/all${qs ? `?${qs}` : ''}`).then(r => r.orders);
+    // Guarded like `list` above — same collection, same components rendering
+    // it. Only the student/shop endpoint was checked, so the admin view of the
+    // very same orders had no protection at all.
+    return api.get<{ orders: unknown }>(`/orders/admin/all${qs ? `?${qs}` : ''}`)
+      .then(r => parseListResponse(orderSchema, r.orders, 'orderApi.listAll') as unknown as DocumentOrder[]);
   },
 
   getById: (orderId: string) =>
-    api.get<{ order: DocumentOrder }>(`/orders/${orderId}`).then(r => r.order),
+    api.get<{ order: unknown }>(`/orders/${orderId}`)
+      .then(r => parseResponse(orderSchema, r.order, 'orderApi.getById') as unknown as DocumentOrder),
 
   updateStatus: (orderId: string, status: OrderStatus, details?: {
     shopNotes?: string; paymentAttemptedAt?: string;
@@ -197,10 +209,24 @@ export const orderApi = {
 // ──────────────────────────────────────────────
 
 export const paymentApi = {
+  /**
+   * Set up a payment for an order — or report that it was already paid.
+   *
+   * `paid` comes back when a retry turned out to be unnecessary: the earlier
+   * attempt had actually been captured at the gateway and the server has just
+   * adopted it. The caller must show `message` and open no checkout, otherwise
+   * the student is charged a second time for the order they already paid for.
+   */
   createOrder: (orderId: string) =>
-    api.post<{ razorpayOrderId: string; amount: number; currency: string; key: string }>(
-      '/payments/create-order', { orderId }
-    ),
+    api.post<{
+      razorpayOrderId: string;
+      amount: number;
+      currency: string;
+      key: string;
+      paid?: boolean;
+      recovered?: boolean;
+      message?: string;
+    }>('/payments/create-order', { orderId }),
 
   verify: (data: {
     razorpay_order_id: string;
@@ -283,7 +309,13 @@ export const notificationApi = {
     const query = new URLSearchParams();
     if (params?.limit) query.set('limit', String(params.limit));
     const qs = query.toString();
-    return api.get<{ notifications: NotificationMessage[] }>(`/notifications${qs ? `?${qs}` : ''}`).then(r => r.notifications);
+    return api
+      .get<{ notifications: unknown }>(`/notifications${qs ? `?${qs}` : ''}`)
+      .then(r => parseListResponse(
+        notificationSchema,
+        r.notifications,
+        'notificationApi.list'
+      ) as unknown as NotificationMessage[]);
   },
 
   markAsRead: (notificationId: string) =>
@@ -308,8 +340,17 @@ export const ticketApi = {
   list: () => api.get<{ tickets: unknown }>('/tickets')
     .then(r => parseListResponse(supportTicketSchema, r.tickets, 'ticketApi.list') as unknown as SupportTicket[]),
 
+  /**
+   * The detail view — and the screen the second blank page came from.
+   *
+   * `list` was guarded after `messages` blanked the ticket list; opening a
+   * ticket then blanked on `statusHistory`, because the guard went on the list
+   * and this returns a ticket too. Every collection on the schema is defaulted,
+   * so a missing one renders as empty here as well.
+   */
   getById: (ticketId: string) =>
-    api.get<{ ticket: SupportTicket }>(`/tickets/${ticketId}`).then(r => r.ticket),
+    api.get<{ ticket: unknown }>(`/tickets/${ticketId}`)
+      .then(r => parseResponse(supportTicketSchema, r.ticket, 'ticketApi.getById') as unknown as SupportTicket),
 
   addMessage: (ticketId: string, message: string) =>
     api.post<{ message: { id: string } }>(`/tickets/${ticketId}/messages`, { message }),
@@ -333,7 +374,24 @@ export const payoutApi = {
     if (params?.limit) query.set('limit', String(params.limit));
     if (params?.offset) query.set('offset', String(params.offset));
     const qs = query.toString();
-    return api.get<{ entries: ShopLedgerEntry[]; pagination: any; currentBalance: number; ledgerBalance: number }>(`/payouts/ledger/${shopId}${qs ? `?${qs}` : ''}`);
+    return api
+      .get<{ entries: unknown; pagination: any; currentBalance: number; ledgerBalance: number }>(
+        `/payouts/ledger/${shopId}${qs ? `?${qs}` : ''}`
+      )
+      .then(r => ({
+        ...r,
+        // The shop dashboard sorts, filters and reduces over this to produce
+        // "Today's Earnings" and the activity list. It was an unchecked `as`,
+        // so an endpoint that answered without `entries` spread `undefined` and
+        // blanked the screen that shows a shop its money — the worst possible
+        // one to lose, because a blank money page is indistinguishable from
+        // having none.
+        entries: parseListResponse(
+          ledgerEntrySchema,
+          r.entries,
+          'payoutApi.getLedger'
+        ) as unknown as ShopLedgerEntry[],
+      }));
   },
 
   request: (data: { shopId: string; amount: number; shopOwnerNote?: string }) =>
@@ -403,9 +461,15 @@ export const refundApi = {
     api.post(`/refunds/${requestId}/resolve`, { action, otp, adminNote }),
 
   syncHistory: (orderId: string) =>
-    api.get<{ success: boolean; count: number; refunds: RefundRequest[] }>(
-      `/refunds/history/${orderId}`
-    ),
+    api.get<{ success: boolean; count: number; refunds: unknown }>(`/refunds/history/${orderId}`)
+      .then(r => ({
+        ...r,
+        refunds: parseListResponse(
+          refundRequestSchema,
+          r.refunds,
+          'refundApi.syncHistory'
+        ) as unknown as RefundRequest[],
+      })),
 
   list: () => api.get<unknown>('/refunds')
     .then(d => parseListResponse(refundRequestSchema, d, 'refundApi.list') as unknown as RefundRequest[]),
@@ -440,7 +504,12 @@ export const reactivationApi = {
   resolve: (requestId: string, action: 'approve' | 'reject', otp: string, rejectionReason?: string) =>
     api.post<{ success: boolean; message?: string }>(`/reactivation/${requestId}/resolve`, { action, otp, rejectionReason }),
 
-  list: () => api.get<ReactivationRequest[]>('/reactivation'),
+  list: () => api.get<unknown>('/reactivation')
+    .then(d => parseListResponse(
+      reactivationRequestSchema,
+      d,
+      'reactivationApi.list'
+    ) as unknown as ReactivationRequest[]),
 };
 
 // ──────────────────────────────────────────────
@@ -455,7 +524,10 @@ export const adminApi = {
     api.post<{ success: boolean; message?: string }>('/admin/action', { action, otp, targetUid, targetShopId }),
 
   getStudentPassHolders: () =>
-    api.get<{ users: { id: string; name?: string; email?: string; studentPassActivatedAt?: string; studentPassPaymentId?: string }[] }>('/users?type=STUDENT&hasPass=true').then(r => r.users),
+    api.get<{ users: unknown }>('/users?type=STUDENT&hasPass=true')
+      .then(r => parseListResponse(userSchema, r.users, 'adminApi.getStudentPassHolders') as unknown as {
+        id: string; name?: string; email?: string; studentPassActivatedAt?: string; studentPassPaymentId?: string;
+      }[]),
 
   checkReturningShopOwner: (email: string) =>
     api.post<{
@@ -489,7 +561,8 @@ export interface ReferralCode {
 }
 
 export const referralApi = {
-  list: () => api.get<{ codes: ReferralCode[] }>('/referrals').then(r => r.codes),
+  list: () => api.get<{ codes: unknown }>('/referrals')
+    .then(r => parseListResponse(referralCodeSchema, r.codes, 'referralApi.list') as unknown as ReferralCode[]),
   create: (daysValid: number = 7) => api.post<{ code: ReferralCode }>('/referrals', { daysValid }).then(r => r.code),
   delete: (codeId: string) => api.del<{ success: boolean; message: string }>(`/referrals/${codeId}`),
 };

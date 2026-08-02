@@ -72,33 +72,29 @@ const StudentOrderList: React.FC<StudentOrderListProps> = ({ orders }) => {
     if (processingOrderId) return;
     setProcessingOrderId(order.id);
 
-    // SAFETY: If this is a retry (PAYMENT_FAILED), check if the previous payment
-    // was actually captured by Razorpay before creating a new payment.
-    if (order.status === OrderStatus.PAYMENT_FAILED && order.razorpayOrderId) {
-      setStatusMessage('Checking previous payment...');
-      try {
-        const checkData = await paymentApi.createOrder(order.id) as unknown as { paid: boolean; recovered?: boolean; message: string };
-
-        if (checkData.paid && checkData.recovered) {
-          // Payment was already captured! Order has been recovered.
-          setInfoDialog({
-            title: 'Payment Recovered',
-            message: 'Good news! Your previous payment was successful. The order has been updated.',
-          });
-          setProcessingOrderId(null);
-          setStatusMessage('');
-          return;
-        }
-      } catch (checkErr) {
-        debugLog('Payment status check failed, proceeding with new payment:', checkErr);
-        // Continue with new payment if check fails
-      }
-    }
-
-    setStatusMessage('Creating order...');
+    const isRetry = order.status === OrderStatus.PAYMENT_FAILED;
+    setStatusMessage(isRetry ? 'Checking previous payment...' : 'Creating order...');
 
     try {
       const data = await paymentApi.createOrder(order.id);
+
+      // The server checks the gateway before letting a failed attempt be
+      // retried, because "payment failed" is only ever our guess — a UPI collect
+      // approved after the sheet closed is recorded as a failure here and a
+      // capture there. When it reports the money already arrived, the order is
+      // paid: show that instead of opening a checkout the student would be
+      // charged by twice.
+      if (data.paid) {
+        setInfoDialog({
+          title: 'Payment already received',
+          message: data.message || 'Your previous payment was successful. The order has been updated.',
+        });
+        await refreshOrders();
+        setProcessingOrderId(null);
+        setShowOverlay(false);
+        setStatusMessage('');
+        return;
+      }
 
       const baseOptions: Record<string, unknown> = {
         key: data.key || RAZORPAY_KEY_ID,
