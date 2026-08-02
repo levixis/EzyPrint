@@ -1,6 +1,6 @@
 import { prisma } from '../utils/prisma';
 import { ApiError } from '../utils/ApiError';
-import { calculateOrderPrice } from './pricing.service';
+import { calculateOrderPrice, isStudentPassActive } from './pricing.service';
 import { creditOrderEarning } from './settlement.service';
 import { enqueueShopEvent, publishQueued } from './realtime.service';
 import { claimCancellationRefund, settleClaimedRefund } from './refund.service';
@@ -211,17 +211,6 @@ export async function createOrder(input: CreateOrderInput) {
       totalPrice,
     }
   };
-}
-
-/**
- * A Student Pass lasts 30 days from activation.
- * Mirrors `isStudentPassActive` in the frontend's utils/pricing.ts.
- */
-const PASS_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
-
-function isStudentPassActive(hasPass?: boolean, activatedAt?: Date | null): boolean {
-  if (!hasPass || !activatedAt) return false;
-  return Date.now() < activatedAt.getTime() + PASS_DURATION_MS;
 }
 
 // ────────────────────────────────────────────────────────────

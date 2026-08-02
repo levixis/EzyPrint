@@ -36,3 +36,45 @@ export function formatDate(value: unknown, fallback = ''): string {
   const date = toDate(value);
   return date ? date.toLocaleDateString() : fallback;
 }
+
+// ─────────────────────────────────────────────────────────────
+// THE MONEY DAY
+//
+// Every boundary the server draws around money is midnight IST: settlement
+// (`settlement.service.computeAvailableAt`), the shop's daily refund cap
+// (`refund.service.startOfDayIST`). Anything on this side that summarises the
+// same money has to draw it in the same place, or the two disagree by up to a
+// day and the shop sees a figure the ledger will not back up.
+//
+// Device-local midnight is not the same boundary. It is only equal on a device
+// set to IST, which is most of them and therefore the reason this kind of bug
+// survives testing.
+// ─────────────────────────────────────────────────────────────
+
+/** IST is UTC+5:30 year-round, no DST. */
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+/**
+ * The instant today began in IST.
+ *
+ * Deliberately the same computation as `startOfDayIST` on the server, so a
+ * figure summed against this window covers exactly the entries the server
+ * considers to be today's.
+ */
+export function startOfTodayIST(now: Date = new Date()): Date {
+  const ist = new Date(now.getTime() + IST_OFFSET_MS);
+  ist.setUTCHours(0, 0, 0, 0);
+  return new Date(ist.getTime() - IST_OFFSET_MS);
+}
+
+/**
+ * How long until the IST day rolls over.
+ *
+ * A print shop leaves its dashboard open all day, so "today" cannot be decided
+ * once at mount and kept — it has to be re-derived when the day actually
+ * changes, or the card keeps reporting a window that closed hours ago.
+ */
+export function msUntilNextIstMidnight(now: Date = new Date()): number {
+  const nextMidnight = startOfTodayIST(now).getTime() + 24 * 60 * 60 * 1000;
+  return Math.max(0, nextMidnight - now.getTime());
+}

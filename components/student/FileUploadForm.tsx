@@ -159,10 +159,13 @@ const FileUploadForm: React.FC<FileUploadFormProps> = ({ userId, isLoadingShops,
         continue;
       }
 
-      // Client-side size guard (matches 50MB Storage rule)
-      const MAX_FILE_SIZE = 50 * 1024 * 1024;
+      // Mirrors MAX_FILE_SIZE in server/src/middleware/upload.ts. The old 50MB
+      // here referred to a Firebase Storage rule that no longer exists, so
+      // anything between 20 and 50MB was accepted, parsed, priced and only
+      // rejected by the server after the whole file had been uploaded.
+      const MAX_FILE_SIZE = 20 * 1024 * 1024;
       if (file.size > MAX_FILE_SIZE) {
-        setError(`File "${file.name}" exceeds 50MB limit. Please use a smaller file.`);
+        setError(`File "${file.name}" exceeds the 20MB limit. Please use a smaller file.`);
         continue;
       }
 

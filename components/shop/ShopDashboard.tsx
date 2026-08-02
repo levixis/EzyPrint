@@ -18,6 +18,8 @@ interface ShopDashboardProps {
 import { useGSAP } from '@gsap/react';
 import gsap from 'gsap';
 import { formatMoney, rupeesToPaise, paiseToRupees } from '../../utils/money';
+import { startOfTodayIST, msUntilNextIstMidnight } from '../../utils/datetime';
+import { sumTodayEarnings } from '../../utils/ledgerSummary';
 
 const getLedgerEntryTone = (entry: ShopLedgerEntry) => {
   if (entry.type === LedgerEntryType.PAYOUT) {
@@ -178,51 +180,38 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
   const lifetimeNetEarned = redeemableAmount + pendingAmount + totalPaidOut;
   const hasRefundOffset = debtAmount > 0;
 
-  const todayStart = useMemo(() => {
-    const now = new Date();
-    return new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  }, []);
+  /**
+   * When today began, in IST — the boundary the server settles on.
+   *
+   * This used to be `new Date(y, m, d)`, which is midnight on whatever timezone
+   * the device happens to be set to. On an IST device that is the same instant,
+   * which is why it survived; anywhere else "Today's Earnings" summed a window
+   * up to a day out of step with the balances shown directly beneath it.
+   *
+   * Held in state and re-armed rather than computed once, because a print shop
+   * leaves this screen open all day. As a `useMemo` with no dependencies it was
+   * fixed at mount, so at 00:01 the card still reported yesterday and kept
+   * doing so until someone reloaded.
+   */
+  const [todayStart, setTodayStart] = useState(() => startOfTodayIST());
+
+  useEffect(() => {
+    const timer = window.setTimeout(
+      () => setTodayStart(startOfTodayIST()),
+      msUntilNextIstMidnight()
+    );
+    return () => window.clearTimeout(timer);
+  }, [todayStart]);
+
   const todayStartIso = useMemo(() => todayStart.toISOString(), [todayStart]);
   const sortedLedgerEntries = useMemo(
     () => [...ledgerEntries].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()),
     [ledgerEntries]
   );
-  /**
-   * What today actually earned, after anything taken back today.
-   *
-   * This summed ORDER_EARNING alone, so an order that was earned and then
-   * refunded on the same day still counted in full — the shop read a number it
-   * was never going to be paid, while "Where your money is" showed the truth
-   * one card below. Two figures on one screen disagreeing about money is worse
-   * than either being absent.
-   *
-   * Clamped at zero rather than shown negative: a clawback for an order earned
-   * on an earlier day would otherwise make "Today's Earnings" read as a loss,
-   * which is not what the card is answering. The balance panel is where a
-   * negative movement belongs, and it reports it.
-   */
-  const todayEarnings = useMemo(() => {
-    const CLAWBACK_TYPES: LedgerEntryType[] = [
-      LedgerEntryType.REFUND_DEDUCTION,
-      LedgerEntryType.CLAWBACK,
-    ];
-
-    const today = sortedLedgerEntries.filter(entry =>
-      entry.status !== LedgerEntryStatus.VOID &&
-      entry.amount > 0 &&
-      entry.createdAt >= todayStartIso
-    );
-
-    const earned = today
-      .filter(entry => entry.type === LedgerEntryType.ORDER_EARNING)
-      .reduce((sum, entry) => sum + entry.amount, 0);
-
-    const takenBack = today
-      .filter(entry => CLAWBACK_TYPES.includes(entry.type))
-      .reduce((sum, entry) => sum + entry.amount, 0);
-
-    return Math.max(0, earned - takenBack);
-  }, [sortedLedgerEntries, todayStartIso]);
+  const todayEarnings = useMemo(
+    () => sumTodayEarnings(sortedLedgerEntries, todayStartIso),
+    [sortedLedgerEntries, todayStartIso]
+  );
   const recentLedgerEntries = useMemo(() => sortedLedgerEntries.slice(0, 6), [sortedLedgerEntries]);
   const lastSettlementAt = useMemo(() => {
     const settledEntry = [...sortedLedgerEntries]

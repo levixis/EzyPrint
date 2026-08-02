@@ -39,6 +39,30 @@ const DOUBLE_SIDED_SHEET_MULTIPLIER = 1.5;
 /** Page cost at or below which a Student Pass waives the base fee (₹30). */
 const STUDENT_PASS_FEE_WAIVER_CEILING = 3000;
 
+/** How long a Student Pass lasts from activation. */
+const PASS_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * Whether a Student Pass is still live.
+ *
+ * Here rather than beside either caller because a pass is a pricing input, and
+ * it had grown two independent copies on this side — one in `order.service`
+ * deciding what to charge, one in `payment.service` deciding whether a second
+ * pass may be sold. Two implementations of one rule disagree eventually, and
+ * the disagreement here is a student either charged a fee they paid to avoid or
+ * sold a pass that overwrites the one they are still using.
+ *
+ * `utils/pricing.ts` mirrors this for the live estimate in the browser; that
+ * one cannot be shared, and has to be kept in step by hand.
+ */
+export function isStudentPassActive(
+  hasPass?: boolean | null,
+  activatedAt?: Date | null
+): boolean {
+  if (!hasPass || !activatedAt) return false;
+  return Date.now() < activatedAt.getTime() + PASS_DURATION_MS;
+}
+
 /**
  * Platform fee on top of page cost. Thresholds read as ₹5 / ₹30 / ₹70 and the
  * fees as ₹2 / ₹3 / ₹4 / ₹5.

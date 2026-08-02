@@ -39,8 +39,13 @@ export async function uploadSingle(req: Request, res: Response, next: NextFuncti
         throw ApiError.badRequest('Order file already linked. Pass replace=true to overwrite.');
       }
       
+      // Scoped to the slot being filled, not to the id alone. `uploadId` is
+      // minted by the browser, so a global lookup answers "has anyone anywhere
+      // used this id" — and on a collision it would hand this caller another
+      // order's storage key and skip linking their file, leaving their own
+      // order with nothing attached.
       const existing = await prisma.orderFile.findUnique({ where: { uploadId } });
-      if (existing && existing.fileStoragePath) {
+      if (existing && existing.fileStoragePath && existing.id === targetOrderFile.id) {
         return res.status(200).json({ success: true, message: 'File already uploaded', data: { storageKey: existing.fileStoragePath } });
       }
     } else if (metadata.ticketId) {
@@ -50,8 +55,10 @@ export async function uploadSingle(req: Request, res: Response, next: NextFuncti
         throw ApiError.forbidden('Not your ticket');
       }
       
+      // Same reasoning as the order branch: an id minted by one browser must
+      // not resolve to an attachment on somebody else's ticket.
       const existing = await prisma.ticketAttachment.findUnique({ where: { uploadId } });
-      if (existing) {
+      if (existing && existing.ticketId === targetTicket.id) {
         return res.status(200).json({ success: true, message: 'File already uploaded', data: { storageKey: existing.storageKey } });
       }
     } else {
@@ -147,12 +154,15 @@ export async function uploadMultiple(req: Request, res: Response, next: NextFunc
     }
 
     
-    const existingOrderFiles = targetOrder ? await prisma.orderFile.findMany({ where: { uploadId: { in: uploadIds }, fileStoragePath: { not: null } } }) : [];
+    // Constrained to this order. Without `orderId` the dedup asks whether the
+    // id has been used anywhere at all, and a browser-minted collision would
+    // return another order's files and skip storing these ones.
+    const existingOrderFiles = targetOrder ? await prisma.orderFile.findMany({ where: { orderId: targetOrder.id, uploadId: { in: uploadIds }, fileStoragePath: { not: null } } }) : [];
     if (existingOrderFiles.length > 0) {
       return res.status(200).json({ success: true, message: 'Files already uploaded', data: { files: existingOrderFiles.map(f => ({ storageKey: f.fileStoragePath, originalName: f.fileName, mimeType: f.fileType, sizeBytes: f.fileSizeBytes })) } });
     }
 
-    const existingTicketAttachments = targetTicket ? await prisma.ticketAttachment.findMany({ where: { uploadId: { in: uploadIds } } }) : [];
+    const existingTicketAttachments = targetTicket ? await prisma.ticketAttachment.findMany({ where: { ticketId: targetTicket.id, uploadId: { in: uploadIds } } }) : [];
     if (existingTicketAttachments.length > 0) {
       return res.status(200).json({ success: true, message: 'Files already uploaded', data: { files: existingTicketAttachments.map(f => ({ storageKey: f.storageKey, originalName: f.originalName, mimeType: f.mimeType, sizeBytes: f.sizeBytes })) } });
     }
