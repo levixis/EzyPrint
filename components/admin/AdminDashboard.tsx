@@ -37,12 +37,17 @@ const PAYOUT_ACTION_COPY: Record<PayoutAction, {
     tone: 'text-emerald-600',
     note: "This marks the transfer as initiated. The shop's ledger balance was already deducted when they requested it.",
   },
+  // Sent, not received. An admin knows when they made the transfer; only the
+  // shop knows when it arrived, and the shop confirms that itself at this
+  // stage. Asking the admin to wait for the money to land also deadlocked the
+  // flow — the shop's Confirm button only appears once a payout is PAID, so a
+  // payout left IN_TRANSIT could never be confirmed by anyone.
   MARK_PAID: {
-    title: 'Mark Payout as Received',
-    verb: 'MARK AS RECEIVED',
-    confirm: 'Confirm Receipt',
+    title: 'Mark Payout as Sent',
+    verb: 'MARK AS SENT',
+    confirm: 'Confirm Transfer Sent',
     tone: 'text-emerald-600',
-    note: "Only do this once the money has actually landed in the shop's bank account. The shop owner sees the change immediately.",
+    note: "Do this once you have made the bank transfer. The shop is then asked to confirm it arrived, or to raise a dispute if it never does.",
   },
   REJECT_PAYOUT: {
     title: 'Reject Payout',
@@ -763,7 +768,7 @@ const AdminDashboard: React.FC = () => {
                                   setAdminPayoutResult(null);
                                 }}
                               >
-                                Mark as Received
+                                Mark as Sent
                               </Button>
                             </div>
                           )}

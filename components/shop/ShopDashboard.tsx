@@ -719,7 +719,15 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
                   )}
 
                   {payout.status === PayoutStatus.PAID && (
-                    <div className="flex gap-2 mt-2.5">
+                    <>
+                      {/* The admin has said they sent it; whether it arrived is
+                          the only part they cannot know. Asking plainly beats
+                          two unexplained buttons, and a dispute raised early is
+                          worth far more than one raised a week later. */}
+                      <p className="text-xs opacity-80 mt-2">
+                        The admin has sent this. Did it reach your account?
+                      </p>
+                      <div className="flex gap-2 mt-2.5">
                       <Button
                         onClick={() => handleConfirmPayout(payout.id)}
                         variant="primary"
@@ -736,7 +744,8 @@ const ShopDashboard: React.FC<ShopDashboardProps> = ({ shopId }) => {
                       >
                         ✕ Dispute
                       </Button>
-                    </div>
+                      </div>
+                    </>
                   )}
 
                   {disputePayoutId === payout.id && (
