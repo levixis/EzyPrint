@@ -11,7 +11,7 @@ import * as realtimeService from '../services/realtime.service';
 import * as notifyService from '../services/notify.service';
 import { sensitiveLimiter } from '../middleware/rateLimiter';
 import { prisma } from '../utils/prisma';
-import type { Prisma } from '@prisma/client';
+import type { Prisma, PayoutStatus } from '@prisma/client';
 
 /**
  * Tell a shop about a payout change it did not make itself.
@@ -32,6 +32,20 @@ async function tellShop(shopId: string, message: string, type: 'info' | 'success
 }
 
 const rupees = (paise: number) => `₹${(paise / 100).toFixed(2)}`;
+
+/**
+ * Payout states a cancellation may act on.
+ *
+ * PENDING — the shop or an admin changing their mind before approval.
+ * DISPUTED — the shop has reported the money never arrived, and returning the
+ *   reservation to their balance is the resolution the admin dashboard offers
+ *   on that row. Only PENDING was allowed, so that button always failed.
+ *
+ * Deliberately excludes IN_TRANSIT and PAID: money has left, or is said to
+ * have left, and crediting the balance back while it is in flight would pay
+ * the shop twice.
+ */
+const CANCELLABLE_PAYOUT_STATUSES: PayoutStatus[] = ['PENDING', 'DISPUTED'];
 
 const router = Router();
 
@@ -357,41 +371,70 @@ router.post('/:id/cancel', authenticate, authorize('SHOP_OWNER', 'ADMIN'), sensi
     if (!req.user) throw ApiError.unauthorized();
     const { otp } = req.body;
 
-    await otpService.consumeOtp(req.user.userId, `payout_${req.params.id}`, otp);
+    const payoutId = req.params.id as string;
+
+    // Everything that can reject this is checked before the code is spent.
+    // Consuming first meant a cancellation the server was never going to allow
+    // still destroyed the OTP, so every retry needed a fresh email and failed
+    // again the same way — which reads as "OTP not working" rather than "this
+    // payout cannot be cancelled".
+    const existing = await prisma.payout.findUnique({ where: { id: payoutId } });
+    if (!existing) throw ApiError.notFound('Payout not found');
+
+    if (req.user.userType === 'SHOP_OWNER') {
+      const shop = await prisma.shop.findUnique({ where: { ownerUserId: req.user.userId } });
+      if (!shop || shop.id !== existing.shopId) {
+        throw ApiError.forbidden('Payout does not belong to your shop');
+      }
+    }
+
+    if (!CANCELLABLE_PAYOUT_STATUSES.includes(existing.status)) {
+      throw ApiError.badRequest(
+        `A payout that is ${existing.status.toLowerCase().replace(/_/g, ' ')} cannot be cancelled.`
+      );
+    }
+
+    await otpService.consumeOtp(req.user.userId, `payout_${payoutId}`, otp);
 
     const outboxIds: string[] = [];
     let cancelled: { shopId: string; amount: number } | null = null;
 
     const result = await prisma.$transaction(async (tx) => {
-      const payout = await tx.payout.findUnique({ where: { id: req.params.id as string } });
+      const payout = await tx.payout.findUnique({ where: { id: payoutId } });
       if (!payout) throw ApiError.notFound('Payout not found');
       cancelled = { shopId: payout.shopId, amount: payout.amount };
-      
-      if (req.user?.userType === 'SHOP_OWNER') {
-        const shop = await tx.shop.findUnique({ where: { ownerUserId: req.user.userId } });
-        if (!shop || shop.id !== payout.shopId) throw ApiError.forbidden('Payout does not belong to your shop');
-      }
-      
+
+      // Still guarded, despite the check above: that read is outside this
+      // transaction, so an admin approving in the meantime must lose the race
+      // rather than have their approval silently cancelled.
       const updated = await tx.payout.updateMany({
-        where: { id: payout.id, status: 'PENDING' },
+        where: { id: payout.id, status: { in: CANCELLABLE_PAYOUT_STATUSES } },
         data: { status: 'CANCELLED' }
       });
-      if (updated.count === 0) throw ApiError.badRequest('Payout status changed concurrently');
+      if (updated.count === 0) throw ApiError.badRequest('This payout was changed by someone else just now. Reload and try again.');
 
-      const entryUpdate = await tx.ledgerEntry.updateMany({ where: { eventId: `payout:${payout.id}:reservation`, status: 'PENDING' }, data: { status: 'VOID' } });
-      if (entryUpdate.count === 0) throw ApiError.badRequest('Reservation ledger entry not found or invalid state');
-      if (entryUpdate.count > 0) {
-        
-        await ledgerService.createLedgerEntry({
-          shopId: payout.shopId,
-          type: 'PAYOUT_CANCEL_REFUND',
-          amount: payout.amount,
-          description: 'Payout request cancelled refund',
-          counterparty: 'PLATFORM',
-          createdBy: req.user?.userType === 'ADMIN' ? 'ADMIN' : 'SHOP',
-          eventId: `payout:${payout.id}:cancelled`
-        }, tx, outboxIds);
-      }
+      // Best effort, not a precondition. A reservation is only PENDING while the
+      // payout is; once approved it is SETTLED, and a disputed payout has
+      // always been through approval. Requiring PENDING here rejected every
+      // dispute resolution — the very case the dashboard offers this for.
+      await tx.ledgerEntry.updateMany({
+        where: { eventId: `payout:${payout.id}:reservation`, status: 'PENDING' },
+        data: { status: 'VOID' },
+      });
+
+      // The money comes back the same way in both cases. The reservation
+      // debited the balance when the payout was requested and nothing has
+      // returned it since — voiding is a label, this is the movement. Its
+      // eventId is unique, so a retry cannot credit twice.
+      await ledgerService.createLedgerEntry({
+        shopId: payout.shopId,
+        type: 'PAYOUT_CANCEL_REFUND',
+        amount: payout.amount,
+        description: 'Payout request cancelled refund',
+        counterparty: 'PLATFORM',
+        createdBy: req.user?.userType === 'ADMIN' ? 'ADMIN' : 'SHOP',
+        eventId: `payout:${payout.id}:cancelled`
+      }, tx, outboxIds);
 
       return updated;
     });
