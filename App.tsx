@@ -1,8 +1,7 @@
 
 import React, { Suspense, lazy, useEffect, useRef, useState } from 'react';
-import { Capacitor } from '@capacitor/core';
 import { initMobile } from './utils/mobile';
-import { dismissTopOverlay } from './utils/backGesture';
+import { useAndroidBackButton } from './utils/useAndroidBackButton';
 import { UserType, AppView, ShopProfile } from './types';
 import Header from './components/layout/Header';
 import { useAppContext } from './contexts/AppContext';
@@ -177,43 +176,7 @@ const AppContent: React.FC = () => {
   useEffect(() => { initMobile(); }, []);
 
   // Handle Android hardware back button
-  useEffect(() => {
-    if (!Capacitor.isNativePlatform()) return;
-
-    let cleanup: (() => void) | undefined;
-
-    import('@capacitor/app').then(({ App }) => {
-      const listener = App.addListener('backButton', () => {
-        // An open overlay owns the gesture. Closing the notification panel or a
-        // modal is what the user means by "back" while one is on screen —
-        // navigating underneath it instead left the overlay floating over a
-        // view it had nothing to do with.
-        if (dismissTopOverlay()) return;
-
-        // The 'landing' and dashboard views are "root" views — exit app from there
-        const rootViews: AppView[] = ['landing', 'login', 'studentDashboard', 'shopDashboard', 'adminDashboard'];
-        if (rootViews.includes(currentView)) {
-          App.minimizeApp();
-          return;
-        }
-
-        // goBack is a no-op on an empty history, which on a non-root view left
-        // the gesture doing nothing at all and the app feeling frozen. Falling
-        // back to minimize matches what Android does everywhere else.
-        if (!goBack()) App.minimizeApp();
-      });
-
-      listener.then(handle => {
-        cleanup = () => handle.remove();
-      });
-    }).catch(err => {
-      void err;
-    });
-
-    return () => {
-      cleanup?.();
-    };
-  }, [currentView, goBack]);
+  useAndroidBackButton(currentView, goBack);
 
   useEffect(() => {
     // Don't do anything while auth is still loading

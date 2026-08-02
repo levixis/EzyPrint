@@ -3,6 +3,7 @@ import { Capacitor } from '@capacitor/core';
 import { DocumentOrder, PrintColor } from '../../types';
 import { getOrderFiles, getOrderDisplayName } from '../../utils/orderHelpers';
 import { Modal } from '../common/Modal';
+import { useBackDismiss } from '../../utils/backGesture';
 import { Button } from '../common/Button';
 import { Spinner } from '../common/Spinner';
 import { useAppContext } from '../../contexts/AppContext';
@@ -49,6 +50,12 @@ const PaymentModal: React.FC<PaymentModalProps> = ({ isOpen, onClose, order, onP
         window.addEventListener('resize', check);
         return () => window.removeEventListener('resize', check);
     }, []);
+
+    // This sheet draws its own overlay rather than going through common/Modal,
+    // so it has to register for the back gesture itself. Gated on isProcessing
+    // for the same reason the backdrop is: dismissing mid-payment would strand
+    // a charge the user can no longer see the result of.
+    useBackDismiss(isOpen && !isProcessing, onClose);
 
     // Lock body scroll on mobile when modal is open
     useEffect(() => {

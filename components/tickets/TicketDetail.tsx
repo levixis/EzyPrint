@@ -7,6 +7,7 @@ import { uploadApi, adminApi } from '../../lib/queries';
 import { RefundOtpModal } from '../common/RefundOtpModal';
 import { RefundHistoryTracker } from '../common/RefundHistoryTracker';
 import { formatDateTime, formatDate } from '../../utils/datetime';
+import { useBackDismiss } from '../../utils/backGesture';
 
 interface TicketDetailProps {
   ticket: SupportTicket;
@@ -83,6 +84,11 @@ const TicketDetail: React.FC<TicketDetailProps> = ({ ticket, isOpen, onClose }) 
   const [isUpdatingStatus, setIsUpdatingStatus] = useState(false);
   const [isPreApproveModalOpen, setIsPreApproveModalOpen] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // The preview draws its own overlay instead of going through common/Modal, so
+  // it registers for the back gesture itself. It sits above the ticket modal in
+  // the dismiss stack, which is the order the user sees them in.
+  useBackDismiss(!!preview, () => setPreview(null));
 
   // Attachment download URLs
   const [attachmentUrls, setAttachmentUrls] = useState<{ path: string; url: string; fileName: string; messageId: string | null; error?: boolean }[]>([]);

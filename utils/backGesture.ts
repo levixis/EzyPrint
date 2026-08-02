@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 
 /**
  * A dismiss stack for the Android back gesture.
@@ -53,13 +53,20 @@ export function hasOpenOverlay(): boolean {
 /**
  * Register an overlay for as long as it is open.
  *
- * `onDismiss` is read through a ref internally by way of the dependency list —
- * pass a stable callback, or accept that reopening the registration on every
- * render would reorder the stack.
+ * `onDismiss` is genuinely read through a ref, so an inline arrow is fine: the
+ * registration depends on `isOpen` alone and survives re-renders. Keying it on
+ * the callback identity instead would pop and re-push on every render, sending
+ * the overlay to the top of the stack and letting a modal opened first swallow
+ * a back press aimed at the panel above it.
  */
 export function useBackDismiss(isOpen: boolean, onDismiss: DismissFn): void {
+  const onDismissRef = useRef(onDismiss);
+  useEffect(() => {
+    onDismissRef.current = onDismiss;
+  });
+
   useEffect(() => {
     if (!isOpen) return;
-    return pushDismissHandler(onDismiss);
-  }, [isOpen, onDismiss]);
+    return pushDismissHandler(() => onDismissRef.current());
+  }, [isOpen]);
 }

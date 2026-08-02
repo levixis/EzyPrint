@@ -1,7 +1,8 @@
 
 import React, { ReactNode, useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Button } from './Button'; 
+import { Button } from './Button';
+import { useBackDismiss } from '../../utils/backGesture';
 
 interface ModalProps {
   isOpen: boolean;
@@ -15,6 +16,12 @@ interface ModalProps {
 
 export const Modal: React.FC<ModalProps> = ({ isOpen, onClose, title, children, size = 'md', footerContent, hideCloseButton = false }) => {
   const [showModal, setShowModal] = useState(false);
+
+  // Every modal is a screen as far as the Android back gesture is concerned.
+  // Without this registration the gesture fell through to the view-level
+  // handler, which sees only the AppView underneath (always a dashboard) and
+  // so minimised the app instead of closing the modal.
+  useBackDismiss(isOpen, onClose);
 
   useEffect(() => {
     if (isOpen) {
