@@ -5,6 +5,13 @@ import { ApiError } from '../utils/ApiError';
  * Shop Service — CRUD, admin actions, settings, and aggregate stats.
  */
 
+/**
+ * Everything about a shop, balances included.
+ *
+ * Only ever for the shop's own owner or an admin. `pendingBalance`,
+ * `ledgerBalance` and `debtAmount` are the shop's money, and `rejectionReason`
+ * is a private note about why an application was turned down.
+ */
 const shopSelect = {
   id: true,
   ownerUserId: true,
@@ -27,6 +34,34 @@ const shopSelect = {
   debtAmount: true,
   createdAt: true,
   updatedAt: true,
+} as const;
+
+/**
+ * What anyone may see about a shop.
+ *
+ * A student choosing where to print needs the name, where it is, what it
+ * charges, whether it is open, and how to contact it. Nothing else on the row
+ * is any of their business.
+ *
+ * This exists because `GET /shops/:shopId` had no `authenticate` on it and
+ * returned the full row plus `payoutMethods` and the owner's email — so an
+ * anonymous caller holding a shop id, which the public shop list hands out,
+ * could read that shop's bank account number, IFSC code, UPI id and balances.
+ * The fields have a properly guarded endpoint of their own
+ * (`GET /shops/:shopId/bank-details`); this route was quietly bypassing it.
+ */
+const publicShopSelect = {
+  id: true,
+  name: true,
+  address: true,
+  bwPerPage: true,
+  colorPerPage: true,
+  isOpen: true,
+  isApproved: true,
+  isArchived: true,
+  contactPhone: true,
+  contactEmail: true,
+  whatsappNumber: true,
 } as const;
 
 // ────────────────────────────────────────────────────────────
@@ -82,9 +117,44 @@ export async function listAllShops() {
 }
 
 /**
- * Get a single shop by ID.
+ * Get a single shop by ID, projected to what the caller is entitled to.
+ *
+ * The privileged shape — balances, payout methods, the owner's email, the
+ * private rejection reason — is for the owner and admins only. Everyone else,
+ * including anonymous callers, gets the same public view the shop list returns.
+ *
+ * Deciding this here rather than in the route is deliberate: the route is where
+ * it was decided before, by omission, and the answer was "everything to
+ * everyone". A caller now has to present an identity to widen the projection,
+ * and passing no requester can only ever narrow it.
  */
-export async function getShopById(shopId: string) {
+export async function getShopById(
+  shopId: string,
+  requester?: { userId: string; userType: string }
+) {
+  // Two queries would race an ownership change between them, and the owner
+  // check needs a field the public projection deliberately omits — so read the
+  // owner id, decide, and only then choose what to return.
+  const owner = await prisma.shop.findUnique({
+    where: { id: shopId },
+    select: { ownerUserId: true },
+  });
+
+  if (!owner) throw ApiError.notFound('Shop not found');
+
+  const privileged =
+    requester?.userType === 'ADMIN' ||
+    (requester != null && requester.userId === owner.ownerUserId);
+
+  if (!privileged) {
+    const publicShop = await prisma.shop.findUnique({
+      where: { id: shopId },
+      select: publicShopSelect,
+    });
+    if (!publicShop) throw ApiError.notFound('Shop not found');
+    return publicShop;
+  }
+
   const shop = await prisma.shop.findUnique({
     where: { id: shopId },
     select: {

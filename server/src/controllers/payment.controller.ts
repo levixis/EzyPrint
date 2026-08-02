@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import * as paymentService from '../services/payment.service';
 import { ApiError } from '../utils/ApiError';
 import { env } from '../config/env';
+import { clampThresholdMinutes } from '../utils/pagination';
 
 /**
  * Payment Controller — Razorpay payment flow + reconciliation.
@@ -106,14 +107,21 @@ export async function webhook(req: Request, res: Response, next: NextFunction) {
  * POST /api/v1/payments/reconcile
  * Upgrade B: The safety net.
  *
- * Scans for orders stuck in PENDING_PAYMENT for over 15 minutes,
- * queries Razorpay for their true status, and fulfills any that
- * were actually paid but whose webhook was missed.
+ * Scans for orders that reached the gateway but never landed as paid here —
+ * PENDING_PAYMENT and PAYMENT_FAILED alike, because the latter is written by
+ * the client when the checkout sheet closes and is routinely wrong about a UPI
+ * collect approved afterwards. Queries Razorpay for their true status and
+ * fulfils any that were actually paid but whose webhook was missed. A capture
+ * we cannot match to the order's price is flagged for an admin instead, never
+ * silently reopened for payment.
  *
- * Also retries any WebhookEvent records that failed processing.
+ * Also retries any WebhookEvent records that failed processing — independently
+ * of the above, so a stuck webhook is retried even on a sweep that finds no
+ * stuck orders.
  *
- * Called by: an external cron service every 15 minutes, or manually
- * by an admin for immediate reconciliation.
+ * Called by: the in-process scheduler, or manually by an admin. `?threshold=0`
+ * sweeps everything immediately rather than waiting out the 15-minute window,
+ * which is what makes this testable by hand.
  */
 export async function reconcile(req: Request, res: Response, next: NextFunction) {
   try {
@@ -122,7 +130,10 @@ export async function reconcile(req: Request, res: Response, next: NextFunction)
       throw ApiError.forbidden('Only admins can trigger reconciliation');
     }
 
-    const thresholdMinutes = parseInt(req.query.threshold as string) || 15;
+    // `|| 15` swallowed the one value an operator most wants: `?threshold=0`
+    // parsed to 0, which is falsy, so "sweep everything now" silently became
+    // the default 15-minute window and the sweep appeared to do nothing.
+    const thresholdMinutes = clampThresholdMinutes(req.query.threshold);
     const result = await paymentService.reconcilePayments(thresholdMinutes);
 
     res.json({
