@@ -46,18 +46,108 @@ export function escapeHtml(value: string): string {
     .replace(/'/g, '&#39;');
 }
 
+
+interface Message {
+  to: string;
+  subject: string;
+  text: string;
+  html: string;
+}
+
+/**
+ * Send over HTTPS through Resend.
+ *
+ * Exists because Render blocks outbound traffic to SMTP ports 25, 465 and 587
+ * on free web services (since Sept 2025), so nodemailer cannot deliver from
+ * there no matter how correct the Gmail credentials are — and ours are, they
+ * authenticate fine from anywhere that is not Render. An HTTP API needs no SMTP
+ * port at all.
+ */
+async function sendViaHttp(message: Message): Promise<void> {
+  const response = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: env.EMAIL_FROM,
+      to: [message.to],
+      subject: message.subject,
+      text: message.text,
+      html: message.html,
+    }),
+    // Matches the SMTP timeouts below: an OTP request waits on this, and an
+    // admin staring at a dialog should get an answer either way.
+    signal: AbortSignal.timeout(15_000),
+  });
+
+  if (!response.ok) {
+    const detail = await response.text().catch(() => '');
+    throw new Error(`Resend returned ${response.status}: ${detail.slice(0, 200)}`);
+  }
+}
+
+/** Send over SMTP. Works anywhere the ports are not blocked — local, paid hosts. */
+async function sendViaSmtp(message: Message): Promise<void> {
+  await getTransporter().sendMail({
+    from: env.EMAIL_FROM,
+    to: message.to,
+    subject: message.subject,
+    text: message.text,
+    html: message.html,
+  });
+}
+
+/**
+ * Deliver a message, preferring whichever transport is configured and falling
+ * back to the other.
+ *
+ * HTTP goes first when a key is present, rather than SMTP-then-fallback. On a
+ * free Render instance SMTP does not fail fast — it fails at the connection
+ * timeout — so trying it first would add ten seconds to every email before
+ * falling back, on a request an admin is actively waiting on.
+ *
+ * Both are attempted before giving up, so a Resend outage still gets the code
+ * out from a host where SMTP works, and vice versa. The combined failure names
+ * both reasons; one of them is the real one and guessing wastes the reader's
+ * time.
+ */
+async function deliver(message: Message): Promise<void> {
+  const transports: Array<{ name: string; send: () => Promise<void> }> = [];
+  if (env.RESEND_API_KEY) transports.push({ name: 'resend', send: () => sendViaHttp(message) });
+  if (env.GMAIL_USER && env.GMAIL_APP_PASSWORD) transports.push({ name: 'smtp', send: () => sendViaSmtp(message) });
+
+  if (transports.length === 0) {
+    throw new Error('No email transport configured. Set RESEND_API_KEY, or GMAIL_USER and GMAIL_APP_PASSWORD.');
+  }
+
+  const failures: string[] = [];
+  for (const transport of transports) {
+    try {
+      await transport.send();
+      if (failures.length > 0) {
+        console.warn(`[email] delivered via ${transport.name} after ${failures.join('; ')}`);
+      }
+      return;
+    } catch (error) {
+      failures.push(`${transport.name}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  throw new Error(`All email transports failed — ${failures.join(' | ')}`);
+}
+
 /**
  * Send an OTP verification email for a sensitive admin/account action.
  */
 export async function sendOTPEmail(to: string, otp: string, actionLabel?: string): Promise<void> {
-  const t = getTransporter();
   const action = actionLabel || 'Sensitive Action Verification';
   const safeAction = escapeHtml(action);
 
-  await t.sendMail({
-    from: `"EzyPrint Security" <${env.GMAIL_USER}>`,
+  await deliver({
     to,
-    // Header values are not HTML; nodemailer encodes them. Body values are.
+    // Header values are not HTML; both transports encode them. Body values are.
     subject: `Verification Code: ${otp} (${action})`,
     text: `You are attempting to perform a sensitive account action.\n\nYour verification code is: ${otp}\n\nThis code expires in 5 minutes. If you did not request this, please secure your account immediately.`,
     html: `

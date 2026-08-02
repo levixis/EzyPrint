@@ -117,6 +117,24 @@ export const env = {
   // ── Email (Gmail SMTP for OTP) ──
   GMAIL_USER: process.env.GMAIL_USER || '',
   GMAIL_APP_PASSWORD: process.env.GMAIL_APP_PASSWORD || '',
+  /**
+   * Resend API key, for delivering mail over HTTPS instead of SMTP.
+   *
+   * Render blocks outbound traffic to ports 25, 465 and 587 on free web
+   * services, so nodemailer cannot deliver from there however correct the Gmail
+   * credentials are. Set this and mail goes out over HTTP, which no port policy
+   * touches. Leave it empty and SMTP is used, which is right locally and on any
+   * host that permits it.
+   */
+  RESEND_API_KEY: process.env.RESEND_API_KEY || '',
+  /**
+   * The From address. Must be on a domain verified with the mail provider —
+   * `onboarding@resend.dev` works untouched for testing, but only delivers to
+   * the address that owns the Resend account.
+   *
+   * Defaults to the Gmail user so existing deploys behave exactly as before.
+   */
+  EMAIL_FROM: process.env.EMAIL_FROM || `"EzyPrint Security" <${process.env.GMAIL_USER || 'noreply@ezyprint.in'}>`,
 
   // ── Pusher (real-time shop ledger) ──
   PUSHER_APP_ID: requireSecret('PUSHER_APP_ID', process.env.PUSHER_APP_ID, ''),
