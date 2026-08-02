@@ -351,6 +351,44 @@ export function notifyEarningCredited(params: {
   );
 }
 
+/**
+ * A refund reached the student's account.
+ *
+ * The one notification the "never notify someone about their own action" rule
+ * must not suppress. A student who cancels a paid order is the actor, so
+ * notifyOrderStatus deliberately stays silent — but settlement happens minutes
+ * or days later, through Razorpay and sometimes an admin, and by then it is no
+ * longer their action. Without this the money simply reappears with no word
+ * from us, and the student is left refreshing the order to find out whether it
+ * worked.
+ *
+ * Sent on the account channel because it names an amount, and that channel is
+ * the one that keeps its contents off the lockscreen.
+ */
+export function notifyRefundSettled(params: {
+  studentUserId: string;
+  orderId: string;
+  shopId: string;
+  amountPaise: number;
+  /** False when nothing went back through the gateway — cash or a free order. */
+  throughGateway: boolean;
+}): void {
+  const rupees = (params.amountPaise / 100).toFixed(2);
+  guard(
+    notifyUser(params.studentUserId, {
+      message: params.throughGateway
+        ? `₹${rupees} has been refunded to your original payment method. It can take 5-7 working days to appear.`
+        : `₹${rupees} has been refunded for your order. Please collect it from the shop.`,
+      title: 'Refund processed',
+      type: 'success',
+      channel: 'ezyprint_account',
+      orderId: params.orderId,
+      targetShopId: params.shopId,
+    }),
+    'refund settled'
+  );
+}
+
 /** A payout changed state — the shop always cares about its own money. */
 export function notifyPayoutUpdate(params: {
   shopId: string;

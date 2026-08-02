@@ -186,6 +186,57 @@ describe('Ticket notifications', () => {
   });
 });
 
+describe('Refund settlement notifications', () => {
+  const base = {
+    studentUserId: 'student_1',
+    orderId: 'order_1',
+    shopId: 'shop_1',
+    amountPaise: 12500,
+  };
+
+  test('the student is told when their refund settles', async () => {
+    // The gap this closes: a student who cancels a paid order is the actor, so
+    // notifyOrderStatus stays silent by design. Settlement happens later,
+    // through Razorpay and sometimes an admin, and nothing announced it — the
+    // money reappeared with no word from us.
+    notify.notifyRefundSettled({ ...base, throughGateway: true });
+    await drain();
+
+    expect(recipients()).toEqual(['student_1']);
+  });
+
+  test('the amount and the wait are both stated', async () => {
+    notify.notifyRefundSettled({ ...base, throughGateway: true });
+    await drain();
+
+    const message = mockNotificationCreate.mock.calls[0][0].data.message;
+    expect(message).toContain('125.00');
+    expect(message).toContain('5-7 working days');
+  });
+
+  test('an offline refund does not promise a bank transfer', async () => {
+    // Cash or a free order — nothing went through the gateway, so pointing the
+    // student at their bank statement would send them looking for money that
+    // was never going to arrive there.
+    notify.notifyRefundSettled({ ...base, throughGateway: false });
+    await drain();
+
+    const message = mockNotificationCreate.mock.calls[0][0].data.message;
+    expect(message).toContain('collect it from the shop');
+    expect(message).not.toContain('payment method');
+  });
+
+  test('it goes out on the channel that hides amounts on the lockscreen', async () => {
+    notify.notifyRefundSettled({ ...base, throughGateway: true });
+    await drain();
+
+    expect(mockSendPush).toHaveBeenCalledWith(
+      'student_1',
+      expect.objectContaining({ channel: 'ezyprint_account' })
+    );
+  });
+});
+
 describe('Failures stay contained', () => {
   test('a failed notification never propagates into the business flow', async () => {
     // The order transition it describes has already committed. Throwing here

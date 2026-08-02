@@ -109,6 +109,10 @@ export async function settleClaimedRefund(
   }
 
   const outboxIds: string[] = [];
+  // Only the delivery that actually moved the row may announce it — a repeat
+  // delivery reaches the guard below and must stay silent rather than tell the
+  // student a second time that their money is on the way.
+  let settledHere = false;
 
   await prisma.$transaction(async (tx) => {
     const updated = await tx.refundRequest.updateMany({
@@ -126,6 +130,7 @@ export async function settleClaimedRefund(
     // Another delivery of the same settlement got here first. The Razorpay
     // call above was idempotent, so nothing has been double-refunded.
     if (updated.count === 0) return;
+    settledHere = true;
 
     if (options.setOrderRefunded) {
       await tx.order.updateMany({
@@ -159,6 +164,20 @@ export async function settleClaimedRefund(
   });
 
   await realtimeService.publishQueued(outboxIds);
+
+  // After commit, and never awaited into the caller's latency. Every settlement
+  // route — admin resolution, shop self-refund, and the automatic refund behind
+  // a cancellation — funnels through here, so this is the one place that covers
+  // all three.
+  if (settledHere) {
+    notifyService.notifyRefundSettled({
+      studentUserId: request.order.userId,
+      orderId: request.orderId,
+      shopId: request.shopId,
+      amountPaise: amount,
+      throughGateway: finalStatus === 'RESOLVED_REFUNDED',
+    });
+  }
 }
 
 /**
