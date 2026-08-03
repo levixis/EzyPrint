@@ -23,28 +23,54 @@ router.post('/submit', authenticate, authorize('SHOP_OWNER'), async (req, res, n
   try {
     const { shopId, shopName } = req.body;
     if (!req.user) throw ApiError.unauthorized();
-    
-    const existing = await prisma.reactivationRequest.findFirst({
-      where: { shopId, status: 'pending' }
+
+    // A shop owner may only ever request reactivation for their own shop. The
+    // route authorises the *role*, not the *shop*, so without this any shop
+    // owner could file a request against somebody else's — and an admin
+    // approving it would reinstate a shop its owner never asked to reinstate.
+    const shop = await prisma.shop.findUnique({
+      where: { id: shopId },
+      select: { ownerUserId: true, name: true },
     });
-    
-    if (existing) {
-      return res.json({ success: false, message: 'Request already pending.' });
-    }
-    
+    if (!shop) throw ApiError.notFound('Shop not found');
+    if (shop.ownerUserId !== req.user.userId) throw ApiError.forbidden('Not your shop');
+
     const user = await prisma.user.findUnique({ where: { id: req.user.userId } });
-    
-    await prisma.reactivationRequest.create({
-      data: {
-        shopId,
-        shopName,
-        ownerUid: req.user.userId,
-        ownerEmail: req.user.email || '',
-        ownerName: user?.name || 'Shop Owner',
-        status: 'pending'
+
+    // Attempt the write and let the database arbitrate, rather than reading
+    // first and creating second. Nothing stood between those two statements, so
+    // two taps on "Request Reactivation" — which is what a locked-out owner
+    // does when the first appears to do nothing — produced two pending rows.
+    // The admin saw the request twice, approved one, and the other stayed
+    // pending forever against a shop that was already active again.
+    //
+    // The partial unique index added in migration
+    // 20260802200000_one_pending_reactivation_per_shop is what makes this
+    // race-free; the catch below only turns its error into the same friendly
+    // answer the check used to give.
+    try {
+      await prisma.reactivationRequest.create({
+        data: {
+          shopId,
+          // Taken from the shop rather than the request body, which the client
+          // supplies and could disagree with the row an admin is about to act on.
+          shopName: shop.name || shopName,
+          ownerUid: req.user.userId,
+          ownerEmail: req.user.email || '',
+          ownerName: user?.name || 'Shop Owner',
+          status: 'pending'
+        }
+      });
+    } catch (error) {
+      // P2002 — unique constraint. Someone (quite possibly this same person a
+      // moment ago) already has a request open for this shop, which is the
+      // outcome the owner wanted anyway.
+      if ((error as { code?: string }).code === 'P2002') {
+        return res.json({ success: false, message: 'Request already pending.' });
       }
-    });
-    
+      throw error;
+    }
+
     res.json({ success: true });
   } catch (error) {
     next(error);

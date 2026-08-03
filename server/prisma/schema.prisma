@@ -685,6 +685,13 @@ model ReactivationRequest {
   @@index([shopId])
   @@index([status])
   @@map("reactivation_requests")
+  // A partial unique index enforces one *pending* request per shop:
+  //   CREATE UNIQUE INDEX ... ON ("shopId") WHERE "status" = 'pending'
+  // Declared in migration 20260802200000_one_pending_reactivation_per_shop
+  // because Prisma's schema language cannot express a partial index. Resolved
+  // requests are deliberately unconstrained — a shop may be archived and
+  // reinstated any number of times, and each of those is a record worth
+  // keeping.
 }
 
 /// Refund request — student requests, shop/admin resolves
