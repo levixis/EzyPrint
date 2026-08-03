@@ -11,7 +11,13 @@ export async function listShops(req: Request, res: Response, next: NextFunction)
       return res.json({ success: true, data: { shops } });
     }
     const onlyOpen = req.query.onlyOpen === 'true';
-    const shops = await shopService.listShopsForStudents({ onlyOpen });
+    // A shop owner always gets their own shop back, even archived or awaiting
+    // approval — it is how the client knows which screen to show them. Anyone
+    // else sees only the approved, unarchived list.
+    const shops = await shopService.listShopsForStudents({
+      onlyOpen,
+      includeOwnedBy: req.user?.userType === 'SHOP_OWNER' ? req.user.userId : undefined,
+    });
     res.json({ success: true, data: { shops } });
   } catch (error) { next(error); }
 }

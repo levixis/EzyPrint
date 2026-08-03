@@ -71,16 +71,34 @@ const publicShopSelect = {
 /**
  * List shops visible to students — approved, not archived.
  * Optionally filter by isOpen.
+ *
+ * `includeOwnedBy` additionally returns that user's own shop whatever state it
+ * is in — archived, closed, or not yet approved. Pass it only for the owner
+ * themselves; the projection is the public one either way, so this widens who
+ * sees a row, never what the row contains.
+ *
+ * Without it, archiving a shop locked its owner out of the app entirely. The
+ * client picks between the dashboard, the pending-approval screen and the
+ * reactivation banner by looking its own shop up in this list, and an archived
+ * shop was never in it — so the owner sat on "Loading your shop dashboard…"
+ * forever and the one screen offering "Request Reactivation" was unreachable.
+ * Archiving is meant to be appealable; it was a silent one-way door.
  */
-export async function listShopsForStudents(options?: { onlyOpen?: boolean }) {
-  const where: Record<string, unknown> = {
+export async function listShopsForStudents(options?: { onlyOpen?: boolean; includeOwnedBy?: string }) {
+  const visible: Record<string, unknown> = {
     isApproved: true,
     isArchived: false,
   };
 
   if (options?.onlyOpen) {
-    where.isOpen = true;
+    visible.isOpen = true;
   }
+
+  // The owner's branch carries no isOpen/isApproved/isArchived filter, so their
+  // shop survives every combination of those flags — which is the whole point.
+  const where = options?.includeOwnedBy
+    ? { OR: [visible, { ownerUserId: options.includeOwnedBy }] }
+    : visible;
 
   return prisma.shop.findMany({
     where,

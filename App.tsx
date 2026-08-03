@@ -2,7 +2,7 @@
 import React, { Suspense, lazy, useEffect, useRef, useState } from 'react';
 import { initMobile } from './utils/mobile';
 import { useAndroidBackButton } from './utils/useAndroidBackButton';
-import { UserType, AppView, ShopProfile } from './types';
+import { UserType, AppView } from './types';
 import Header from './components/layout/Header';
 import { useAppContext } from './contexts/AppContext';
 // Firebase removed — data is fetched via REST API polling
@@ -72,7 +72,12 @@ const ShopLoadingFallback: React.FC = () => {
 
 // Banner shown when a shopkeeper signs in and their shop is archived.
 // They can request reactivation from here.
-const ArchivedShopBanner: React.FC<{ shop: ShopProfile }> = ({ shop }) => {
+// Takes the id and name rather than a ShopProfile because it must render in
+// the case where there is no ShopProfile to hand: the session's
+// `isShopArchived` flag can say the shop is archived while the shop list has
+// not loaded, or has failed to load. Those are exactly the moments the owner
+// most needs a way out, so the banner asks for the least it can work with.
+const ArchivedShopBanner: React.FC<{ shopId: string; shopName: string }> = ({ shopId, shopName }) => {
   const { submitReactivationRequest, logoutUser } = useAppContext();
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitted, setSubmitted] = useState(false);
@@ -81,7 +86,7 @@ const ArchivedShopBanner: React.FC<{ shop: ShopProfile }> = ({ shop }) => {
   const handleRequestReactivation = async () => {
     setIsSubmitting(true);
     setErrorMsg('');
-    const result = await submitReactivationRequest(shop.id, shop.name);
+    const result = await submitReactivationRequest(shopId, shopName);
     setIsSubmitting(false);
     if (result.success) {
       setSubmitted(true);
@@ -106,7 +111,7 @@ const ArchivedShopBanner: React.FC<{ shop: ShopProfile }> = ({ shop }) => {
 
         <h2 className="text-2xl font-bold text-gray-900 dark:text-white">Shop Archived</h2>
         <p className="text-sm text-gray-600 dark:text-gray-400">
-          Your shop <strong className="text-gray-900 dark:text-white">"{shop.name}"</strong> has been archived by the admin.
+          Your shop <strong className="text-gray-900 dark:text-white">"{shopName}"</strong> has been archived by the admin.
           You can request reactivation below.
         </p>
 
@@ -161,16 +166,28 @@ const AppContent: React.FC = () => {
   // Valid views for each user type - these views don't require redirect
   const staticPages: AppView[] = ['privacy', 'terms', 'refund', 'shipping', 'contact'];
 
-  // Auto-poll for shop approval status if pending
+  // `refreshCurrentUser` is a fresh function identity on every render, so it is
+  // held in a ref instead of being named as a dependency. Listing it tore the
+  // interval down and rebuilt it on each render, and a screen that rerenders
+  // more often than the interval never fired it at all.
+  const refreshCurrentUserRef = useRef(refreshCurrentUser);
+  useEffect(() => { refreshCurrentUserRef.current = refreshCurrentUser; });
+
+  // Both of these are states only an admin can move the owner out of: awaiting
+  // approval, and archived. Either way the owner is looking at a screen that
+  // will not change by itself, so poll the session until it does. Archived was
+  // missing here, which meant an approved reactivation left the owner on the
+  // banner until they thought to reload.
+  const awaitingAdminAction =
+    currentUser?.type === UserType.SHOP_OWNER &&
+    !currentUser.isShopRejected &&
+    (currentUser.isShopApproved === false || currentUser.isShopArchived === true);
+
   useEffect(() => {
-    let interval: NodeJS.Timeout;
-    if (currentUser?.type === 'SHOP_OWNER' && currentUser.isShopApproved === false && !currentUser.isShopRejected) {
-      interval = setInterval(() => {
-        refreshCurrentUser();
-      }, 10000); // Check every 10 seconds
-    }
+    if (!awaitingAdminAction) return;
+    const interval = setInterval(() => { void refreshCurrentUserRef.current(); }, 10000);
     return () => clearInterval(interval);
-  }, [currentUser, refreshCurrentUser]);
+  }, [awaitingAdminAction]);
 
   // Initialize mobile platform features (status bar, splash screen, etc.)
   useEffect(() => { initMobile(); }, []);
@@ -352,9 +369,22 @@ const AppContent: React.FC = () => {
               </div>
             );
           }
-          // Check if shop is archived — show reactivation banner instead of dashboard
-          if (archivedShopForCurrentUser) {
-            return <ArchivedShopBanner shop={archivedShopForCurrentUser} />;
+          // Archived — offer reactivation instead of a dashboard they cannot use.
+          //
+          // Two independent sources say so: the shop row, and `isShopArchived`
+          // on the session. Either alone is enough. The row can be missing
+          // because the list has not arrived or the request failed, and the
+          // flag can be stale because the session predates the archiving — but
+          // they do not go wrong at the same time, and the cost of trusting
+          // either is one extra screen, while the cost of trusting neither is
+          // the spinner that used to sit here forever.
+          if (archivedShopForCurrentUser || currentUser.isShopArchived) {
+            return (
+              <ArchivedShopBanner
+                shopId={currentUser.shopId}
+                shopName={archivedShopForCurrentUser?.name || currentUser.shopName || 'your shop'}
+              />
+            );
           }
           const shop = getShopById(currentUser.shopId);
           if (isLoadingShops || !shop) {
