@@ -1,7 +1,8 @@
 import { prisma } from '../utils/prisma';
 import { env } from '../config/env';
 import { runSettlementSweep } from './settlement.service';
-import { reconcilePayments } from './payment.service';
+import { reconcilePayments, auditCapturedPayments } from './payment.service';
+import * as notify from './notify.service';
 import { dispatchOutbox, pruneOutbox } from './realtime.service';
 import { sweepUndeletedFiles } from './cleanup.service';
 import { sweepExpiredReferralCodes } from './referral.service';
@@ -28,6 +29,7 @@ const LOCK_KEYS = {
   outboxPrune: 4820_003,
   fileRetention: 4820_004,
   referralSweep: 4820_005,
+  paymentAudit: 4820_006,
 } as const;
 
 /**
@@ -101,6 +103,34 @@ export function startScheduler(): void {
         `recovered ${result.reconciled}, retried ${result.retriedWebhooks} webhook(s)`
       );
     }
+  });
+
+  // Asks Razorpay what it was paid and checks we have an order for each. The
+  // reconciliation job above cannot do this: it starts from our own orders, so
+  // an order that is missing entirely is invisible to it.
+  //
+  // This is the job that would have caught the ₹5 order lost on 2026-08-03,
+  // when a database restore rolled production back past a payment that had
+  // already been captured, printed and completed. Nothing internal noticed —
+  // the ledger still balanced, because the earning was removed along with the
+  // order it belonged to.
+  schedule('payment-audit', env.PAYMENT_AUDIT_INTERVAL_MS, async () => {
+    const result = await withAdvisoryLock(LOCK_KEYS.paymentAudit, () => auditCapturedPayments());
+    if (!result || result.orphans.length === 0) return;
+
+    const total = result.orphans.reduce((sum, o) => sum + o.amountPaise, 0);
+    // Logged in full because the alert has to be actionable without a database
+    // to hand — by definition the rows it is about are not in the database.
+    console.error(
+      `[scheduler] payment-audit: ${result.orphans.length} captured payment(s) ` +
+      `worth ₹${(total / 100).toFixed(2)} have no order:`,
+      result.orphans
+    );
+    notify.notifyAdmins(
+      `${result.orphans.length} captured payment(s) worth ₹${(total / 100).toFixed(2)} ` +
+      `have no matching order. Payment ids: ${result.orphans.map((o) => o.paymentId).join(', ')}`,
+      'error'
+    );
   });
 
   // Frequent and cheap: the immediate publish on the request path handles the

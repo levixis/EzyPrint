@@ -1170,3 +1170,153 @@ export async function verifyStudentPassPayment(
     studentPassActivatedAt: user?.studentPassActivatedAt ?? null,
   };
 }
+
+// ────────────────────────────────────────────────────────────
+// AUDIT — Razorpay as the source of truth
+// ────────────────────────────────────────────────────────────
+
+/** A captured payment with no order behind it. */
+export interface OrphanPayment {
+  paymentId: string;
+  amountPaise: number;
+  capturedAt: Date;
+  /** Our order id, as recorded in the payment's notes when it was created. */
+  claimedOrderId: string | null;
+  razorpayOrderId: string | null;
+  email: string | null;
+  contact: string | null;
+}
+
+export interface PaymentAuditResult {
+  windowStart: Date;
+  /** Captured payments old enough to be judged. */
+  checked: number;
+  /** Captured but too recent to judge yet; see `graceMinutes`. */
+  skippedTooRecent: number;
+  orphans: OrphanPayment[];
+}
+
+/** Razorpay caps a page at 100. */
+const AUDIT_PAGE_SIZE = 100;
+
+/**
+ * The part of a Razorpay payment this audit reads.
+ *
+ * Narrow on purpose: the SDK's own types are loose, and naming only the fields
+ * we depend on means a change to any of them is a compile error here rather
+ * than an `undefined` that quietly makes every payment look accounted for.
+ */
+interface RazorpayPayment {
+  id: string;
+  status?: string;
+  amount?: number;
+  order_id?: string | null;
+  created_at?: number;
+  email?: string | null;
+  contact?: string | null;
+  notes?: Record<string, string | undefined> | null;
+}
+
+/**
+ * Find captured payments that no order in this database accounts for.
+ *
+ * `reconcilePayments` walks from our orders out to Razorpay: it asks, of the
+ * orders we know are stuck, which ones Razorpay considers paid. That direction
+ * cannot see an order that is not in the table at all — and the table is not
+ * guaranteed. A restore that rolls the database back past a payment, a failed
+ * insert, a row deleted by a cascade: in each case the money is real, Razorpay
+ * remembers it, and nothing here is looking.
+ *
+ * This walks the other way, from Razorpay in. It is the only check that can
+ * detect an order that has ceased to exist, because it never consults our data
+ * to decide what to look for.
+ *
+ * It is worth saying why the obvious alternative is not enough: the ledger
+ * reconciles against itself perfectly in exactly this scenario. When an order
+ * and its earning are removed together the books still balance — they are
+ * simply the books of a smaller business. Internal consistency cannot detect a
+ * clean amputation. Only an outside record can.
+ *
+ * `graceMinutes` exists because a payment captured seconds ago may legitimately
+ * not be reflected yet; anything inside that window is counted, not judged.
+ */
+export async function auditCapturedPayments(options?: {
+  windowMinutes?: number;
+  graceMinutes?: number;
+}): Promise<PaymentAuditResult> {
+  const windowMinutes = options?.windowMinutes ?? 24 * 60;
+  const graceMinutes = options?.graceMinutes ?? 10;
+
+  const windowStart = new Date(Date.now() - windowMinutes * 60 * 1000);
+  const graceCutoff = new Date(Date.now() - graceMinutes * 60 * 1000);
+
+  const razorpay = getRazorpay();
+
+  const captured: RazorpayPayment[] = [];
+  let skip = 0;
+  // Bounded so a wide window cannot spin: 10 pages is 1000 payments, far more
+  // than this platform sees in a day, and the window is the real control.
+  for (let page = 0; page < 10; page++) {
+    const response = (await razorpay.payments.all({
+      from: Math.floor(windowStart.getTime() / 1000),
+      count: AUDIT_PAGE_SIZE,
+      skip,
+    })) as unknown as { items?: RazorpayPayment[] };
+
+    const items: RazorpayPayment[] = response?.items ?? [];
+    captured.push(...items.filter((p) => p?.status === 'captured'));
+
+    if (items.length < AUDIT_PAGE_SIZE) break;
+    skip += AUDIT_PAGE_SIZE;
+  }
+
+  let skippedTooRecent = 0;
+  const orphans: OrphanPayment[] = [];
+
+  for (const payment of captured) {
+    const capturedAt = new Date((payment.created_at ?? 0) * 1000);
+    if (capturedAt > graceCutoff) {
+      skippedTooRecent++;
+      continue;
+    }
+
+    // Student Pass payments are not orders and have no order row by design.
+    if (payment?.notes?.subscription_type === 'student_pass') continue;
+
+    const claimedOrderId: string | null = payment?.notes?.orderId ?? payment?.notes?.order_id ?? null;
+    const razorpayOrderId: string | null = payment?.order_id ?? null;
+
+    // Three ways to find it, because any one of them can be absent: the
+    // payment id is only written once we process the capture, and the notes
+    // are only as good as what we sent when the order was created.
+    const match = await prisma.order.findFirst({
+      where: {
+        OR: [
+          { razorpayPaymentId: payment.id },
+          ...(claimedOrderId ? [{ id: claimedOrderId }] : []),
+          ...(razorpayOrderId ? [{ razorpayOrderId }] : []),
+        ],
+      },
+      select: { id: true },
+    });
+
+    if (match) continue;
+
+    orphans.push({
+      paymentId: payment.id,
+      amountPaise: payment.amount ?? 0,
+      capturedAt,
+      claimedOrderId,
+      razorpayOrderId,
+      email: payment.email ?? null,
+      contact: payment.contact ?? null,
+    });
+  }
+
+  return {
+    windowStart,
+    checked: captured.length - skippedTooRecent,
+    skippedTooRecent,
+    orphans,
+  };
+}

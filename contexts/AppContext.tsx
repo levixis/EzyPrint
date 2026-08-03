@@ -21,6 +21,7 @@ export { calculateBaseFee, calculateOrderPrice, calculateMultiFileOrderPrice, is
 import { registerPushNotifications, unregisterPushNotifications } from '../utils/pushNotifications';
 import { formatMoney } from '../utils/money';
 import { createFetchGuard } from '../utils/fetchGuard';
+import { sortNotificationsNewestFirst } from '../utils/notificationOrder';
 import { applyOverrides, retireConfirmedOverrides, type StatusOverrides } from '../utils/optimisticStatus';
 
 /**
@@ -350,7 +351,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     const scoped = currentUser?.type === UserType.SHOP_OWNER && currentUser.shopId
       ? merged.filter(notification => !notification.targetShopId || notification.targetShopId === currentUser.shopId)
       : merged;
-    return scoped.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+    return sortNotificationsNewestFirst(scoped);
   }, [localNotifications, serverNotifications, currentUser]);
 
   const navigateTo = useCallback((view: AppView) => {

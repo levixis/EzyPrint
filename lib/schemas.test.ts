@@ -221,13 +221,55 @@ describe('Notification responses', () => {
     spy.mockRestore();
   });
 
-  test('a notification with no timestamp still sorts deterministically', () => {
-    // The merge sorts on `new Date(timestamp)`. Undefined gives NaN, and NaN
-    // comparisons are all false, which scrambles the order silently rather
-    // than failing — the worst kind of wrong.
-    const parsed = notificationSchema.parse({ id: 'n_1', message: 'Order ready' });
+  test('a server row keeps its real time, taken from createdAt', () => {
+    // The regression. The server returns the Prisma row untouched, so the
+    // field is `createdAt`; the client type calls it `timestamp` and nothing
+    // mapped between them. The `.catch(() => new Date(0).toISOString())` that
+    // used to sit on `timestamp` therefore fired on every server notification
+    // and stamped it with the Unix epoch — the whole tray read "56y ago".
+    const parsed = notificationSchema.parse({
+      id: 'n_1',
+      message: 'New order from a student',
+      createdAt: '2026-08-03T04:03:11.000Z',
+      read: false,
+      type: 'info',
+    });
 
-    expect(Number.isNaN(new Date(parsed.timestamp).getTime())).toBe(false);
+    expect(parsed.timestamp).toBe('2026-08-03T04:03:11.000Z');
+  });
+
+  test('an absent time stays absent instead of becoming 1970', () => {
+    // Honest over convenient: a default here is indistinguishable from a real
+    // value downstream, and `timeAgo` already renders nothing for an unusable
+    // date. The ordering hazard the default used to cover is handled in
+    // sortNotificationsNewestFirst, which is tested directly.
+    const parsed = notificationSchema.parse({ id: 'n_2', message: 'Order ready' });
+
+    expect(parsed.timestamp).toBeUndefined();
+  });
+
+  test('a client-side toast keeps its own timestamp field', () => {
+    // Session-local toasts are built against NotificationMessage, so they
+    // carry `timestamp`. Both names have to work; picking one would break the
+    // other.
+    const parsed = notificationSchema.parse({
+      id: 'n_3',
+      message: 'Saved',
+      timestamp: '2026-08-03T05:00:00.000Z',
+    });
+
+    expect(parsed.timestamp).toBe('2026-08-03T05:00:00.000Z');
+  });
+
+  test('timestamp wins over createdAt when a row somehow carries both', () => {
+    const parsed = notificationSchema.parse({
+      id: 'n_4',
+      message: 'Both',
+      timestamp: '2026-08-03T05:00:00.000Z',
+      createdAt: '2020-01-01T00:00:00.000Z',
+    });
+
+    expect(parsed.timestamp).toBe('2026-08-03T05:00:00.000Z');
   });
 
   test('a real notification passes through intact', () => {

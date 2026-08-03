@@ -182,20 +182,38 @@ export const reactivationRequestSchema = z.object({
  * without a `notifications` key would take out every screen that renders the
  * header — which is all of them.
  *
- * `timestamp` is defaulted rather than optional because the sort reads it
- * unconditionally, and `new Date(undefined)` sorts as NaN, which silently
- * scrambles the order rather than failing.
+ * The two names for the same instant are both accepted. The server returns the
+ * Prisma row as-is, so its field is `createdAt`; session-local toasts are built
+ * client-side against `NotificationMessage`, so theirs is `timestamp`. Nothing
+ * mapped between them.
+ *
+ * `timestamp` used to carry `.catch(() => new Date(0).toISOString())` to keep
+ * the sort total. Because no server notification has ever had a `timestamp`
+ * field, that catch fired on every single one and stamped them all with the
+ * Unix epoch — so the whole notification tray read "56y ago". The mistake was
+ * using a default to paper over a *missing* field: it converts a shape
+ * mismatch into a confident wrong answer, which is far harder to notice than a
+ * blank. Before this schema existed the field was simply `undefined` and the
+ * time rendered as nothing, which was ugly but honest.
+ *
+ * So: read whichever name is present, and if neither is, leave it undefined.
+ * `timeAgo` already renders nothing for an unusable date, and the sort in
+ * AppContext now orders undefined last instead of relying on a sentinel.
  */
 export const notificationSchema = z.object({
   id: z.string(),
   message: z.string().catch(''),
-  timestamp: isoDate.catch(() => new Date(0).toISOString()),
+  timestamp: isoDate.optional(),
+  createdAt: isoDate.optional(),
   read: z.boolean().catch(false),
   type: z.string().optional(),
   orderId: z.string().nullable().optional(),
   targetUserId: z.string().nullable().optional(),
   targetShopId: z.string().nullable().optional(),
-}).loose();
+}).loose().transform(({ createdAt, ...rest }) => ({
+  ...rest,
+  timestamp: rest.timestamp ?? createdAt,
+}));
 
 // ──────────────────────────────────────────────
 // PARSING

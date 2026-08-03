@@ -184,6 +184,13 @@ export const env = {
   ENABLE_SCHEDULER: boolFromEnv('ENABLE_SCHEDULER', !isTest),
   SETTLEMENT_SWEEP_INTERVAL_MS: intFromEnv('SETTLEMENT_SWEEP_INTERVAL_MS', 5 * 60 * 1000),
   RECONCILE_INTERVAL_MS: intFromEnv('RECONCILE_INTERVAL_MS', 15 * 60 * 1000),
+  /**
+   * How often to ask Razorpay what it was paid and check we have an order for
+   * each. Hourly rather than every 15 minutes because it reads the gateway's
+   * whole payment list, and the failures it catches — a lost row, a restore
+   * that rolled past a capture — are not the kind that get worse in an hour.
+   */
+  PAYMENT_AUDIT_INTERVAL_MS: intFromEnv('PAYMENT_AUDIT_INTERVAL_MS', 60 * 60 * 1000),
   OUTBOX_DISPATCH_INTERVAL_MS: intFromEnv('OUTBOX_DISPATCH_INTERVAL_MS', 10 * 1000),
   /** How often to retry file deletions the inline purge missed. */
   FILE_RETENTION_SWEEP_INTERVAL_MS: intFromEnv('FILE_RETENTION_SWEEP_INTERVAL_MS', 60 * 60 * 1000),

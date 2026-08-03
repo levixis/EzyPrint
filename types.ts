@@ -167,7 +167,14 @@ export interface DocumentOrder {
 export interface NotificationMessage {
   id: string;
   message: string;
-  timestamp: string;
+  /**
+   * Optional because it genuinely can be absent. The server row calls this
+   * `createdAt` and the boundary schema maps it across; a notification that
+   * arrives with neither name renders without a time rather than with a
+   * fabricated one. Defaulting it to the epoch is what made the whole tray
+   * read "56y ago".
+   */
+  timestamp?: string;
   read: boolean;
   orderId?: string;
   type: 'success' | 'info' | 'warning' | 'error';

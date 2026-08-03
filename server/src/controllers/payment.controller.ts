@@ -147,6 +147,39 @@ export async function reconcile(req: Request, res: Response, next: NextFunction)
 }
 
 /**
+ * GET /api/v1/payments/audit
+ *
+ * Ask Razorpay what it was paid over a window and report any captured payment
+ * with no order behind it. The opposite direction to /reconcile, which starts
+ * from our orders and so can never see one that is missing entirely.
+ *
+ * Read-only on purpose. Putting a payment back means recreating an order, its
+ * files and its ledger entry, and what that should contain depends on why it
+ * went missing — so this reports and leaves the decision to a person.
+ */
+export async function audit(req: Request, res: Response, next: NextFunction) {
+  try {
+    if (!req.user) throw ApiError.unauthorized();
+    if (req.user.userType !== 'ADMIN') {
+      throw ApiError.forbidden('Only admins can run the payment audit');
+    }
+
+    const windowMinutes = clampThresholdMinutes(req.query.windowMinutes) || 24 * 60;
+    const result = await paymentService.auditCapturedPayments({ windowMinutes });
+
+    res.json({
+      success: true,
+      message: result.orphans.length === 0
+        ? `No unmatched payments in the last ${windowMinutes} minutes.`
+        : `${result.orphans.length} captured payment(s) have no matching order.`,
+      data: result,
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+/**
  * POST /api/v1/payments/pass/create-order
  */
 export async function createStudentPassOrder(req: Request, res: Response, next: NextFunction) {

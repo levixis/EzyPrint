@@ -15,5 +15,6 @@ router.post('/webhook', webhookLimiter, paymentController.webhook);
 
 // Upgrade B: Reconciliation endpoint — admin-only
 router.post('/reconcile', authenticate, authorize('ADMIN'), paymentController.reconcile);
+router.get('/audit', authenticate, authorize('ADMIN'), paymentController.audit);
 
 export default router;
