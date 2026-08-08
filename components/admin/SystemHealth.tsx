@@ -157,9 +157,15 @@ const SystemHealth: React.FC = () => {
     );
   }
 
-  const failing = report?.checks.filter((check) => check.status === 'fail') ?? [];
-  const warning = report?.checks.filter((check) => check.status === 'warn') ?? [];
-  const healthy = report?.checks.filter((check) => check.status === 'ok' || check.status === 'skipped') ?? [];
+  // `checks?.` and not `checks.` — `parseResponse` returns the raw body when a
+  // response fails to match, so a report that arrives without `checks` reaches
+  // here as undefined and takes the whole admin page down at `.filter`. That is
+  // the exact crash that blanked this app twice, and the schema does not rule it
+  // out: `checkedAt` is a bare `z.string()` with no `.catch`, so one malformed
+  // date fails the object parse and hands the raw body straight through.
+  const failing = report?.checks?.filter((check) => check.status === 'fail') ?? [];
+  const warning = report?.checks?.filter((check) => check.status === 'warn') ?? [];
+  const healthy = report?.checks?.filter((check) => check.status === 'ok' || check.status === 'skipped') ?? [];
 
   const overall = report?.status ?? 'down';
   const overallStyles =

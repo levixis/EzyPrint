@@ -417,14 +417,44 @@ async function checkEmail(): Promise<HealthCheck> {
   });
 }
 
-/** Unresolved defects the error recorder has collected. */
+/**
+ * Unresolved defects the error recorder has collected.
+ *
+ * Counts application errors only — `source: 'health'` is excluded, and that
+ * exclusion is the whole correctness of this check rather than a refinement.
+ *
+ * Every failing health check is escalated by the watchdog as a CRITICAL
+ * `system_events` row with `source: 'health'`. Counting those means counting
+ * this check's own alert: one failure writes the `health:errors` row, that row
+ * is an unresolved CRITICAL, so the next cycle fails again on the evidence it
+ * just created. Observed doing exactly that — 8 unresolved criticals, all of
+ * them `source: 'health'`, none an actual application error, with the row's own
+ * message reading "8 unresolved critical error(s)".
+ *
+ * The consequences are not cosmetic. The check could never return to `ok` once
+ * any check had failed once, so `status` was permanently `degraded`, the
+ * all-clear in `alert.clearActive` could never fire, and the alert re-sent on
+ * its escalating backoff forever. A monitor that is always red is one you stop
+ * reading — which is the failure this whole subsystem exists to avoid.
+ *
+ * Nothing is lost by excluding them: every one of those rows is a *derived*
+ * signal from a check that already reports itself in this same report. What
+ * belongs here is what nothing else reports — unhandled request errors, crashed
+ * processes, failing jobs.
+ */
+const DERIVED_SOURCE = 'health';
+
 async function checkErrorRate(): Promise<HealthCheck> {
   return timed('errors', async () => {
     const lastHour = new Date(Date.now() - 60 * 60 * 1000);
 
     const [critical, recent] = await Promise.all([
-      prisma.systemEvent.count({ where: { resolvedAt: null, severity: 'CRITICAL' } }),
-      prisma.systemEvent.count({ where: { resolvedAt: null, lastSeenAt: { gte: lastHour } } }),
+      prisma.systemEvent.count({
+        where: { resolvedAt: null, severity: 'CRITICAL', source: { not: DERIVED_SOURCE } },
+      }),
+      prisma.systemEvent.count({
+        where: { resolvedAt: null, lastSeenAt: { gte: lastHour }, source: { not: DERIVED_SOURCE } },
+      }),
     ]);
 
     if (critical > 0) {
