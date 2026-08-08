@@ -436,6 +436,88 @@ export function notifyRefundSettled(params: {
 }
 
 /**
+ * The refund has been accepted by Razorpay but has not landed yet.
+ *
+ * Separate from `notifyRefundSettled` because the difference between "on its
+ * way" and "arrived" is the entire point. Razorpay refunds are asynchronous:
+ * a 2xx on the refund call means accepted, and the money moves later — or does
+ * not, in which case `refund.failed` arrives and `notifyRefundFailed` below
+ * corrects this message.
+ *
+ * The wording promises nothing that acceptance does not support. "Has been
+ * refunded" was the previous claim at this exact moment, and a student who
+ * reads that waits out the 5-7 days before suspecting anything is wrong.
+ */
+export function notifyRefundInitiated(params: {
+  studentUserId: string;
+  orderId: string;
+  shopId: string;
+  amountPaise: number;
+}): void {
+  const rupees = (params.amountPaise / 100).toFixed(2);
+  guard(
+    notifyUser(params.studentUserId, {
+      message: `Your ₹${rupees} refund is on its way to your original payment method. We'll confirm as soon as your bank accepts it — usually 5-7 working days.`,
+      title: 'Refund in progress',
+      type: 'info',
+      channel: 'ezyprint_account',
+      orderId: params.orderId,
+      targetShopId: params.shopId,
+    }),
+    'refund initiated'
+  );
+}
+
+/**
+ * Razorpay failed the refund after accepting it.
+ *
+ * Nothing told the student this. They had already been told their money was on
+ * the way, and that stayed the last word they ever got — so they waited out the
+ * 5-7 days for money that was never coming, and the first anyone heard of it
+ * was a support ticket blaming the shop.
+ *
+ * Emailed as well as pushed. This is money the student is owed and an action
+ * they may need to chase; a notification they swipe away should not be the only
+ * record of it.
+ */
+export function notifyRefundFailed(params: {
+  studentUserId: string;
+  orderId: string;
+  shopId: string;
+  amountPaise: number;
+}): void {
+  const rupees = (params.amountPaise / 100).toFixed(2);
+  guard(
+    notifyUser(params.studentUserId, {
+      message: `Your ₹${rupees} refund could not be completed by your bank. Nothing has been taken from you — we're looking into it and will retry. No action is needed on your side.`,
+      title: 'Refund failed — we are on it',
+      type: 'error',
+      channel: 'ezyprint_account',
+      orderId: params.orderId,
+      targetShopId: params.shopId,
+      email: {
+        subject: 'Your EzyPrint refund could not be completed',
+        heading: 'Your refund could not be completed',
+        lines: [
+          `We asked your bank to return ₹${rupees} for order ${params.orderId}, and the transfer failed.`,
+          'You have not been charged again, and the amount is still owed to you.',
+          'Our team has been alerted and will retry the refund.',
+        ],
+        tone: 'bad',
+      },
+    }),
+    'refund failed'
+  );
+
+  // The retry needs a human: an admin resolves it from the REFUND_FAILED
+  // request. Without this the only trace is a ledger reversal nobody reads.
+  notifyAdmins(
+    `Refund of ₹${rupees} failed at the gateway for order ${params.orderId}. Retry from the refund queue.`,
+    'error'
+  );
+}
+
+/**
  * An admin approved or rejected a shop's application.
  *
  * Nothing announced this before — not in-app, not push, not email. A shop owner

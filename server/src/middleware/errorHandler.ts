@@ -1,6 +1,8 @@
 import { Request, Response, NextFunction } from 'express';
 import { ApiError } from '../utils/ApiError';
 import { env } from '../config/env';
+import { captureError } from '../services/observability.service';
+import * as alert from '../services/alert.service';
 
 /**
  * Centralized error handling middleware.
@@ -12,7 +14,7 @@ import { env } from '../config/env';
  */
 export const errorHandler = (
   err: Error,
-  _req: Request,
+  req: Request,
   res: Response,
   _next: NextFunction
 ): void => {
@@ -43,6 +45,36 @@ export const errorHandler = (
   // Log non-operational errors (unexpected bugs)
   if (!isOperational) {
     console.error('💥 UNHANDLED ERROR:', err);
+
+    // Record and, if it is new or the cooldown has passed, alert.
+    //
+    // Only non-operational errors. An ApiError is the server correctly telling
+    // a caller they did something wrong — a 404, a bad password, an expired
+    // token — and paging on those means paging on normal traffic. What lands
+    // here is the class nobody anticipated, which is exactly the class worth
+    // being woken for.
+    //
+    // Deliberately not awaited: an error response must not wait on a database
+    // write and an SMTP round trip. The floating promise is caught internally —
+    // captureError never rejects — so there is nothing to leak.
+    void (async () => {
+      const event = await captureError({
+        source: 'http',
+        severity: 'ERROR',
+        message: err.message || 'Unhandled error',
+        // Path and method only. Never the body: it carries passwords, OTPs and
+        // tokens, and system_events is rendered in the admin dashboard.
+        context: { method: req.method, path: req.originalUrl, statusCode },
+        error: err,
+      });
+
+      if (event) {
+        await alert.maybeSend(event, {
+          title: `Unhandled error on ${req.method} ${req.originalUrl}`,
+          body: err.message || 'Unhandled error',
+        });
+      }
+    })();
   }
 
   res.status(statusCode).json({

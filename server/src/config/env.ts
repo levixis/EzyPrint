@@ -134,7 +134,27 @@ export const env = {
    *
    * Defaults to the Gmail user so existing deploys behave exactly as before.
    */
-  EMAIL_FROM: process.env.EMAIL_FROM || `"EzyPrint Security" <${process.env.GMAIL_USER || 'noreply@ezyprint.in'}>`,
+  EMAIL_FROM: process.env.EMAIL_FROM || `"EzyPrint Security" <${process.env.GMAIL_USER || 'noreply@ezyprint.co.in'}>`,
+
+  /**
+   * Where operational alerts go — the human who gets woken up.
+   *
+   * Separate from the admin *accounts* in the database on purpose. Alerts fire
+   * when things are broken, and "query the users table for admins" is a step
+   * that itself fails when the database is the thing that is down. This address
+   * is read from the environment and needs nothing working to be known.
+   *
+   * Falls back to GMAIL_USER **in production only**.
+   *
+   * That fallback used to apply everywhere, and GMAIL_USER is set in every
+   * local `.env` — so a dev server running on a laptop mailed the operator
+   * about a laptop. Sleeping machines stop the scheduler and idle Neon
+   * connections drop, so a development run generates exactly the alerts that
+   * mean nothing and train you to ignore the ones that do.
+   *
+   * Locally you now get alerts only by naming an address on purpose.
+   */
+  ALERT_EMAIL: process.env.ALERT_EMAIL || (isProd ? process.env.GMAIL_USER || '' : ''),
 
   // ── Pusher (real-time shop ledger) ──
   PUSHER_APP_ID: requireSecret('PUSHER_APP_ID', process.env.PUSHER_APP_ID, ''),
@@ -191,6 +211,29 @@ export const env = {
    * that rolled past a capture — are not the kind that get worse in an hour.
    */
   PAYMENT_AUDIT_INTERVAL_MS: intFromEnv('PAYMENT_AUDIT_INTERVAL_MS', 60 * 60 * 1000),
+  /**
+   * How often to ask Razorpay how the refunds we are still waiting on ended.
+   *
+   * The `refund.processed` / `refund.failed` webhooks are ticked by hand in the
+   * dashboard, per mode, and have never delivered a single event here. Until
+   * they do, this poll is the *only* thing that ends a refund: without it the
+   * student is told their money is on the way and never told it arrived, the
+   * shop is never debited, and the order's files are pinned by the unsettled
+   * refund forever.
+   *
+   * Every 15 minutes, matching the payment reconciliation, because it queries
+   * only refunds already flagged stale and does nothing when there are none.
+   */
+  REFUND_RECONCILE_INTERVAL_MS: intFromEnv('REFUND_RECONCILE_INTERVAL_MS', 15 * 60 * 1000),
+  /**
+   * How long a refund may sit in PROCESSING_REFUND before the poll asks about it.
+   *
+   * A grace period, not a deadline. Razorpay usually settles in minutes but is
+   * entitled to take days, and asking immediately would spend a gateway call
+   * per refund to be told what we already know. Nothing is judged at this
+   * threshold — a refund the gateway still calls pending is left alone.
+   */
+  REFUND_STUCK_MINUTES: intFromEnv('REFUND_STUCK_MINUTES', 30),
   OUTBOX_DISPATCH_INTERVAL_MS: intFromEnv('OUTBOX_DISPATCH_INTERVAL_MS', 10 * 1000),
   /** How often to retry file deletions the inline purge missed. */
   FILE_RETENTION_SWEEP_INTERVAL_MS: intFromEnv('FILE_RETENTION_SWEEP_INTERVAL_MS', 60 * 60 * 1000),
@@ -222,8 +265,154 @@ export const env = {
    */
   REFERRAL_SWEEP_INTERVAL_MS: intFromEnv('REFERRAL_SWEEP_INTERVAL_MS', 24 * 60 * 60 * 1000),
 
+  // ── Watchdog / self-healing ──
+  /**
+   * Master kill switch for automatic remediation.
+   *
+   * Detection, alerting and the health endpoint are unaffected by this — only
+   * the part that *acts* is disabled. If a remediation is ever implicated in an
+   * incident, this turns off the acting without turning off the seeing, which
+   * is the state you want while diagnosing.
+   */
+  ENABLE_WATCHDOG: boolFromEnv('ENABLE_WATCHDOG', !isTest),
+  /** How often the watchdog runs its checks and considers remediating. */
+  WATCHDOG_INTERVAL_MS: intFromEnv('WATCHDOG_INTERVAL_MS', 2 * 60 * 1000),
+  /**
+   * Consecutive failures of one remediation before its circuit opens and the
+   * watchdog stops trying and escalates to a human instead.
+   *
+   * Three, because the failure modes worth retrying (a dropped connection, a
+   * gateway 502, a lock held by a dying replica) clear inside three attempts,
+   * and anything that survives three identical attempts is a real defect that
+   * more attempts will not fix — it will only bury the alert under retries.
+   */
+  WATCHDOG_CIRCUIT_THRESHOLD: intFromEnv('WATCHDOG_CIRCUIT_THRESHOLD', 3),
+  /** How long an open circuit stays open before a single trial attempt. */
+  WATCHDOG_CIRCUIT_COOLDOWN_MS: intFromEnv('WATCHDOG_CIRCUIT_COOLDOWN_MS', 30 * 60 * 1000),
+  /**
+   * A scheduler job is considered stalled when this much time has passed
+   * beyond its own interval without a completed run.
+   *
+   * A multiplier rather than a fixed number, because the intervals span 10
+   * seconds (outbox) to 24 hours (referral sweep) and one threshold cannot
+   * serve both. Three times the interval tolerates two missed ticks, which a
+   * cold start or a slow Neon wake can legitimately cause.
+   */
+  WATCHDOG_STALL_MULTIPLIER: intFromEnv('WATCHDOG_STALL_MULTIPLIER', 3),
+  /**
+   * Consecutive cycles a check must fail before a human is told.
+   *
+   * Two, because the most common failure here is not a fault at all: Neon
+   * closes idle connections and suspends on the free tier, so a single cycle
+   * can fail with "Server has closed the connection" and the next one
+   * reconnects and passes. Paging on the first failure meant paging on
+   * housekeeping.
+   *
+   * Remediation is unaffected and still runs on the first failure — retrying a
+   * dropped connection is exactly the cheap, idempotent thing the watchdog
+   * should do immediately. It is only *waking a person* that waits for
+   * confirmation.
+   */
+  WATCHDOG_ESCALATE_AFTER: intFromEnv('WATCHDOG_ESCALATE_AFTER', 2),
+
+  // ── Alerting ──
+  /**
+   * Minimum gap between two alerts about the same fingerprint.
+   *
+   * Without this, one failing endpoint hit by a class of 300 students is 300
+   * identical emails, and the alert channel becomes something you mute — which
+   * is strictly worse than having no alerting, because you believe you have it.
+   */
+  ALERT_COOLDOWN_MS: intFromEnv('ALERT_COOLDOWN_MS', 15 * 60 * 1000),
+  /** Hard ceiling on alert emails per hour, across all fingerprints. */
+  ALERT_MAX_PER_HOUR: intFromEnv('ALERT_MAX_PER_HOUR', 12),
+  /** Days to keep system events before the sweep deletes them. */
+  SYSTEM_EVENT_RETENTION_DAYS: intFromEnv('SYSTEM_EVENT_RETENTION_DAYS', 30),
+
   // ── Helpers ──
   isDev,
   isProd,
   isTest,
 } as const;
+
+/**
+ * Configuration that must be right in production, checked at boot.
+ *
+ * `requireSecret` above covers the values whose absence is obvious — a missing
+ * JWT secret cannot be mistaken for a working one. This function covers the
+ * opposite and more dangerous class: values that are *present, valid, and
+ * wrong*, where the server starts cleanly and the damage is silent.
+ *
+ * Every check here is one that has a real failure attached to it:
+ *
+ *  - STORAGE_MODE defaulting to 'local' writes student uploads to Render's
+ *    ephemeral container disk. The order is paid, the shop sees it, and the
+ *    file is gone at the next deploy. Nothing in the request path errors.
+ *  - A test Razorpay key in production takes real checkout attempts and fails
+ *    every one of them, or worse, appears to succeed against test money.
+ *  - EMAIL_FROM on resend.dev delivers only to the Resend account owner, so
+ *    password resets, payout OTPs and account-deletion codes are all issued,
+ *    all logged as sent, and all arrive nowhere.
+ *
+ * Throwing at boot means Render's deploy fails loudly and the previous good
+ * instance keeps serving, which is the correct outcome for every one of these.
+ */
+export function assertProductionConfig(): void {
+  if (!isProd) return;
+
+  const problems: string[] = [];
+
+  // ── Storage ──
+  if (env.STORAGE_MODE !== 's3') {
+    problems.push(
+      `STORAGE_MODE is "${env.STORAGE_MODE}", which writes uploads to the container's ` +
+      `ephemeral disk — they are lost on every deploy and every restart. Set STORAGE_MODE=s3.`
+    );
+  } else {
+    for (const [name, value] of Object.entries({
+      S3_BUCKET: env.S3_BUCKET,
+      S3_ENDPOINT: env.S3_ENDPOINT,
+      S3_ACCESS_KEY: env.S3_ACCESS_KEY,
+      S3_SECRET_KEY: env.S3_SECRET_KEY,
+    })) {
+      if (!value) problems.push(`STORAGE_MODE=s3 but ${name} is empty.`);
+    }
+  }
+
+  // ── Razorpay ──
+  if (!env.RAZORPAY_KEY_ID) {
+    problems.push('RAZORPAY_KEY_ID is empty — checkout cannot be opened.');
+  } else if (env.RAZORPAY_KEY_ID.startsWith('rzp_test_')) {
+    problems.push(
+      'RAZORPAY_KEY_ID is a TEST key in production. Real payments cannot be collected. ' +
+      'Switch to the rzp_live_ key and regenerate RAZORPAY_WEBHOOK_SECRET — the live-mode ' +
+      'webhook has a different signing secret than the test-mode one.'
+    );
+  }
+
+  // ── Email ──
+  if (!env.RESEND_API_KEY && !env.GMAIL_APP_PASSWORD) {
+    problems.push(
+      'No mail transport configured (RESEND_API_KEY and GMAIL_APP_PASSWORD both empty). ' +
+      'Password reset, payout OTP and account deletion all silently fail.'
+    );
+  }
+  if (/resend\.dev/i.test(env.EMAIL_FROM)) {
+    problems.push(
+      `EMAIL_FROM is "${env.EMAIL_FROM}", which is Resend's shared testing sender. It ` +
+      'delivers ONLY to the mailbox that owns the Resend account — every other recipient ' +
+      'gets nothing. Set it to an address on your verified domain.'
+    );
+  }
+  if (!env.ALERT_EMAIL) {
+    problems.push('ALERT_EMAIL is empty — nobody is told when the app breaks.');
+  }
+
+  if (problems.length > 0) {
+    throw new Error(
+      `\n❌ Refusing to start in production with this configuration:\n\n` +
+      problems.map((p, i) => `  ${i + 1}. ${p}`).join('\n\n') +
+      `\n\nFix these in the host's environment settings and redeploy.\n`
+    );
+  }
+}

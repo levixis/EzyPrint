@@ -6,6 +6,7 @@ import {
   PutObjectCommand,
   GetObjectCommand,
   DeleteObjectCommand,
+  HeadBucketCommand,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { env } from '../config/env';
@@ -233,4 +234,35 @@ export async function deleteFile(storageKey: string): Promise<void> {
   } catch {
     // File may already be deleted — that's fine
   }
+}
+
+/**
+ * Check that the configured storage backend is actually reachable and writable.
+ *
+ * `HeadBucket` rather than a test upload: it costs nothing, needs no cleanup,
+ * and fails for every reason a real upload would — bad credentials, wrong
+ * endpoint, deleted bucket, network. The one thing it does not prove is write
+ * permission, which R2 tokens can withhold separately; a scoped token that can
+ * read but not write would pass this and fail on the first order. That is the
+ * known gap, and it is caught by the first upload rather than by a probe that
+ * leaves litter in the bucket on every health check.
+ *
+ * Throws with a usable message on failure; the caller turns it into a status.
+ */
+export async function probeStorage(): Promise<{ mode: string; detail: string }> {
+  if (env.STORAGE_MODE === 's3') {
+    const client = getS3Client();
+    await client.send(new HeadBucketCommand({ Bucket: env.S3_BUCKET }));
+    return { mode: 's3', detail: `bucket "${env.S3_BUCKET}" reachable` };
+  }
+
+  // Local mode is a red flag in itself outside development — assertProductionConfig
+  // refuses to boot on it — but the probe still reports honestly rather than
+  // claiming health it cannot verify.
+  const uploadDir = await getLocalUploadDir();
+  await fs.access(uploadDir);
+  return {
+    mode: 'local',
+    detail: `writing to ${uploadDir} — ephemeral, files do not survive a redeploy`,
+  };
 }

@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { authenticate, authorize } from '../middleware/auth';
+import { authenticate } from '../middleware/auth';
 import { prisma } from '../utils/prisma';
 import { ApiError } from '../utils/ApiError';
 import { sendOTPEmail } from '../services/email.service';

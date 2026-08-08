@@ -3,13 +3,16 @@ import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
 
-import { env } from './config/env';
+import { env, assertProductionConfig } from './config/env';
 import { generalLimiter } from './middleware/rateLimiter';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler';
 import routes from './routes';
 import { prisma } from './utils/prisma';
 import { sanitizeBody, additionalSecurityHeaders } from './middleware/security';
 import { startScheduler, stopScheduler } from './services/scheduler.service';
+import { startWatchdog, stopWatchdog } from './services/watchdog.service';
+import { captureError } from './services/observability.service';
+import * as alert from './services/alert.service';
 
 /**
  * EzyPrint Backend Server
@@ -102,6 +105,12 @@ app.use(errorHandler);
 // ── Start Server ──
 const startServer = async () => {
   try {
+    // Refuse to start on a production configuration that is present, valid and
+    // wrong — test payment keys, ephemeral storage, a mail sender that reaches
+    // one mailbox. Before the listener binds, so a bad deploy fails and Render
+    // keeps the previous instance serving instead of promoting a broken one.
+    assertProductionConfig();
+
     // Verify database connection on startup
     await prisma.$connect();
     console.log('✅ Database connected successfully');
@@ -127,6 +136,13 @@ const startServer = async () => {
     // safe.
     startScheduler();
 
+    // ── Watchdog ──
+    // Checks health on an interval, repairs the failures it has a safe and
+    // idempotent remedy for, and escalates everything else. Started after the
+    // scheduler so the first cycle sees real heartbeats rather than reporting
+    // every job as missing.
+    startWatchdog();
+
     // ── Graceful Shutdown ──
     // When Railway/Render sends SIGTERM (container restart, deploy, etc.),
     // we stop accepting new connections but let in-flight requests finish.
@@ -136,6 +152,7 @@ const startServer = async () => {
 
       // Stop background jobs before draining, so no new work starts mid-drain.
       stopScheduler();
+      stopWatchdog();
 
       // Stop accepting new connections, wait for in-flight to finish
       server.close(async () => {
@@ -172,15 +189,45 @@ startServer();
 process.on('unhandledRejection', (reason: unknown) => {
   console.error('💥 UNHANDLED REJECTION:', reason);
   // Don't crash — log and let the server continue.
-  // In a production observability stack, this would fire an alert.
+  void captureError({
+    source: 'process',
+    severity: 'ERROR',
+    message: reason instanceof Error ? reason.message : `Unhandled rejection: ${String(reason)}`,
+    error: reason,
+  });
 });
 
 process.on('uncaughtException', (error: Error) => {
   console.error('💥 UNCAUGHT EXCEPTION:', error);
-  // Uncaught exceptions leave the process in an undefined state.
-  // Log the error and exit — the container orchestrator (Railway)
-  // will restart the process automatically.
-  process.exit(1);
+
+  // The process is about to exit, so the usual fire-and-forget pattern would
+  // lose the report. Give the write and the alert a bounded window to land,
+  // then exit regardless — a crash that is never reported is a crash that
+  // repeats. CRITICAL because reaching here means the process died.
+  const deadline = setTimeout(() => process.exit(1), 3000);
+  deadline.unref();
+
+  void (async () => {
+    try {
+      const event = await captureError({
+        source: 'process',
+        severity: 'CRITICAL',
+        message: `Uncaught exception: ${error.message}`,
+        error,
+      });
+      if (event) {
+        await alert.maybeSend(event, {
+          title: 'Server crashed (uncaught exception)',
+          body: `${error.message}\n\nThe process is restarting. If this repeats, the restart loop will not resolve it.`,
+        });
+      }
+    } finally {
+      clearTimeout(deadline);
+      // Uncaught exceptions leave the process in an undefined state. Exit and
+      // let Render restart it.
+      process.exit(1);
+    }
+  })();
 });
 
 export default app;

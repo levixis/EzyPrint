@@ -1,6 +1,6 @@
 import Razorpay from 'razorpay';
 import crypto from 'crypto';
-import type { OrderStatus } from '@prisma/client';
+import type { OrderStatus, Prisma, RefundRequestStatus } from '@prisma/client';
 import { prisma } from '../utils/prisma';
 import { ApiError } from '../utils/ApiError';
 import { env } from '../config/env';
@@ -85,6 +85,23 @@ function getRazorpay(): InstanceType<typeof Razorpay> {
     });
   }
   return razorpayClient;
+}
+
+/**
+ * Check that Razorpay answers and that our credentials are accepted.
+ *
+ * Listing one order is the cheapest authenticated call available: it proves
+ * reachability, key validity and secret validity in a single request, and
+ * unlike creating anything it leaves no trace on the account.
+ *
+ * Also reports which mode the key is in, because "payments are failing" and
+ * "the server is on test keys" look identical from the outside and are the
+ * single most likely launch-day misconfiguration.
+ */
+export async function probeGateway(): Promise<{ mode: 'live' | 'test'; detail: string }> {
+  const mode = env.RAZORPAY_KEY_ID.startsWith('rzp_live_') ? 'live' : 'test';
+  await getRazorpay().orders.all({ count: 1 });
+  return { mode, detail: `gateway reachable, credentials accepted (${mode} mode)` };
 }
 
 // ────────────────────────────────────────────────────────────
@@ -679,6 +696,191 @@ async function findRefundRequest(tx: any, refund: { id: string; payment_id?: str
   });
 }
 
+/**
+ * Everyone who needs telling once a refund reaches its terminal state.
+ *
+ * Returned rather than notified in place because both callers below run inside
+ * a transaction, and a notification sent from there would announce an outcome
+ * that a rollback can still take back.
+ */
+interface RefundParty {
+  studentUserId: string;
+  orderId: string;
+  shopId: string;
+}
+
+/**
+ * Apply a confirmed refund to the request, the order and the shop's ledger.
+ *
+ * Extracted from the `refund.processed` webhook so the reconciliation poll in
+ * `reconcileStuckRefunds` applies the identical effects. Two implementations of
+ * "the refund landed" is how the push path and the pull path drift into
+ * disagreeing about what a settled refund looks like — and the pull path is the
+ * one that runs when the webhook was never configured, so it is exactly the
+ * copy that would rot unnoticed.
+ *
+ * Returns who to tell, or null when this call was not the one that moved the
+ * row — a redelivery, or the poll racing the webhook it exists to replace.
+ *
+ * The ledger write reuses `refund:<id>` as its eventId, so an entry made by
+ * whichever path arrived first is found rather than duplicated.
+ */
+async function applyRefundProcessed(
+  tx: Prisma.TransactionClient,
+  request: { id: string; orderId: string; shopId: string; status: RefundRequestStatus },
+  refund: { id: string; amount: number },
+  outboxIds: string[]
+): Promise<RefundParty | null> {
+  if (request.status !== 'PROCESSING_REFUND') return null;
+
+  const moved = await tx.refundRequest.updateMany({
+    where: { id: request.id, status: 'PROCESSING_REFUND' },
+    data: {
+      status: 'RESOLVED_REFUNDED',
+      razorpayRefundId: refund.id,
+      adminResolvedAt: new Date(),
+      refundAmount: refund.amount,
+    },
+  });
+
+  // Record the refund on the order regardless of what terminal state it
+  // holds. This is the moment `refundStatus` earns the word 'processed' — it
+  // is written here, on Razorpay's confirmation, rather than at acceptance
+  // where it used to be a guess.
+  await tx.order.updateMany({
+    where: { id: request.orderId },
+    data: {
+      refundId: refund.id,
+      refundStatus: 'processed',
+      refundAmount: refund.amount,
+      refundedAt: new Date(),
+    },
+  });
+
+  // Promoting the order to REFUNDED is separate, because it must not apply to
+  // every order that gets refunded. A cancellation keeps CANCELLED — the more
+  // meaningful record of why the order ended, and there is no
+  // CANCELLED -> REFUNDED edge in VALID_TRANSITIONS.
+  //
+  // This guard did not exist before and did not need to: the resolve path
+  // marked the request RESOLVED_REFUNDED at acceptance, so this whole block was
+  // skipped for every real delivery. Now that the request honestly stays
+  // PROCESSING_REFUND until Razorpay confirms, this runs for cancellation
+  // refunds too.
+  await tx.order.updateMany({
+    where: { id: request.orderId, status: { notIn: ['CANCELLED', 'REFUNDED'] } },
+    data: { status: 'REFUNDED' },
+  });
+
+  // Same split as the admin resolve path: the shop is liable only for what it
+  // actually received, never for the platform's base fee.
+  const shopShare = await ledgerService.shopShareOfRefund(tx, request.orderId, refund.amount);
+
+  if (shopShare > 0) {
+    await ledgerService.createLedgerEntry({
+      shopId: request.shopId,
+      type: 'REFUND_DEDUCTION',
+      amount: shopShare,
+      description: `Refund for order ${request.orderId}`,
+      counterparty: 'STUDENT',
+      createdBy: 'SYSTEM',
+      orderId: request.orderId,
+      eventId: `refund:${request.id}`,
+      allowDebt: true,
+    }, tx, outboxIds);
+  }
+
+  if (moved.count === 0) return null;
+
+  const order = await tx.order.findUnique({
+    where: { id: request.orderId },
+    select: { userId: true },
+  });
+  if (!order) return null;
+
+  return { studentUserId: order.userId, orderId: request.orderId, shopId: request.shopId };
+}
+
+/**
+ * Apply a failed refund: reverse the shop's deduction and correct both screens.
+ *
+ * The student's money never moved, so the shop must not stay charged. A
+ * compensating ADJUSTMENT credit reverses the deduction rather than deleting
+ * the original entry — the ledger stays append-only, so both the attempt and
+ * its reversal remain auditable.
+ *
+ * ADJUSTMENT is the exact mirror of REFUND_DEDUCTION: same CLEARING bucket,
+ * opposite direction. Credits pay down `debtAmount` first, which is what should
+ * happen when the refund had pushed the shop negative.
+ *
+ * The reversal's own `refund:<id>:reversal` eventId makes a second arrival of
+ * the same failure — a redelivered webhook, or the poll after the webhook —
+ * harmless.
+ */
+async function applyRefundFailed(
+  tx: Prisma.TransactionClient,
+  request: { id: string; orderId: string; shopId: string; status: RefundRequestStatus },
+  outboxIds: string[]
+): Promise<RefundParty | null> {
+  // Guarding on the statuses that imply a deduction was actually made stops a
+  // second arrival from crediting the shop twice.
+  if (!['RESOLVED_REFUNDED', 'PROCESSING_REFUND'].includes(request.status)) return null;
+
+  const deducted = await tx.ledgerEntry.findUnique({
+    where: { eventId: `refund:${request.id}` },
+  });
+
+  if (deducted) {
+    await ledgerService.createLedgerEntry({
+      shopId: request.shopId,
+      type: 'ADJUSTMENT',
+      amount: deducted.amount,
+      description: `Reversal — Razorpay refund failed for order ${request.orderId}`,
+      counterparty: 'PLATFORM',
+      createdBy: 'SYSTEM',
+      orderId: request.orderId,
+      eventId: `refund:${request.id}:reversal`,
+    }, tx, outboxIds);
+  }
+
+  const moved = await tx.refundRequest.updateMany({
+    where: { id: request.id, status: request.status },
+    data: { status: 'REFUND_FAILED' },
+  });
+
+  // The order was never actually refunded. Returning it to COMPLETED is the
+  // least-wrong terminal state: the print was delivered, and only the refund
+  // attempt failed. An admin retries from the REFUND_FAILED request.
+  await tx.order.updateMany({
+    where: { id: request.orderId, status: 'REFUNDED' },
+    data: { status: 'COMPLETED' },
+  });
+
+  // Stop the order claiming a refund that did not happen.
+  //
+  // This is a separate statement from the one above because it must run
+  // whatever status the order holds — a cancellation refund never made the
+  // order REFUNDED, so the guarded update matches nothing and the stale
+  // 'processed' would survive. `refundStatus` is what the admin payment badge
+  // is derived from and what the student's order card reads, so leaving it
+  // meant both screens showed a completed refund while only the ledger
+  // reversal knew otherwise.
+  await tx.order.updateMany({
+    where: { id: request.orderId },
+    data: { refundStatus: 'FAILED', refundError: 'Refund failed at the gateway' },
+  });
+
+  if (moved.count === 0) return null;
+
+  const order = await tx.order.findUnique({
+    where: { id: request.orderId },
+    select: { userId: true },
+  });
+  if (!order) return null;
+
+  return { studentUserId: order.userId, orderId: request.orderId, shopId: request.shopId };
+}
+
 async function processWebhookEvent(eventType: string, event: any, eventId: string) {
   switch (eventType) {
     case 'payment.captured': {
@@ -811,131 +1013,82 @@ async function processWebhookEvent(eventType: string, event: any, eventId: strin
     /**
      * Razorpay confirms the refund actually settled.
      *
-     * Normally a no-op: the admin resolve flow already recorded everything
-     * synchronously. It matters when that flow crashed *after* Razorpay
-     * accepted the refund but *before* the local transaction committed —
-     * leaving the request stuck in PROCESSING_REFUND with the student refunded
-     * and the shop's ledger untouched. Completing it here closes that window.
+     * This is the event that ends a refund. `settleClaimedRefund` leaves the
+     * request in PROCESSING_REFUND because Razorpay's acceptance is not
+     * settlement, so nothing tells the student their money arrived until this
+     * arrives — or until `reconcileStuckRefunds` goes and asks.
      *
-     * The ledger write reuses `refund:<id>` as its eventId, so if the original
-     * transaction did commit this finds the existing entry and moves no money.
+     * The effects live in `applyRefundProcessed`, shared with that poll.
      */
     case 'refund.processed': {
       const refund = event.payload.refund.entity;
       const outboxIds: string[] = [];
 
-      await prisma.$transaction(async (tx) => {
+      // Only the delivery that actually moved the row may tell the student —
+      // `applyRefundProcessed` returns null for every other caller.
+      const confirmedHere = await prisma.$transaction(async (tx) => {
         const request = await findRefundRequest(tx, refund);
-
-        if (request && request.status === 'PROCESSING_REFUND') {
-          await tx.refundRequest.updateMany({
-            where: { id: request.id, status: 'PROCESSING_REFUND' },
-            data: {
-              status: 'RESOLVED_REFUNDED',
-              razorpayRefundId: refund.id,
-              adminResolvedAt: new Date(),
-              refundAmount: refund.amount,
-            },
-          });
-
-          await tx.order.updateMany({
-            where: { id: request.orderId },
-            data: { status: 'REFUNDED' },
-          });
-
-          // Same split as the admin resolve path: the shop is liable only for
-          // what it actually received, never for the platform's base fee.
-          const shopShare = await ledgerService.shopShareOfRefund(tx, request.orderId, refund.amount);
-
-          if (shopShare > 0) {
-            await ledgerService.createLedgerEntry({
-              shopId: request.shopId,
-              type: 'REFUND_DEDUCTION',
-              amount: shopShare,
-              description: `Refund for order ${request.orderId}`,
-              counterparty: 'STUDENT',
-              createdBy: 'SYSTEM',
-              orderId: request.orderId,
-              eventId: `refund:${request.id}`,
-              allowDebt: true,
-            }, tx, outboxIds);
-          }
-        }
+        const party = request
+          ? await applyRefundProcessed(tx, request, refund, outboxIds)
+          : null;
 
         await tx.webhookEvent.update({
           where: { eventId },
           data: { processed: true, processedAt: new Date() },
         });
+
+        return party;
       });
 
       await realtimeService.publishQueued(outboxIds);
+
+      // After commit. The student was last told the refund was on its way;
+      // this is the message that closes that loop.
+      if (confirmedHere) {
+        notify.notifyRefundSettled({
+          ...confirmedHere,
+          amountPaise: refund.amount,
+          throughGateway: true,
+        });
+      }
       break;
     }
 
     /**
      * Razorpay failed the refund after accepting it.
      *
-     * The student's money never moved, so the shop must not stay charged. A
-     * compensating ADJUSTMENT credit reverses the deduction rather than
-     * deleting the original entry — the ledger stays append-only, so both the
-     * attempt and its reversal remain auditable.
-     *
-     * ADJUSTMENT is the exact mirror of REFUND_DEDUCTION: same CLEARING
-     * bucket, opposite direction. Credits pay down `debtAmount` first, which
-     * is what should happen when the refund had pushed the shop negative.
-     *
-     * The reversal's own `refund:<id>:reversal` eventId makes redelivery of
-     * this webhook harmless.
+     * The effects live in `applyRefundFailed`, shared with the reconciliation
+     * poll — which is the only thing that notices a failure at all when this
+     * event is not configured on the webhook.
      */
     case 'refund.failed': {
       const refund = event.payload.refund.entity;
       const outboxIds: string[] = [];
 
-      await prisma.$transaction(async (tx) => {
+      const failedHere = await prisma.$transaction(async (tx) => {
         const request = await findRefundRequest(tx, refund);
-
-        // Guarding on the statuses that imply a deduction was actually made
-        // stops a redelivered failure from crediting the shop twice.
-        if (request && ['RESOLVED_REFUNDED', 'PROCESSING_REFUND'].includes(request.status)) {
-          const deducted = await tx.ledgerEntry.findUnique({
-            where: { eventId: `refund:${request.id}` },
-          });
-
-          if (deducted) {
-            await ledgerService.createLedgerEntry({
-              shopId: request.shopId,
-              type: 'ADJUSTMENT',
-              amount: deducted.amount,
-              description: `Reversal — Razorpay refund failed for order ${request.orderId}`,
-              counterparty: 'PLATFORM',
-              createdBy: 'SYSTEM',
-              orderId: request.orderId,
-              eventId: `refund:${request.id}:reversal`,
-            }, tx, outboxIds);
-          }
-
-          await tx.refundRequest.updateMany({
-            where: { id: request.id, status: request.status },
-            data: { status: 'REFUND_FAILED' },
-          });
-
-          // The order was never actually refunded. Returning it to COMPLETED
-          // is the least-wrong terminal state: the print was delivered, and
-          // only the refund attempt failed. An admin retries from the
-          // REFUND_FAILED request.
-          await tx.order.updateMany({
-            where: { id: request.orderId, status: 'REFUNDED' },
-            data: { status: 'COMPLETED' },
-          });
-        }
+        const party = request ? await applyRefundFailed(tx, request, outboxIds) : null;
 
         await tx.webhookEvent.update({
           where: { eventId },
           data: { processed: true, processedAt: new Date() },
         });
+
+        return party;
       });
 
       await realtimeService.publishQueued(outboxIds);
+
+      // After commit. The student's last message said their money was on the
+      // way; without this that stays the final word and they wait out the
+      // 5-7 days for money that is never coming. Also pages the admins, since
+      // the retry needs a human.
+      if (failedHere) {
+        notify.notifyRefundFailed({
+          ...failedHere,
+          amountPaise: refund.amount,
+        });
+      }
       break;
     }
 
@@ -1319,4 +1472,191 @@ export async function auditCapturedPayments(options?: {
     skippedTooRecent,
     orphans,
   };
+}
+
+// ────────────────────────────────────────────────────────────
+// REFUND RECONCILIATION — the pull side of the refund lifecycle
+// ────────────────────────────────────────────────────────────
+
+export interface RefundReconcileResult {
+  /** Requests that were stale enough to be asked about. */
+  checked: number;
+  /** Confirmed settled by the gateway on this pass. */
+  confirmed: number;
+  /** Confirmed failed by the gateway on this pass. */
+  failed: number;
+  /** Genuinely still in flight — Razorpay has it and has not finished. */
+  stillPending: number;
+  /**
+   * Requests that claim to be refunding but that the gateway has no refund
+   * for. These are the ones a human has to look at: the refund was never
+   * actually initiated, so nobody is waiting on Razorpay for anything.
+   */
+  stranded: string[];
+  /** Requests whose gateway lookup threw. Retried on the next pass. */
+  errors: number;
+}
+
+/** How many stale requests one pass will ask the gateway about. */
+const REFUND_RECONCILE_BATCH = 50;
+
+/**
+ * Find the gateway's refund for a request, without trusting that we stored it.
+ *
+ * The stored `razorpayRefundId` is the fast path. The fallback matters because
+ * of the exact crash this whole function exists to survive: `callRazorpayRefund`
+ * returns, the local transaction fails to commit, and the id is lost while the
+ * refund is real and in flight. Listing the payment's refunds finds it anyway.
+ *
+ * `notes.orderId` is set on every refund we create, so the match is exact
+ * rather than positional — a payment can carry more than one refund, and
+ * picking "the first" would attribute a partial refund to the wrong request.
+ */
+async function findGatewayRefund(request: {
+  id: string;
+  orderId: string;
+  razorpayRefundId: string | null;
+  order: { razorpayPaymentId: string | null };
+}): Promise<{ id: string; amount: number; status: 'pending' | 'processed' | 'failed' } | null> {
+  const razorpay = getRazorpay();
+
+  if (request.razorpayRefundId) {
+    const refund = await razorpay.refunds.fetch(request.razorpayRefundId);
+    return { id: refund.id, amount: refund.amount ?? 0, status: refund.status };
+  }
+
+  if (!request.order.razorpayPaymentId) return null;
+
+  const response = await razorpay.payments.fetchMultipleRefund(request.order.razorpayPaymentId);
+  const items = response?.items ?? [];
+  const match = items.find((r) => r?.notes?.orderId === request.orderId);
+  if (!match) return null;
+
+  return { id: match.id, amount: match.amount ?? 0, status: match.status };
+}
+
+/**
+ * Ask Razorpay how the refunds we are still waiting on actually ended.
+ *
+ * This is the pull side of the refund lifecycle, and the webhook is the push
+ * side — the same pairing `reconcilePayments` already provides for payments.
+ * It exists because the push side is configuration rather than code: the
+ * `refund.processed` and `refund.failed` events are ticked by hand in the
+ * Razorpay dashboard, live mode and test mode are separate objects with
+ * separate subscriptions, and `webhook_events` has never held a single row for
+ * either one.
+ *
+ * Without this, an unticked checkbox means every refund sits in
+ * PROCESSING_REFUND forever: the student is told their money is on its way and
+ * never told it arrived, the shop is never debited, `Order.refundStatus` stays
+ * `pending` on both dashboards, and the order's files are pinned by
+ * `UNSETTLED_REFUND_STATUSES` and never purged. Nothing errors, and the first
+ * report is a support ticket weeks later.
+ *
+ * Reconciling is also the only way a *failed* refund is ever noticed when the
+ * event is not configured. That one costs real money — the shop stays debited
+ * for a refund the student never received.
+ *
+ * `stuckMinutes` is the grace period. Razorpay settles most refunds in minutes
+ * but is entitled to take days, so this does not decide anything is wrong; it
+ * only decides when it is worth asking. Anything the gateway still calls
+ * `pending` is left exactly as it is.
+ */
+export async function reconcileStuckRefunds(options?: {
+  stuckMinutes?: number;
+  limit?: number;
+}): Promise<RefundReconcileResult> {
+  const stuckMinutes = options?.stuckMinutes ?? 30;
+  const limit = options?.limit ?? REFUND_RECONCILE_BATCH;
+  const cutoff = new Date(Date.now() - stuckMinutes * 60 * 1000);
+
+  // `adminResolvedAt` is stamped when the gateway leg starts, so it is the age
+  // of the refund attempt. It is null when the settle path died before
+  // committing — the case that most needs reconciling — so those fall back to
+  // when the student asked. RefundRequest has no `updatedAt` to lean on.
+  const stuck = await prisma.refundRequest.findMany({
+    where: {
+      status: 'PROCESSING_REFUND',
+      OR: [
+        { adminResolvedAt: { lt: cutoff } },
+        { adminResolvedAt: null, studentRequestedAt: { lt: cutoff } },
+      ],
+    },
+    select: {
+      id: true,
+      orderId: true,
+      shopId: true,
+      status: true,
+      razorpayRefundId: true,
+      order: { select: { razorpayPaymentId: true } },
+    },
+    orderBy: { studentRequestedAt: 'asc' },
+    take: limit,
+  });
+
+  const result: RefundReconcileResult = {
+    checked: stuck.length,
+    confirmed: 0,
+    failed: 0,
+    stillPending: 0,
+    stranded: [],
+    errors: 0,
+  };
+
+  for (const request of stuck) {
+    try {
+      const refund = await findGatewayRefund(request);
+
+      if (!refund) {
+        // No refund exists at the gateway for a request that says it is
+        // refunding. Waiting cannot fix that, and the money is still with us.
+        result.stranded.push(request.id);
+        continue;
+      }
+
+      if (refund.status === 'pending') {
+        result.stillPending++;
+        continue;
+      }
+
+      const outboxIds: string[] = [];
+
+      // Re-read inside the transaction rather than trusting the row from the
+      // scan: the gateway call above is a network round trip, and the webhook
+      // this poll exists to replace may have arrived during it. The status
+      // guards inside the apply functions are what make the loser silent.
+      const party = await prisma.$transaction(async (tx) => {
+        const current = await tx.refundRequest.findUnique({ where: { id: request.id } });
+        if (!current) return null;
+
+        return refund.status === 'processed'
+          ? applyRefundProcessed(tx, current, refund, outboxIds)
+          : applyRefundFailed(tx, current, outboxIds);
+      });
+
+      await realtimeService.publishQueued(outboxIds);
+
+      // Counted on what this pass actually moved, not on what the gateway
+      // said. A null party means the webhook landed during the round trip
+      // above and did the work — nothing happened here, and the remediation
+      // log should not claim otherwise.
+      if (!party) continue;
+
+      if (refund.status === 'processed') {
+        result.confirmed++;
+        notify.notifyRefundSettled({ ...party, amountPaise: refund.amount, throughGateway: true });
+      } else {
+        result.failed++;
+        notify.notifyRefundFailed({ ...party, amountPaise: refund.amount });
+      }
+    } catch (error) {
+      // One unreachable refund must not stop the rest of the batch. The next
+      // pass retries it, and the request stays PROCESSING_REFUND meanwhile,
+      // which is still the truth.
+      result.errors++;
+      console.error(`[refund-reconcile] ${request.id} failed:`, error);
+    }
+  }
+
+  return result;
 }

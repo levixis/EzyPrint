@@ -1,0 +1,133 @@
+name: CI
+
+# Runs on every push and pull request to main.
+#
+# Both test suites passed locally for months and nothing enforced it, which
+# means "the tests pass" was a claim about one laptop rather than about the
+# branch. The Android build is deliberately not here — it needs the signing
+# keystore, which is not in the repo and should not be.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A new push to the same branch makes the previous run irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  web:
+    name: Web — typecheck, lint, test, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+
+      # Lint covers both halves of the repo — the eslint config at the root
+      # includes server/src. It runs before the tests because a lint failure is
+      # a five-second answer and a test failure is a two-minute one.
+      #
+      # The warning ceiling is pinned to the current count of
+      # `no-explicit-any`, making it a ratchet: the number can fall and cannot
+      # rise. Lower the number in package.json as they get fixed.
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+  server:
+    name: Server — typecheck, test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: server/package-lock.json
+
+      - run: npm ci
+
+      # The Prisma client is generated code that nothing commits, so every step
+      # after this one fails without it.
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      # NODE_ENV=test makes config/env.ts use development fallbacks for the
+      # secrets rather than throwing, and turns the scheduler and the watchdog
+      # off — no CI run should ever start a background job or remediate
+      # anything. The suite is fully mocked and touches no database.
+      - name: Test
+        run: npm test
+        env:
+          NODE_ENV: test
+
+  migrations:
+    name: Migrations match the schema
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: server/package-lock.json
+
+      - run: npm ci
+
+      # `prisma migrate deploy` runs on every production boot (see the `start`
+      # script). A schema edited without a matching migration therefore fails at
+      # deploy time, on the live service, which is the worst place to find out.
+      #
+      # Diffing the migration history against the schema catches it here
+      # instead. A real Postgres is needed as the shadow database because the
+      # diff replays every migration into it.
+      - name: Check for drift between migrations and schema.prisma
+        run: |
+          npx prisma migrate diff \
+            --from-migrations ./prisma/migrations \
+            --to-schema-datamodel ./prisma/schema.prisma \
+            --shadow-database-url "$SHADOW_DATABASE_URL" \
+            --exit-code
+        env:
+          SHADOW_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/shadow
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: shadow
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5

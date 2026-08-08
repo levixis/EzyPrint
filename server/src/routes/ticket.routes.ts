@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { authenticate, authorize } from '../middleware/auth';
+import { authenticate } from '../middleware/auth';
 import { validate } from '../middleware/validate';
 import { createTicketSchema, ticketMessageSchema, ticketStatusSchema } from '../validators/schemas';
 import * as ticketController from '../controllers/ticket.controller';

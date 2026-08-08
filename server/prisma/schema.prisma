@@ -814,3 +814,121 @@ model AdminOtp {
   @@index([userId])
   @@map("admin_otps")
 }
+
+// ─────────────────────────────────────────────────────────────
+// OBSERVABILITY — what broke, what we did about it, and whether
+// the background jobs are actually running.
+//
+// These tables live in the same database as everything else, which
+// is a deliberate limitation to understand: when Postgres itself is
+// down, nothing here records anything. That is why the alert path
+// (alert.service) can deliver without touching the database, and why
+// an external uptime check outside this process is not optional.
+// What these tables are good for is the far more common case — the
+// database is fine and the application is not.
+// ─────────────────────────────────────────────────────────────
+
+enum SystemEventSeverity {
+  INFO
+  WARNING
+  ERROR
+  CRITICAL
+}
+
+/// A distinct thing that went wrong, aggregated by fingerprint.
+///
+/// One row per fingerprint rather than per occurrence: a broken endpoint hit
+/// 400 times is one defect, and storing it 400 times buys nothing but a table
+/// that has to be swept more often. `count` and `lastSeenAt` carry the volume.
+model SystemEvent {
+  id String @id @default(cuid())
+
+  /// Stable hash of (source + normalized message). Two occurrences of the same
+  /// defect must produce the same fingerprint even though their messages differ
+  /// in ids, amounts and timestamps — see fingerprint() in observability.service.
+  fingerprint String              @unique
+  severity    SystemEventSeverity
+  /// Subsystem that reported it: 'http', 'scheduler', 'payment', 'process', …
+  source      String
+  message     String
+  /// Truncated stack, request path, job name — whatever helps diagnose. Never
+  /// request bodies: they carry tokens, and this table is read by the frontend.
+  context     Json?
+
+  count      Int      @default(1)
+  firstSeenAt DateTime @default(now())
+  lastSeenAt  DateTime @default(now())
+
+  /// Set when an operator marks it handled. Resolved events stop alerting; a
+  /// new occurrence after resolution clears this and alerts again, because a
+  /// defect that comes back is news.
+  resolvedAt DateTime?
+  resolvedBy String?
+
+  /// Last time an alert went out for this fingerprint — enforces the cooldown
+  /// across restarts, which an in-memory timer cannot do on a host that sleeps.
+  lastAlertedAt DateTime?
+
+  @@index([resolvedAt, lastSeenAt])
+  @@index([severity, lastSeenAt])
+  @@map("system_events")
+}
+
+/// Last completed run of each background job.
+///
+/// The scheduler's own logs say a job started; only this says it finished. On a
+/// host that sleeps, "the settlement sweep has not completed in six hours" is
+/// the single most useful signal available, and it cannot be derived from
+/// anything else we store.
+model JobHeartbeat {
+  /// Job name, matching the string passed to schedule() in scheduler.service.
+  name String @id
+
+  lastStartedAt   DateTime?
+  lastSucceededAt DateTime?
+  lastFailedAt    DateTime?
+  lastError       String?
+  /// Milliseconds the last successful run took. A job that still completes but
+  /// takes 40x longer than usual is a warning ahead of an outage.
+  lastDurationMs  Int?
+  consecutiveFailures Int @default(0)
+
+  updatedAt DateTime @updatedAt
+
+  @@map("job_heartbeats")
+}
+
+enum RemediationOutcome {
+  /// Precondition no longer held when the action was about to run — the problem
+  /// resolved itself between detection and action. Not a failure.
+  SKIPPED
+  SUCCEEDED
+  FAILED
+  /// Circuit was open; no attempt was made.
+  BLOCKED
+}
+
+/// Every automatic action the watchdog took, successful or not.
+///
+/// An append-only audit log. The watchdog is allowed to act on production
+/// without a human, so the non-negotiable price is that every action it takes
+/// is reconstructable afterwards — what it saw, what it did, what happened.
+model RemediationLog {
+  id String @id @default(cuid())
+
+  /// Which remediation ran, e.g. 'redispatch-outbox', 'force-reconciliation'.
+  action String
+  /// Fingerprint of the condition that triggered it, for correlation with
+  /// system_events.
+  trigger String
+  outcome RemediationOutcome
+  /// What the check saw at decision time, and what the action changed.
+  detail  Json?
+  durationMs Int?
+
+  createdAt DateTime @default(now())
+
+  @@index([action, createdAt])
+  @@index([createdAt])
+  @@map("remediation_log")
+}

@@ -14,8 +14,13 @@ export interface JwtPayload {
 
 /**
  * Extend Express Request to carry authenticated user info.
+ *
+ * Declaration merging into `Express.Request` is the only way to add a property
+ * to a third-party interface, and the namespace form is the shape Express's own
+ * types are declared in — there is no ES module equivalent to merge into.
  */
 declare global {
+  // eslint-disable-next-line @typescript-eslint/no-namespace
   namespace Express {
     interface Request {
       user?: JwtPayload;

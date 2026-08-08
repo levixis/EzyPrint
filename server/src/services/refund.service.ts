@@ -16,6 +16,15 @@ import * as notifyService from './notify.service';
  */
 
 /**
+ * Razorpay's own view of a refund, narrowed to the distinction that matters.
+ *
+ * The gateway also reports `failed`, but never in the response to the refund
+ * call itself — a synchronous failure comes back as a non-2xx and throws below.
+ * `failed` only ever arrives later, on the `refund.failed` webhook.
+ */
+type RazorpayRefundStatus = 'pending' | 'processed';
+
+/**
  * Ask Razorpay to refund a payment.
  *
  * `idempotencyKey` is the RefundRequest id, so a retry after a timeout — where
@@ -28,7 +37,7 @@ async function callRazorpayRefund(
   amountPaise: number,
   idempotencyKey: string,
   orderId: string
-): Promise<string> {
+): Promise<{ id: string; status: RazorpayRefundStatus }> {
   const auth = Buffer.from(`${env.RAZORPAY_KEY_ID}:${env.RAZORPAY_KEY_SECRET}`).toString('base64');
 
   const response = await fetch(`https://api.razorpay.com/v1/payments/${paymentId}/refund`, {
@@ -51,7 +60,19 @@ async function callRazorpayRefund(
     throw ApiError.internal(`Razorpay Refund Failed: ${data.error?.description || 'Unknown error'}`);
   }
 
-  return data.id;
+  // `status` is the field that decides whether the student has their money or
+  // is merely owed it. It was previously discarded, and a 2xx alone was read as
+  // completion — which is what let a refund Razorpay had only *accepted* be
+  // announced as one it had settled.
+  //
+  // Anything other than an explicit `processed` is treated as pending. An
+  // unrecognised value must not be optimistically upgraded: the cost of waiting
+  // for a webhook that confirms is a delayed notification, and the cost of
+  // guessing wrong is telling someone their money arrived when it did not.
+  return {
+    id: data.id,
+    status: data.status === 'processed' ? 'processed' : 'pending',
+  };
 }
 
 export interface ResolveRefundOptions {
@@ -91,22 +112,57 @@ export async function settleClaimedRefund(
 
   const amount = request.refundAmount ?? request.order.totalPrice;
   let razorpayRefundId = request.razorpayRefundId;
-  let finalStatus: 'RESOLVED_REFUNDED' | 'REFUND_SETTLED_OFFLINE' = 'RESOLVED_REFUNDED';
+
+  /**
+   * Where this refund actually stands, which is not the same as whether the
+   * call succeeded.
+   *
+   *  - `RESOLVED_REFUNDED`      the money has moved and we know it
+   *  - `PROCESSING_REFUND`      accepted, in flight, awaiting `refund.processed`
+   *  - `REFUND_SETTLED_OFFLINE` no gateway leg existed to wait on
+   */
+  let finalStatus: 'RESOLVED_REFUNDED' | 'PROCESSING_REFUND' | 'REFUND_SETTLED_OFFLINE' =
+    'PROCESSING_REFUND';
+
+  /**
+   * Whether this call is the one that started the gateway leg.
+   *
+   * The admin claim deliberately re-admits `PROCESSING_REFUND` so a stuck
+   * refund can be retried, and a retry now finds the request in the same status
+   * it left it in — so the status guard alone no longer bounds the "in
+   * progress" notice to one. An admin pressing retry should not re-tell the
+   * student something they were told an hour ago.
+   */
+  let initiatedHere = false;
 
   if (request.order.razorpayPaymentId) {
     if (!razorpayRefundId) {
-      razorpayRefundId = await callRazorpayRefund(
+      const accepted = await callRazorpayRefund(
         request.order.razorpayPaymentId,
         amount,
         request.id,
         request.orderId
       );
+      razorpayRefundId = accepted.id;
+      initiatedHere = true;
+      // Instant refunds do exist, and when Razorpay itself reports `processed`
+      // in the response that is confirmation — waiting for a webhook to repeat
+      // what we have already been told would strand the student in limbo.
+      finalStatus = accepted.status === 'processed' ? 'RESOLVED_REFUNDED' : 'PROCESSING_REFUND';
     }
+    // A refund id already on the row means the gateway call happened on an
+    // earlier attempt whose local transaction did not commit. We have no
+    // response to read a status from, so this stays PROCESSING_REFUND and
+    // waits for the webhook — assuming completion here would be assuming it
+    // about a call we never saw the result of.
   } else {
-    // Nothing was ever charged through Razorpay — cash or a free order. The
-    // request still closes, just without a gateway refund.
+    // Nothing was ever charged through Razorpay — cash or a free order. There
+    // is no asynchronous leg to be honest about, so this settles immediately.
     finalStatus = 'REFUND_SETTLED_OFFLINE';
   }
+
+  /** True once the money is known to have moved, not merely to have been sent. */
+  const isConfirmed = finalStatus !== 'PROCESSING_REFUND';
 
   const outboxIds: string[] = [];
   // Only the delivery that actually moved the row may announce it — a repeat
@@ -149,16 +205,21 @@ export async function settleClaimedRefund(
     await tx.order.updateMany({
       where: { id: request.orderId },
       data: {
-        // `setOrderRefunded` stays the sole control over the *status*. A
-        // cancellation keeps CANCELLED, which is the more meaningful record of
-        // why the order ended, and VALID_TRANSITIONS has no CANCELLED ->
-        // REFUNDED edge anyway.
-        ...(options.setOrderRefunded ? { status: 'REFUNDED' as const } : {}),
+        // `setOrderRefunded` controls the *status*, but only once the refund is
+        // confirmed. A cancellation keeps CANCELLED regardless — it is the more
+        // meaningful record of why the order ended, and VALID_TRANSITIONS has
+        // no CANCELLED -> REFUNDED edge anyway.
+        ...(options.setOrderRefunded && isConfirmed ? { status: 'REFUNDED' as const } : {}),
         // Falls back to the request id when nothing went through the gateway,
         // so an offline settlement is still recorded as settled rather than
         // reading as unrefunded.
         refundId: razorpayRefundId ?? request.id,
-        refundStatus: 'processed',
+        // 'pending' until the gateway confirms. Both dashboards already read
+        // this field and already render all three values — the student card
+        // shows "Refund Initiated" and the admin badge "Refund Pending" — so
+        // the only thing that was ever missing was the server telling the
+        // truth about which one applied.
+        refundStatus: isConfirmed ? 'processed' : 'pending',
         refundAmount: amount,
       },
     });
@@ -193,14 +254,29 @@ export async function settleClaimedRefund(
   // route — admin resolution, shop self-refund, and the automatic refund behind
   // a cancellation — funnels through here, so this is the one place that covers
   // all three.
-  if (settledHere) {
+  if (!settledHere) return;
+
+  const recipient = {
+    studentUserId: request.order.userId,
+    orderId: request.orderId,
+    shopId: request.shopId,
+    amountPaise: amount,
+  };
+
+  if (isConfirmed) {
     notifyService.notifyRefundSettled({
-      studentUserId: request.order.userId,
-      orderId: request.orderId,
-      shopId: request.shopId,
-      amountPaise: amount,
+      ...recipient,
       throughGateway: finalStatus === 'RESOLVED_REFUNDED',
     });
+    return;
+  }
+
+  // Accepted, not landed. The student hears that it is on its way, and hears
+  // again from the `refund.processed` / `refund.failed` webhook when it is
+  // actually one or the other. Saying "refunded" here is the claim this whole
+  // split exists to stop making.
+  if (initiatedHere) {
+    notifyService.notifyRefundInitiated(recipient);
   }
 }
 

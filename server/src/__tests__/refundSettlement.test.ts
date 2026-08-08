@@ -44,15 +44,24 @@ jest.mock('../services/notify.service', () => ({
 
 import { settleClaimedRefund } from '../services/refund.service';
 
-/** A claim already carried to PROCESSING_REFUND and already refunded at the
- *  gateway, so the code under test makes no network call of its own. */
+/**
+ * A claim carried to PROCESSING_REFUND, whose gateway call comes back
+ * **confirmed** — Razorpay reporting `processed` in the refund response, which
+ * is what an instant refund looks like.
+ *
+ * This file is about who gets told once a refund has actually settled, so its
+ * fixture has to be a settled one. The unconfirmed case — Razorpay accepting a
+ * refund it has not yet moved, which is the common one — is a different
+ * sequence with a different message, and lives in `refundLifecycle.test.ts`
+ * along with the accept-then-fail path.
+ */
 const claimedRequest = (overrides: Record<string, unknown> = {}) => ({
   id: 'refund_1',
   orderId: 'order_1',
   shopId: 'shop_1',
   studentId: 'student_1',
   refundAmount: 12500,
-  razorpayRefundId: 'rfnd_existing',
+  razorpayRefundId: null,
   order: {
     id: 'order_1',
     userId: 'student_1',
@@ -73,6 +82,15 @@ const runTransaction = () =>
 
 beforeEach(() => {
   jest.clearAllMocks();
+
+  // Razorpay confirms the refund in the response itself. `status` is what
+  // separates a refund that has landed from one merely accepted, and reading
+  // it is the difference this fixture depends on.
+  global.fetch = jest.fn().mockResolvedValue({
+    ok: true,
+    json: async () => ({ id: 'rfnd_existing', status: 'processed', amount: 12500 }),
+  }) as unknown as typeof fetch;
+
   mockRefundFindUnique.mockResolvedValue(claimedRequest());
   mockRefundUpdateMany.mockResolvedValue({ count: 1 });
   mockOrderUpdateMany.mockResolvedValue({ count: 1 });

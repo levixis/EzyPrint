@@ -18,7 +18,8 @@ export async function uploadSingle(req: Request, res: Response, next: NextFuncti
     
     let metadata: any = {};
     if (req.body.metadata) {
-      try { metadata = typeof req.body.metadata === 'string' ? JSON.parse(req.body.metadata) : req.body.metadata; } catch (e) {}
+      try { metadata = typeof req.body.metadata === 'string' ? JSON.parse(req.body.metadata) : req.body.metadata; }
+      catch { /* malformed metadata falls back to {} — the upload itself is still valid */ }
     }
     
     const uploadId = req.body.uploadId;
@@ -111,12 +112,14 @@ export async function uploadMultiple(req: Request, res: Response, next: NextFunc
     
     let metadata: any = {};
     if (req.body.metadata) {
-      try { metadata = typeof req.body.metadata === 'string' ? JSON.parse(req.body.metadata) : req.body.metadata; } catch (e) {}
+      try { metadata = typeof req.body.metadata === 'string' ? JSON.parse(req.body.metadata) : req.body.metadata; }
+      catch { /* malformed metadata falls back to {} — the upload itself is still valid */ }
     }
     
     let uploadIds: string[] = [];
     if (req.body.uploadIds) {
-      try { uploadIds = typeof req.body.uploadIds === 'string' ? JSON.parse(req.body.uploadIds) : req.body.uploadIds; } catch (e) {}
+      try { uploadIds = typeof req.body.uploadIds === 'string' ? JSON.parse(req.body.uploadIds) : req.body.uploadIds; }
+      catch { /* left empty; the length check below rejects the request with a clear reason */ }
     }
     
     if (!Array.isArray(uploadIds) || uploadIds.length !== files.length) {

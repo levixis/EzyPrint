@@ -22,6 +22,9 @@ import {
   userSchema,
   referralCodeSchema,
   reactivationRequestSchema,
+  healthReportSchema,
+  systemEventSchema,
+  remediationLogSchema,
 } from './schemas';
 import type {
   User, ShopProfile, DocumentOrder, NotificationMessage,
@@ -565,4 +568,78 @@ export const referralApi = {
     .then(r => parseListResponse(referralCodeSchema, r.codes, 'referralApi.list') as unknown as ReferralCode[]),
   create: (daysValid: number = 7) => api.post<{ code: ReferralCode }>('/referrals', { daysValid }).then(r => r.code),
   delete: (codeId: string) => api.del<{ success: boolean; message: string }>(`/referrals/${codeId}`),
+};
+
+// ──────────────────────────────────────────────
+// SYSTEM HEALTH (ADMIN ONLY)
+// ──────────────────────────────────────────────
+
+export interface HealthCheck {
+  name: string;
+  status: 'ok' | 'warn' | 'fail' | 'skipped';
+  summary: string;
+  detail?: Record<string, unknown> | null;
+  latencyMs?: number | null;
+}
+
+export interface HealthReport {
+  status: 'ok' | 'degraded' | 'down';
+  checkedAt: string;
+  uptimeSeconds: number;
+  environment: string;
+  checks: HealthCheck[];
+}
+
+export interface SystemEvent {
+  id: string;
+  fingerprint: string;
+  severity: 'INFO' | 'WARNING' | 'ERROR' | 'CRITICAL';
+  source: string;
+  message: string;
+  count: number;
+  firstSeenAt?: string;
+  lastSeenAt?: string;
+  resolvedAt?: string | null;
+  context?: unknown;
+}
+
+export interface RemediationEntry {
+  id: string;
+  action: string;
+  trigger: string;
+  outcome: 'SKIPPED' | 'SUCCEEDED' | 'FAILED' | 'BLOCKED';
+  detail?: unknown;
+  durationMs?: number | null;
+  createdAt?: string;
+}
+
+export interface PermittedRemediation {
+  action: string;
+  triggeredBy: string;
+  description: string;
+  minIntervalMs: number;
+}
+
+export const systemApi = {
+  /**
+   * `deep` adds the R2 and Razorpay probes. Off by default because the panel
+   * polls, and a round trip to two external services on every poll is both slow
+   * and a needless load on them — the operator asks for it explicitly.
+   */
+  health: (deep = false) => api.get<unknown>(`/system/health${deep ? '?deep=1' : ''}`)
+    .then(r => parseResponse(healthReportSchema, r, 'systemApi.health') as HealthReport),
+
+  events: (includeResolved = false) => api.get<unknown>(`/system/events${includeResolved ? '?includeResolved=1' : ''}`)
+    .then(r => parseListResponse(systemEventSchema, r, 'systemApi.events') as unknown as SystemEvent[]),
+
+  resolveEvent: (id: string) => api.patch<{ success: boolean }>(`/system/events/${id}/resolve`),
+
+  remediations: () => api.get<{ history: unknown; permitted: unknown }>('/system/remediations')
+    .then(r => ({
+      history: parseListResponse(remediationLogSchema, r.history, 'systemApi.remediations') as unknown as RemediationEntry[],
+      permitted: (Array.isArray(r.permitted) ? r.permitted : []) as PermittedRemediation[],
+    })),
+
+  /** Run a watchdog cycle now instead of waiting for the interval. */
+  runCheck: () => api.post<{ report: HealthReport }>('/system/check'),
 };

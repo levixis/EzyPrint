@@ -216,6 +216,49 @@ export const notificationSchema = z.object({
 }));
 
 // ──────────────────────────────────────────────
+// SYSTEM HEALTH
+// ──────────────────────────────────────────────
+
+export const healthCheckSchema = z.object({
+  name: z.string(),
+  status: z.enum(['ok', 'warn', 'fail', 'skipped']).catch('warn'),
+  summary: z.string().catch(''),
+  detail: z.record(z.string(), z.unknown()).nullable().optional(),
+  latencyMs: z.number().nullable().optional(),
+}).loose();
+
+export const healthReportSchema = z.object({
+  status: z.enum(['ok', 'degraded', 'down']).catch('degraded'),
+  checkedAt: isoDate,
+  uptimeSeconds: z.number().catch(0),
+  environment: z.string().catch('unknown'),
+  checks: list(healthCheckSchema),
+}).loose();
+
+export const systemEventSchema = z.object({
+  id: z.string(),
+  fingerprint: z.string().catch(''),
+  severity: z.enum(['INFO', 'WARNING', 'ERROR', 'CRITICAL']).catch('ERROR'),
+  source: z.string().catch('unknown'),
+  message: z.string().catch(''),
+  count: z.number().catch(1),
+  firstSeenAt: isoDate.optional(),
+  lastSeenAt: isoDate.optional(),
+  resolvedAt: isoDate.nullable().optional(),
+  context: z.unknown().optional(),
+}).loose();
+
+export const remediationLogSchema = z.object({
+  id: z.string(),
+  action: z.string().catch('unknown'),
+  trigger: z.string().catch(''),
+  outcome: z.enum(['SKIPPED', 'SUCCEEDED', 'FAILED', 'BLOCKED']).catch('SKIPPED'),
+  detail: z.unknown().optional(),
+  durationMs: z.number().nullable().optional(),
+  createdAt: isoDate.optional(),
+}).loose();
+
+// ──────────────────────────────────────────────
 // PARSING
 // ──────────────────────────────────────────────
 

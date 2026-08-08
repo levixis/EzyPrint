@@ -4,6 +4,7 @@ import { ShopAggregate, ShopProfile, OrderStatus, PayoutStatus, DocumentOrder, R
 import AdminShopCard from './AdminShopCard';
 import AdminPayoutModal from './AdminPayoutModal';
 import AdminReferrals from './AdminReferrals';
+import SystemHealth from './SystemHealth';
 import { Card } from '../common/Card';
 import { RefundOtpModal } from '../common/RefundOtpModal';
 import { AccountOtpModal } from '../common/AccountOtpModal';
@@ -15,7 +16,7 @@ import * as api from '../../lib/api';
 import { Button } from '../common/Button';
 import { formatMoney } from '../../utils/money';
 
-type AdminTab = 'overview' | 'shops' | 'reactivations' | 'payouts' | 'orders' | 'tickets' | 'refunds' | 'referrals';
+type AdminTab = 'overview' | 'shops' | 'reactivations' | 'payouts' | 'orders' | 'tickets' | 'refunds' | 'referrals' | 'system';
 
 type PayoutAction = 'APPROVE_PAYOUT' | 'MARK_PAID' | 'REJECT_PAYOUT' | 'CANCEL_PAYOUT';
 
@@ -400,6 +401,7 @@ const AdminDashboard: React.FC = () => {
     { key: 'reactivations', label: 'Reactivations', icon: <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4"><path fillRule="evenodd" d="M4.755 10.059a7.5 7.5 0 0 1 12.548-3.364l1.903 1.903h-3.183a.75.75 0 1 0 0 1.5h4.992a.75.75 0 0 0 .75-.75V4.356a.75.75 0 0 0-1.5 0v3.18l-1.9-1.9A9 9 0 0 0 3.306 9.67a.75.75 0 1 0 1.45.388Zm14.49 3.882a7.5 7.5 0 0 1-12.548 3.364l-1.902-1.903h3.183a.75.75 0 0 0 0-1.5H2.984a.75.75 0 0 0-.75.75v4.992a.75.75 0 0 0 1.5 0v-3.18l1.9 1.9a9 9 0 0 0 15.059-4.035.75.75 0 0 0-1.45-.388Z" clipRule="evenodd" /></svg> },
     { key: 'refunds', label: 'Refunds', icon: <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4"><path fillRule="evenodd" d="M12 2.25c-5.385 0-9.75 4.365-9.75 9.75s4.365 9.75 9.75 9.75 9.75-4.365 9.75-9.75S17.385 2.25 12 2.25ZM9.204 10.97a.75.75 0 0 1 .157-1.049 4.496 4.496 0 0 1 5.278 0 .75.75 0 0 1-.92 1.157 2.997 2.997 0 0 0-3.518 0 .75.75 0 0 1-1.049-.158H9.204ZM12 7.125a1.125 1.125 0 1 0 0 2.25 1.125 1.125 0 0 0 0-2.25Z" clipRule="evenodd" /></svg> },
     { key: 'referrals', label: 'Referrals', icon: <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4"><path fillRule="evenodd" d="M15.75 4.5a3 3 0 1 1 .825 2.066l-8.421 4.679a3.002 3.002 0 0 1 0 1.51l8.421 4.679a3 3 0 1 1-.729 1.31l-8.421-4.678a3 3 0 1 1 0-4.132l8.421-4.679a3 3 0 0 1-.096-.755Z" clipRule="evenodd" /></svg> },
+    { key: 'system', label: 'System', icon: <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-4 h-4"><path fillRule="evenodd" d="M11.078 2.25c-.917 0-1.699.663-1.85 1.567L9.05 4.889c-.02.12-.115.26-.297.348a7.493 7.493 0 0 0-.986.57c-.166.115-.334.126-.45.083L6.3 5.508a1.875 1.875 0 0 0-2.282.819l-.922 1.597a1.875 1.875 0 0 0 .432 2.385l.84.692c.095.078.17.229.154.43a7.598 7.598 0 0 0 0 1.139c.015.2-.059.352-.153.43l-.841.692a1.875 1.875 0 0 0-.432 2.385l.922 1.597a1.875 1.875 0 0 0 2.282.818l1.019-.382c.115-.043.283-.031.45.082.312.214.641.405.985.57.182.088.277.228.297.35l.178 1.071c.151.904.933 1.567 1.85 1.567h1.844c.916 0 1.699-.663 1.85-1.567l.178-1.072c.02-.12.114-.26.297-.349.344-.165.673-.356.985-.57.167-.114.335-.125.45-.082l1.02.382a1.875 1.875 0 0 0 2.28-.819l.923-1.597a1.875 1.875 0 0 0-.432-2.385l-.84-.692c-.095-.078-.17-.229-.154-.43a7.614 7.614 0 0 0 0-1.139c-.016-.2.059-.352.153-.43l.84-.692c.708-.582.891-1.59.433-2.385l-.922-1.597a1.875 1.875 0 0 0-2.282-.818l-1.02.382c-.114.043-.282.031-.449-.083a7.49 7.49 0 0 0-.985-.57c-.183-.087-.277-.227-.297-.348l-.179-1.072a1.875 1.875 0 0 0-1.85-1.567h-1.843ZM12 15.75a3.75 3.75 0 1 0 0-7.5 3.75 3.75 0 0 0 0 7.5Z" clipRule="evenodd" /></svg> },
   ];
 
   return (
@@ -1354,6 +1356,8 @@ const AdminDashboard: React.FC = () => {
 
       {/* ===== REFERRALS TAB ===== */}
       {activeTab === 'referrals' && <AdminReferrals />}
+
+      {activeTab === 'system' && <SystemHealth />}
 
       {/* Payout Modal */}
       {selectedShopForPayout && (

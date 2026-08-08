@@ -15,6 +15,7 @@ import referralRoutes from './referral.routes';
 import reactivationRoutes from './reactivation.routes';
 import refundRoutes from './refund.routes';
 import realtimeRoutes from './realtime.routes';
+import systemRoutes from './system.routes';
 
 const router = Router();
 
@@ -35,6 +36,7 @@ const router = Router();
  *   /api/v1/notifications/* → In-app notifications
  *   /api/v1/referrals/*     → Referral system
  *   /api/v1/realtime/*      → Pusher channel auth + balance snapshot
+ *   /api/v1/system/*        → Health report, error log, watchdog audit (admin)
  */
 router.use('/health', healthRoutes);
 router.use('/auth', authRoutes);
@@ -51,5 +53,6 @@ router.use('/referrals', referralRoutes);
 router.use('/reactivation', reactivationRoutes);
 router.use('/refunds', refundRoutes);
 router.use('/realtime', realtimeRoutes);
+router.use('/system', systemRoutes);
 
 export default router;

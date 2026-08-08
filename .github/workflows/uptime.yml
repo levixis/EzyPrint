@@ -1,0 +1,145 @@
+name: Uptime watchdog
+
+# The monitor that lives outside the thing it monitors.
+#
+# Everything in server/src — the health checks, the watchdog, the alert
+# service — runs inside the API process. All of it goes quiet at exactly the
+# moment it is most needed: when the process is dead, the container is asleep,
+# or Render is having an outage. A monitor cannot report its own death.
+#
+# So this runs on GitHub's infrastructure, depends on nothing of ours, and
+# opens an issue when the API stops answering. It is the only part of the
+# monitoring system that survives a total outage.
+#
+# Setup: set the repository variable API_URL to the deployed API's base URL
+# (Settings → Secrets and variables → Actions → Variables). Falls back to the
+# current Render URL if unset.
+
+on:
+  schedule:
+    # Every 10 minutes. GitHub's scheduler is best-effort and routinely runs
+    # late under load, which is fine for "is it down" and is why this is a
+    # watchdog rather than a keep-alive. Keeping a free Render instance awake
+    # by pinging it is not something to rely on — the Starter plan is the fix
+    # for sleeping, not this file.
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+# Needed to open and comment on the issue below.
+permissions:
+  issues: write
+
+jobs:
+  ping:
+    name: Ping /health
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the API answers
+        id: check
+        run: |
+          API_URL="${{ vars.API_URL || 'https://ezyprint-backend.onrender.com' }}"
+          echo "Pinging $API_URL/api/v1/health"
+
+          # Three attempts with backoff before declaring an outage. A single
+          # failed request is not an outage: Render drops the first request
+          # after idle, and a cold Neon start can exceed a short timeout. Most
+          # false alarms are one retry away from resolving, and an alert channel
+          # that cries wolf gets muted.
+          for attempt in 1 2 3; do
+            code=$(curl --silent --show-error --max-time 45 \
+                        --output /tmp/health.json --write-out '%{http_code}' \
+                        "$API_URL/api/v1/health" || echo "000")
+
+            echo "attempt $attempt → HTTP $code"
+            if [ "$code" = "200" ]; then
+              echo "status=up" >> "$GITHUB_OUTPUT"
+              cat /tmp/health.json
+              exit 0
+            fi
+            sleep $((attempt * 15))
+          done
+
+          echo "status=down" >> "$GITHUB_OUTPUT"
+          echo "last_code=$code" >> "$GITHUB_OUTPUT"
+          {
+            echo "body<<EOF"
+            echo "The API did not return 200 after three attempts."
+            echo ""
+            echo "- URL: \`$API_URL/api/v1/health\`"
+            echo "- Last HTTP status: \`$code\` (\`000\` means the connection never completed)"
+            echo "- Checked at: $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo ""
+            echo "Response body, if any:"
+            echo '```'
+            head -c 2000 /tmp/health.json 2>/dev/null || echo "(empty)"
+            echo '```'
+            echo ""
+            echo "Worth knowing: a 'CORS error' in the browser console is usually this —"
+            echo "Render's own error page carries no Access-Control-Allow-Origin header."
+            echo "Curl the endpoint before believing a CORS message."
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          exit 1
+
+      - name: Open or update the outage issue
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = '🔴 API is down';
+            const body = `${{ steps.check.outputs.body }}`;
+
+            // One issue per outage, not one per check. At six checks an hour a
+            // new issue each time would bury the original report — and the
+            // first one is the one with the timestamp that matters.
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'outage',
+            });
+
+            if (existing.data.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.data[0].number,
+                body: `Still down as of ${new Date().toISOString()}.`,
+              });
+              return;
+            }
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: ['outage'],
+            });
+
+      - name: Close the outage issue on recovery
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'outage',
+            });
+
+            for (const issue of existing.data) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `Recovered — /health returned 200 at ${new Date().toISOString()}.`,
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed',
+              });
+            }

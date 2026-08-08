@@ -222,7 +222,6 @@ const LoginPage: React.FC = () => {
     step, authMode
   ]);
 
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const handleAuthError = (error: unknown, _context: string): string => {
     const message = error instanceof Error ? error.message : "An unexpected error occurred.";
     setError(message);
