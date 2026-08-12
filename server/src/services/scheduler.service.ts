@@ -97,6 +97,87 @@ function schedule(name: string, intervalMs: number, job: () => Promise<void>): v
   // Do not keep the event loop alive purely for a background job.
   timer.unref();
   timers.push(timer);
+
+  scheduleCatchUp(name, intervalMs, tick);
+}
+
+/**
+ * Delay before the first catch-up run, and the gap between successive jobs.
+ *
+ * Staggered rather than simultaneous: a cold start is exactly when the Neon
+ * connection is being established and the first requests are queuing, and
+ * firing eight sweeps into that at once turns a slow wake into a failed one.
+ */
+const CATCH_UP_DELAY_MS = 5_000;
+const CATCH_UP_STAGGER_MS = 3_000;
+
+/** Consecutive failures after which a job forfeits its catch-up run. */
+const CATCH_UP_FAILURE_LIMIT = 3;
+
+/** Position in the stagger, reset each time the scheduler starts. */
+let catchUpSlot = 0;
+
+/**
+ * Run a job once shortly after boot if it is overdue.
+ *
+ * `setInterval` alone means every job waits a full interval after start before
+ * its first run. On an always-on host that is invisible. On one that sleeps —
+ * Render's free tier stops the instance after about fifteen minutes idle — it
+ * means any job whose interval is longer than the awake window never runs at
+ * all. payment-audit and file-retention are hourly, so on a sleeping instance
+ * they were dead code: the safety net that catches a captured payment with no
+ * order would never once have executed.
+ *
+ * With this, any request that wakes the instance also settles whatever is
+ * overdue. Every job here is a catch-up sweep rather than a fire-at-a-moment
+ * cron — they select outstanding work by predicate — so running late costs
+ * delay, not correctness, and running on wake is enough.
+ *
+ * Two guards keep this from becoming a stampede of its own:
+ *
+ *  - Overdue is read from the heartbeat, so a container that restarts twice in
+ *    a minute does not re-run an hourly audit twice. Nothing is owed if the
+ *    last success is inside the interval.
+ *  - A job with a failure streak is left to the normal interval. Gating on
+ *    *success* is deliberate — a job killed mid-run by the host suspending is
+ *    the case this exists to fix, and it never records one — but that same
+ *    property would let a persistently failing job retry on every boot of a
+ *    crash loop, hammering whatever external service it failed against.
+ */
+function scheduleCatchUp(name: string, intervalMs: number, tick: () => Promise<void>): void {
+  const delay = CATCH_UP_DELAY_MS + catchUpSlot * CATCH_UP_STAGGER_MS;
+  catchUpSlot += 1;
+
+  const timer = setTimeout(async () => {
+    try {
+      const beat = await prisma.jobHeartbeat.findUnique({
+        where: { name },
+        select: { lastSucceededAt: true, consecutiveFailures: true },
+      });
+
+      if (beat && beat.consecutiveFailures >= CATCH_UP_FAILURE_LIMIT) {
+        console.warn(
+          `[scheduler] ${name} skipped its catch-up run — ` +
+          `${beat.consecutiveFailures} consecutive failures, leaving it to the interval`
+        );
+        return;
+      }
+
+      // Never succeeded, or not since one whole interval ago: work is owed.
+      const lastSuccess = beat?.lastSucceededAt?.getTime() ?? 0;
+      if (Date.now() - lastSuccess < intervalMs) return;
+
+      console.log(`[scheduler] ${name} running a catch-up sweep (overdue since boot)`);
+      await tick();
+    } catch (error) {
+      // The heartbeat read failing must not take the boot down with it. The
+      // normal interval still applies; only the catch-up is lost.
+      console.error(`[scheduler] ${name} catch-up failed:`, error);
+    }
+  }, delay);
+
+  timer.unref();
+  timers.push(timer);
 }
 
 export function startScheduler(): void {
@@ -104,6 +185,10 @@ export function startScheduler(): void {
     console.log('[scheduler] disabled (ENABLE_SCHEDULER=false)');
     return;
   }
+
+  // Each start lays out its own stagger, so a stop/start inside one process
+  // does not push the first catch-up further and further out.
+  catchUpSlot = 0;
 
   schedule('settlement', env.SETTLEMENT_SWEEP_INTERVAL_MS, async () => {
     const result = await withAdvisoryLock(LOCK_KEYS.settlement, () => runSettlementSweep());
