@@ -62,3 +62,17 @@ functions/lib/
 check-console.cjs
 update_ticket_detail.cjs
 test-render.tsx
+
+# Internal operational docs — deliberately not published.
+#
+# This repository is public. Both files are candid in the way a handover
+# between maintainers should be and a shop window should not: the known-gaps
+# list, which areas have no test coverage, where the blank-page crashes came
+# from, and why `check-returning-shop` is deliberately inert. That is a map of
+# the soft spots in an app that takes student payments.
+#
+# AI_STATE_HANDOFF.md was tracked until now, so older revisions remain readable
+# in the git history on GitHub. Untracking it stops further updates being
+# published; it does not retract what is already there.
+AI_STATE_HANDOFF.md
+LAUNCH_RUNBOOK.md
