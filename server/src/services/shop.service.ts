@@ -1,5 +1,6 @@
 import { prisma } from '../utils/prisma';
 import { ApiError } from '../utils/ApiError';
+import { isUsablePageRate, pageRateFloorMessage } from './pricing.service';
 
 /**
  * Shop Service — CRUD, admin actions, settings, and aggregate stats.
@@ -231,15 +232,63 @@ export async function updateShopSettings(
     throw ApiError.forbidden('You do not own this shop');
   }
 
-  // Validate pricing
-  if (data.bwPerPage !== undefined && data.bwPerPage < 0) {
-    throw ApiError.badRequest('B/W price per page cannot be negative');
+  // Validate pricing.
+  //
+  // The floor is the half that matters. `updateShopSchema` rejects a sub-50p
+  // rate too, but the rupees-as-paise bug is a *unit* error and its entry path
+  // is that the browser does the rupee→paise conversion — so the defence has to
+  // hold for a caller that never went through the form. Below 50 paise a page
+  // is a hundredth of a rupee, which no shop means; zero stays legal because a
+  // free black-and-white tier is a real offer.
+  if (data.bwPerPage !== undefined && !isUsablePageRate(data.bwPerPage)) {
+    throw ApiError.badRequest(
+      data.bwPerPage < 0
+        ? 'B/W price per page cannot be negative'
+        : pageRateFloorMessage('B/W')
+    );
   }
-  if (data.colorPerPage !== undefined && data.colorPerPage < 0) {
-    throw ApiError.badRequest('Color price per page cannot be negative');
+  if (data.colorPerPage !== undefined && !isUsablePageRate(data.colorPerPage)) {
+    throw ApiError.badRequest(
+      data.colorPerPage < 0
+        ? 'Color price per page cannot be negative'
+        : pageRateFloorMessage('Colour')
+    );
   }
 
-  const { payoutMethods, ...shopData } = data;
+  const { payoutMethods } = data;
+
+  /**
+   * The columns a settings update may write, named one by one.
+   *
+   * Deliberately not `...rest`. The controller builds its payload as
+   * `{ ...req.body }`, and `validate` parses a request to reject bad input
+   * without ever writing the parsed body back — so Zod's stripping of unknown
+   * keys never reaches here and anything the caller sends is in scope. Every
+   * field below is a real Shop column, which meant a shop owner could PATCH
+   * their own shop with
+   *
+   *     { "isOpen": true, "ledgerBalance": 999999, "debtAmount": 0, "isApproved": true }
+   *
+   * and Prisma would write all four: credit themselves an arbitrary balance,
+   * clear money they owed the platform, and approve their own shop past the
+   * admin review that is supposed to gate it. The balance is withdrawable, so
+   * that is a direct route from a settings form to a payout.
+   *
+   * An allowlist is the control rather than the schema, because it holds
+   * wherever the call comes from and does not depend on middleware behaviour.
+   * Balances move only through `ledger.service`, which is the single place that
+   * takes the compare-and-swap on `financialVersion`; approval moves only
+   * through `approveShop`.
+   */
+  const shopData = {
+    ...(data.bwPerPage !== undefined ? { bwPerPage: data.bwPerPage } : {}),
+    ...(data.colorPerPage !== undefined ? { colorPerPage: data.colorPerPage } : {}),
+    ...(data.isOpen !== undefined ? { isOpen: data.isOpen } : {}),
+    ...(data.contactPhone !== undefined ? { contactPhone: data.contactPhone } : {}),
+    ...(data.contactPhoneAlt !== undefined ? { contactPhoneAlt: data.contactPhoneAlt } : {}),
+    ...(data.contactEmail !== undefined ? { contactEmail: data.contactEmail } : {}),
+    ...(data.whatsappNumber !== undefined ? { whatsappNumber: data.whatsappNumber } : {}),
+  };
 
   if (payoutMethods !== undefined) {
     return prisma.$transaction(async (tx) => {

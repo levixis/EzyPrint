@@ -149,7 +149,7 @@ export interface DocumentOrder {
   specialInstructions?: string; // Optional free-text note from student to shop
   // Refund tracking (written by onOrderStatusChange auto-refund or requestRefund function)
   refundId?: string;
-  refundStatus?: string; // "processed", "pending", "FAILED"
+  refundStatus?: string; // "processed", "pending", "failed"
   refundAmount?: number;
   refundedAt?: string;
   cancelledAt?: string;

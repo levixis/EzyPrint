@@ -19,6 +19,7 @@ const mockOrderUpdateMany = jest.fn();
 const mockTransaction = jest.fn();
 const mockNotifyRefundSettled = jest.fn();
 const mockShopShareOfRefund = jest.fn();
+const mockCreateLedgerEntry = jest.fn();
 const mockPublishQueued = jest.fn();
 
 jest.mock('../utils/prisma', () => ({
@@ -28,9 +29,13 @@ jest.mock('../utils/prisma', () => ({
   },
 }));
 
+// The real `refundAttemptNumber` / `refundLedgerEventId` are kept: which key an
+// attempt writes under is what separates a retry from a replay, so stubbing
+// them would let the production keys drift without failing anything here.
 jest.mock('../services/ledger.service', () => ({
+  ...jest.requireActual('../services/ledger.service'),
   shopShareOfRefund: mockShopShareOfRefund,
-  createLedgerEntry: jest.fn().mockResolvedValue(undefined),
+  createLedgerEntry: mockCreateLedgerEntry,
 }));
 
 jest.mock('../services/realtime.service', () => ({
@@ -62,6 +67,9 @@ const claimedRequest = (overrides: Record<string, unknown> = {}) => ({
   studentId: 'student_1',
   refundAmount: 12500,
   razorpayRefundId: null,
+  // No failed attempts yet, so this is attempt 1 — the one that keeps the bare
+  // request id as its gateway key and `refund:<id>` as its ledger key.
+  attempts: 0,
   order: {
     id: 'order_1',
     userId: 'student_1',
@@ -95,6 +103,7 @@ beforeEach(() => {
   mockRefundUpdateMany.mockResolvedValue({ count: 1 });
   mockOrderUpdateMany.mockResolvedValue({ count: 1 });
   mockShopShareOfRefund.mockResolvedValue(0);
+  mockCreateLedgerEntry.mockResolvedValue(undefined);
   mockPublishQueued.mockResolvedValue(undefined);
   runTransaction();
 });
@@ -213,5 +222,115 @@ describe('The order records the refund', () => {
     expect(data.status).toBe('REFUNDED');
     expect(data.refundId).toBe('rfnd_existing');
     expect(data.refundStatus).toBe('processed');
+  });
+});
+
+
+/**
+ * Retrying a refund, without either paying twice or charging nobody.
+ *
+ * Two opposite failures meet on this path, and a fix for one is the other bug
+ * if the attempt number is derived from the wrong thing:
+ *
+ *   - Razorpay FAILED the refund. The money never moved, the shop's deduction
+ *     has been reversed, and the retry must look new to both the gateway and
+ *     the ledger — otherwise the gateway hands back the dead refund and the
+ *     ledger dedupes the deduction away, so the student is never paid and the
+ *     shop is never charged.
+ *   - The gateway ACCEPTED the refund and the local transaction then failed to
+ *     commit. The refund is real and in flight. The retry must look identical,
+ *     or Razorpay issues a second one and the student is refunded twice.
+ *
+ * `attempts` counts failures rather than starts, which is what tells the two
+ * apart: only the first advances it.
+ */
+describe('Retrying a refund', () => {
+  /** The idempotency key presented to Razorpay on the nth call. */
+  const gatewayKey = (call = 0) =>
+    ((global.fetch as jest.Mock).mock.calls[call][1].headers as Record<string, string>)[
+      'X-Refund-Idempotency'
+    ];
+
+  /** The eventId of the shop's REFUND_DEDUCTION, if one was written. */
+  const deductionEventId = () =>
+    mockCreateLedgerEntry.mock.calls.find((c) => c[0]?.type === 'REFUND_DEDUCTION')?.[0]?.eventId;
+
+  beforeEach(() => {
+    // A share worth deducting, so the ledger write actually happens.
+    mockShopShareOfRefund.mockResolvedValue(12500);
+  });
+
+  test('a first attempt presents the bare request id', async () => {
+    // Unchanged from before retries existed, so a refund already in flight at
+    // the gateway keeps answering to the key it was created with.
+    await settle();
+
+    expect(gatewayKey()).toBe('refund_1');
+    expect(deductionEventId()).toBe('refund:refund_1');
+  });
+
+  test('an attempt that lost its transaction retries under the same key', async () => {
+    // The gateway call succeeded and the commit did not, so `attempts` never
+    // advanced and no refund id was stored. Presenting the same key is what
+    // makes Razorpay return the refund it already made instead of a second one.
+    mockRefundFindUnique.mockResolvedValue(claimedRequest({ attempts: 0, razorpayRefundId: null }));
+
+    await settle();
+
+    expect(gatewayKey()).toBe('refund_1');
+  });
+
+  test('a retry after a failed attempt presents a new key', async () => {
+    // One failure recorded, so this is attempt 2 and must look new — the same
+    // key would return the refund Razorpay has already failed.
+    mockRefundFindUnique.mockResolvedValue(claimedRequest({ attempts: 1 }));
+
+    await settle();
+
+    expect(gatewayKey()).toBe('refund_1-retry-2');
+  });
+
+  test('every key Razorpay is sent is one Razorpay will accept', async () => {
+    // Razorpay constrains X-Refund-Idempotency to at least 10 characters of
+    // letters, digits, hyphens and underscores. A colon separator reads better
+    // and is what the ledger's own event ids use — and it would have been
+    // rejected on every retry, so the retry would fail at the gateway instead
+    // of issuing the refund. Real request ids are 25-character cuids, so only
+    // the separator is at risk here; this asserts the shape rather than
+    // trusting it.
+    const razorpayAccepts = /^[A-Za-z0-9_-]{10,}$/;
+
+    for (const attempts of [0, 1, 2, 9]) {
+      (global.fetch as jest.Mock).mockClear();
+      mockRefundFindUnique.mockResolvedValue(
+        // Padded to a realistic cuid length; the id itself clears the floor.
+        claimedRequest({ attempts, id: 'clx1a2b3c4d5e6f7g8h9i0j1k' })
+      );
+
+      await settleClaimedRefund('refund_1', { setOrderRefunded: true, createdBy: 'ADMIN' });
+
+      expect(gatewayKey()).toMatch(razorpayAccepts);
+    }
+  });
+
+  test("a retry after a failed attempt writes its own ledger entry", async () => {
+    // The first attempt's deduction was reversed when it failed. Reusing its
+    // eventId here would be deduped by `createLedgerEntry` and the shop would
+    // keep money it has given back — the platform absorbing the whole refund.
+    mockRefundFindUnique.mockResolvedValue(claimedRequest({ attempts: 1 }));
+
+    await settle();
+
+    expect(deductionEventId()).toBe('refund:refund_1:2');
+  });
+
+  test('the gateway is not called again for a refund already in flight', async () => {
+    // A stored refund id means an earlier attempt reached Razorpay and is
+    // waiting on a webhook. Calling again would be a second refund.
+    mockRefundFindUnique.mockResolvedValue(claimedRequest({ razorpayRefundId: 'rfnd_inflight' }));
+
+    await settle();
+
+    expect(global.fetch).not.toHaveBeenCalled();
   });
 });

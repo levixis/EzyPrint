@@ -20,12 +20,21 @@
 
 const mockHeartbeatFindUnique = jest.fn();
 const mockHeartbeatUpsert = jest.fn();
-const mockQueryRaw = jest.fn();
+const mockHeartbeatUpdateMany = jest.fn();
+const mockHeartbeatCreate = jest.fn();
 
+// Jobs guard themselves with a lease on their `job_heartbeats` row rather than
+// a Postgres advisory lock: an advisory lock is session-scoped and leaks
+// through a transaction-mode connection pooler, silently wedging every job
+// forever. `updateMany` is the compare-and-swap that takes and releases it.
 jest.mock('../utils/prisma', () => ({
   prisma: {
-    jobHeartbeat: { findUnique: mockHeartbeatFindUnique, upsert: mockHeartbeatUpsert },
-    $queryRaw: mockQueryRaw,
+    jobHeartbeat: {
+      findUnique: mockHeartbeatFindUnique,
+      upsert: mockHeartbeatUpsert,
+      updateMany: mockHeartbeatUpdateMany,
+      create: mockHeartbeatCreate,
+    },
   },
 }));
 
@@ -78,9 +87,10 @@ const runCatchUps = async () => {
 beforeEach(() => {
   jest.clearAllMocks();
   jest.useFakeTimers();
-  // The advisory lock every job takes before doing work. `withAdvisoryLock`
-  // destructures `{ locked }` — the SQL alias, not the function name.
-  mockQueryRaw.mockResolvedValue([{ locked: true }]);
+  // The lease every job takes before doing work: count 1 means this instance
+  // won it, which is the ordinary single-instance case.
+  mockHeartbeatUpdateMany.mockResolvedValue({ count: 1 });
+  mockHeartbeatCreate.mockResolvedValue({});
   mockHeartbeatUpsert.mockResolvedValue({});
 });
 
@@ -185,7 +195,8 @@ describe('catch-up on boot', () => {
     stopScheduler();
     jest.clearAllMocks();
     mockHeartbeatFindUnique.mockResolvedValue({ lastSucceededAt: null, consecutiveFailures: 0 });
-    mockQueryRaw.mockResolvedValue([{ locked: true }]);
+    mockHeartbeatUpdateMany.mockResolvedValue({ count: 1 });
+  mockHeartbeatCreate.mockResolvedValue({});
 
     startScheduler();
     await runCatchUps();

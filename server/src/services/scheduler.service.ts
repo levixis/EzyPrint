@@ -21,42 +21,107 @@ import {
  * Nothing did, so a dropped webhook stranded a paid order in PENDING_PAYMENT
  * permanently. These intervals are what actually make it run.
  *
- * Every job holds a Postgres advisory lock for its duration. Advisory locks are
- * held on a session and released automatically if the connection dies, so a
- * crashed instance cannot leave a job permanently blocked — unlike a lock row
- * in a table, which would need its own expiry handling. If a second Railway
- * replica is ever started, only one instance runs each job.
+ * Every job takes a lease on its `job_heartbeats` row for its duration, so if a
+ * second replica is ever started only one instance runs each job. The lease
+ * carries its own expiry, so a crashed instance delays a job by at most
+ * `JOB_LEASE_MS` rather than blocking it forever — see `withJobLease` for why
+ * this is a lease rather than the Postgres advisory lock it used to be.
  */
 
-/** Distinct lock keys. Arbitrary but must stay stable across deploys. */
-const LOCK_KEYS = {
-  settlement: 4820_001,
-  reconciliation: 4820_002,
-  outboxPrune: 4820_003,
-  fileRetention: 4820_004,
-  referralSweep: 4820_005,
-  paymentAudit: 4820_006,
-  eventSweep: 4820_007,
-  refundReconcile: 4820_008,
-} as const;
+/**
+ * How long a lease is held before another instance may take it over.
+ *
+ * Generous relative to any job here — the longest is the refund reconcile,
+ * which makes up to 50 sequential gateway calls. A lease that expires while its
+ * job is still running does not corrupt anything (every job is a guarded,
+ * idempotent sweep), it just allows a second instance to start the same work,
+ * so the cost of being generous is only latency after a crash.
+ */
+const JOB_LEASE_MS = 15 * 60 * 1000;
+
+/** Identifies this process in a lease, so it only ever releases its own. */
+const INSTANCE_ID = `${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
 
 /**
- * Run `work` only if this instance can take the advisory lock.
+ * Run `work` only if this instance can take the job's lease.
  *
  * Returns null when another instance holds it — that is a normal outcome, not
  * an error.
+ *
+ * This replaces a Postgres session-level advisory lock, which was unsafe here
+ * for two independent reasons.
+ *
+ * The first is correctness: `pg_try_advisory_lock` and `pg_advisory_unlock` are
+ * scoped to a *session*, and at runtime the app connects through Neon's
+ * PgBouncer pooler, where consecutive statements are not guaranteed the same
+ * backend. The unlock could land on a connection that did not hold the lock,
+ * return false, and leave it held forever — after which every subsequent run
+ * saw "not acquired" and returned null, which this function treats as the
+ * ordinary contended case. Settlement, reconciliation, the payment audit and
+ * file retention would all have stopped, silently, with nothing logged.
+ *
+ * The second rules out the obvious fix. A transaction-scoped
+ * `pg_advisory_xact_lock` is released correctly, but only holds for the life of
+ * a transaction — so the job would have to run inside one, pinning a pooled
+ * connection for its whole duration. Several of these jobs open transactions of
+ * their own while running, and with `connection_limit=10` a handful of
+ * overlapping jobs each holding a connection while waiting for another is a
+ * pool deadlock.
+ *
+ * A lease row costs no held connection and expires by itself, so a killed
+ * process delays a job by at most `JOB_LEASE_MS` instead of stopping it
+ * permanently. The compare-and-swap is the `lockedUntil` predicate: only one
+ * caller's `updateMany` can match a free-or-expired lease.
  */
-async function withAdvisoryLock<T>(key: number, work: () => Promise<T>): Promise<T | null> {
-  const [{ locked }] = await prisma.$queryRaw<Array<{ locked: boolean }>>`
-    SELECT pg_try_advisory_lock(${key}::bigint) AS locked
-  `;
+async function withJobLease<T>(name: string, work: () => Promise<T>): Promise<T | null> {
+  const now = new Date();
+  const until = new Date(now.getTime() + JOB_LEASE_MS);
 
-  if (!locked) return null;
+  const taken = await prisma.jobHeartbeat.updateMany({
+    where: {
+      name,
+      OR: [{ lockedUntil: null }, { lockedUntil: { lt: now } }],
+    },
+    data: { lockedUntil: until, lockedBy: INSTANCE_ID },
+  });
+
+  if (taken.count === 0) {
+    // Either someone holds a live lease, or the row does not exist yet.
+    // `recordJobStart` creates it before the job body runs, but it swallows its
+    // own failures by design — so depending on that having worked would
+    // reintroduce exactly the failure being fixed here: a job that never runs
+    // again and says nothing about it.
+    const exists = await prisma.jobHeartbeat.findUnique({
+      where: { name },
+      select: { name: true },
+    });
+    if (exists) return null;
+
+    try {
+      await prisma.jobHeartbeat.create({
+        data: { name, lockedUntil: until, lockedBy: INSTANCE_ID },
+      });
+    } catch {
+      // Another instance created the row first, which means it holds the lease.
+      return null;
+    }
+  }
 
   try {
     return await work();
   } finally {
-    await prisma.$queryRaw`SELECT pg_advisory_unlock(${key}::bigint)`;
+    // Scoped to this instance's own lease: if ours already expired and another
+    // instance took over, releasing would hand the job to a third.
+    await prisma.jobHeartbeat
+      .updateMany({
+        where: { name, lockedBy: INSTANCE_ID },
+        data: { lockedUntil: null, lockedBy: null },
+      })
+      .catch((error) => {
+        // The lease expires on its own, so a failed release costs a delay
+        // rather than a stuck job. Worth saying out loud all the same.
+        console.error(`[scheduler] could not release the ${name} lease:`, error);
+      });
   }
 }
 
@@ -191,7 +256,7 @@ export function startScheduler(): void {
   catchUpSlot = 0;
 
   schedule('settlement', env.SETTLEMENT_SWEEP_INTERVAL_MS, async () => {
-    const result = await withAdvisoryLock(LOCK_KEYS.settlement, () => runSettlementSweep());
+    const result = await withJobLease('settlement', () => runSettlementSweep());
     if (result && result.entriesSettled > 0) {
       console.log(
         `[scheduler] settled ${result.entriesSettled} entries ` +
@@ -201,7 +266,7 @@ export function startScheduler(): void {
   });
 
   schedule('reconciliation', env.RECONCILE_INTERVAL_MS, async () => {
-    const result = await withAdvisoryLock(LOCK_KEYS.reconciliation, () => reconcilePayments(15));
+    const result = await withJobLease('reconciliation', () => reconcilePayments(15));
     if (result && (result.reconciled > 0 || result.retriedWebhooks > 0)) {
       console.log(
         `[scheduler] reconciliation: checked ${result.checked}, ` +
@@ -220,7 +285,7 @@ export function startScheduler(): void {
   // the ledger still balanced, because the earning was removed along with the
   // order it belonged to.
   schedule('payment-audit', env.PAYMENT_AUDIT_INTERVAL_MS, async () => {
-    const result = await withAdvisoryLock(LOCK_KEYS.paymentAudit, () => auditCapturedPayments());
+    const result = await withJobLease('payment-audit', () => auditCapturedPayments());
     if (!result || result.orphans.length === 0) return;
 
     const total = result.orphans.reduce((sum, o) => sum + o.amountPaise, 0);
@@ -250,7 +315,7 @@ export function startScheduler(): void {
   // the gateway has no refund at all for it, so no amount of waiting resolves
   // it and the student's money is still sitting with us.
   schedule('refund-reconcile', env.REFUND_RECONCILE_INTERVAL_MS, async () => {
-    const result = await withAdvisoryLock(LOCK_KEYS.refundReconcile, () =>
+    const result = await withJobLease('refund-reconcile', () =>
       reconcileStuckRefunds({ stuckMinutes: env.REFUND_STUCK_MINUTES })
     );
     if (!result) return;
@@ -285,7 +350,7 @@ export function startScheduler(): void {
   });
 
   schedule('outbox-prune', 6 * 60 * 60 * 1000, async () => {
-    await withAdvisoryLock(LOCK_KEYS.outboxPrune, () => pruneOutbox());
+    await withJobLease('outbox-prune', () => pruneOutbox());
   });
 
   // Backstop for the inline deletion that runs when an order finishes or a
@@ -294,7 +359,7 @@ export function startScheduler(): void {
   // removal at all. Without this the bucket keeps documents the rest of the
   // system considers gone.
   schedule('file-retention', env.FILE_RETENTION_SWEEP_INTERVAL_MS, async () => {
-    const result = await withAdvisoryLock(LOCK_KEYS.fileRetention, () => sweepUndeletedFiles());
+    const result = await withJobLease('file-retention', () => sweepUndeletedFiles());
     if (result && result.filesRemoved > 0) {
       console.log(
         `[scheduler] file-retention removed ${result.filesRemoved} file(s) ` +
@@ -307,7 +372,7 @@ export function startScheduler(): void {
   // nobody can use them and they attach to no shop. Redeemed codes are never
   // touched — those are the record of how a shop owner got in.
   schedule('referral-sweep', env.REFERRAL_SWEEP_INTERVAL_MS, async () => {
-    const deleted = await withAdvisoryLock(LOCK_KEYS.referralSweep, () => sweepExpiredReferralCodes());
+    const deleted = await withJobLease('referral-sweep', () => sweepExpiredReferralCodes());
     if (deleted) {
       console.log(`[scheduler] referral-sweep removed ${deleted} expired unused code(s)`);
     }
@@ -317,7 +382,7 @@ export function startScheduler(): void {
   // Only resolved events are deleted — an unresolved defect that stopped
   // recurring is precisely what you want still on screen when it returns.
   schedule('event-sweep', 24 * 60 * 60 * 1000, async () => {
-    const result = await withAdvisoryLock(LOCK_KEYS.eventSweep, () => sweepOldEvents());
+    const result = await withJobLease('event-sweep', () => sweepOldEvents());
     if (result && (result.events > 0 || result.remediations > 0)) {
       console.log(
         `[scheduler] event-sweep removed ${result.events} resolved event(s) ` +

@@ -3,6 +3,7 @@ import { prisma } from '../utils/prisma';
 import { ApiError } from '../utils/ApiError';
 import { issueOtp, consumeOtp } from './otp.service';
 import { sendPasswordResetEmail } from './email.service';
+import { findUserIdByEmail } from './auth.service';
 
 /**
  * Password reset by emailed one-time code.
@@ -55,10 +56,15 @@ const NO_CODE = 'No verification code was requested for this email.';
  * route. It is logged so the failure is visible to us rather than to the caller.
  */
 export async function requestPasswordReset(email: string): Promise<void> {
-  const user = await prisma.user.findUnique({
-    where: { email },
+  // Case-insensitive, like every other email lookup: an address stored
+  // `Name@gmail.com` must still receive its code when typed in lower case.
+  // Resolving without regard to case is what stops a forgotten password being
+  // unrecoverable for anyone who capitalised their address at signup.
+  const userId = await findUserIdByEmail(email);
+  const user = userId ? await prisma.user.findUnique({
+    where: { id: userId },
     select: { id: true, email: true, name: true },
-  });
+  }) : null;
 
   if (!user?.email) return;
 
@@ -97,14 +103,15 @@ export async function resetPassword(
   code: string,
   newPassword: string
 ): Promise<void> {
-  const user = await prisma.user.findUnique({
-    where: { email },
-    select: { id: true },
-  });
+  // Same case-insensitive resolution as the request step. If the two disagreed,
+  // a code could be issued to an address and then rejected when it was typed
+  // back the same way.
+  const userId = await findUserIdByEmail(email);
 
   // Deliberately the message consumeOtp gives for an account that never
   // requested one, so the two cases are indistinguishable from outside.
-  if (!user) throw ApiError.badRequest(NO_CODE);
+  if (!userId) throw ApiError.badRequest(NO_CODE);
+  const user = { id: userId };
 
   // Throws on a wrong, expired, missing or locked-out code. On success the code
   // is gone, so a replay of the same value cannot set the password twice.

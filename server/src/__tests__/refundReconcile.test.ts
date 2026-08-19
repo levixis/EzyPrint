@@ -51,7 +51,11 @@ jest.mock('razorpay', () =>
 
 const mockShopShareOfRefund = jest.fn();
 const mockCreateLedgerEntry = jest.fn();
+// The real `refundLedgerEventId` / `refundReversalEventId` are kept, because
+// which key an attempt writes under is exactly what these tests are pinning —
+// a stub would let the production keys drift without failing anything here.
 jest.mock('../services/ledger.service', () => ({
+  ...jest.requireActual('../services/ledger.service'),
   shopShareOfRefund: mockShopShareOfRefund,
   createLedgerEntry: mockCreateLedgerEntry,
 }));
@@ -83,6 +87,11 @@ const stuckRequest = (overrides: Record<string, unknown> = {}) => ({
   shopId: 'shop_1',
   status: 'PROCESSING_REFUND',
   razorpayRefundId: 'rfnd_1',
+  // No failed attempts yet, so this is attempt 1 — which keeps the original
+  // `refund:<id>` ledger key, since only retries carry a suffix. The
+  // assertions below therefore read the same as they did before refunds
+  // became retryable.
+  attempts: 0,
   order: { razorpayPaymentId: 'pay_1' },
   ...overrides,
 });
@@ -198,7 +207,7 @@ describe('a refund the gateway has failed', () => {
   test('corrects the order rather than leaving it claiming a refund', async () => {
     await reconcileStuckRefunds();
 
-    expect(orderDataWith('refundStatus').refundStatus).toBe('FAILED');
+    expect(orderDataWith('refundStatus').refundStatus).toBe('failed');
   });
 
   test('tells the student, who was last told it was on its way', async () => {

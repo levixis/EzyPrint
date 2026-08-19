@@ -217,12 +217,12 @@ const StudentOrderCard: React.FC<StudentOrderCardProps> = ({ order, onPayNow, on
       {/* Refund Status Display */}
       {order.refundId && (
         <div className={`mt-4 p-3 rounded-lg border ${
-          order.refundStatus === 'FAILED'
+          order.refundStatus === 'failed'
             ? 'bg-red-50 dark:bg-red-900/20 border-red-200 dark:border-red-800/50'
             : 'bg-blue-50 dark:bg-blue-900/20 border-blue-200 dark:border-blue-800/50'
         }`}>
           <div className="flex items-center gap-2 mb-1">
-            {order.refundStatus === 'FAILED' ? (
+            {order.refundStatus === 'failed' ? (
               <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4 text-red-500">
                 <path fillRule="evenodd" d="M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Zm-8-5a.75.75 0 0 1 .75.75v4.5a.75.75 0 0 1-1.5 0v-4.5A.75.75 0 0 1 10 5Zm0 10a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z" clipRule="evenodd" />
               </svg>
@@ -232,11 +232,11 @@ const StudentOrderCard: React.FC<StudentOrderCardProps> = ({ order, onPayNow, on
               </svg>
             )}
             <span className={`text-sm font-semibold ${
-              order.refundStatus === 'FAILED'
+              order.refundStatus === 'failed'
                 ? 'text-red-700 dark:text-red-400'
                 : 'text-blue-700 dark:text-blue-400'
             }`}>
-              {order.refundStatus === 'FAILED' ? 'Refund Failed' :
+              {order.refundStatus === 'failed' ? 'Refund Failed' :
                order.refundStatus === 'processed' ? 'Refund Processed' :
                'Refund Initiated'}
             </span>
@@ -248,7 +248,7 @@ const StudentOrderCard: React.FC<StudentOrderCardProps> = ({ order, onPayNow, on
           )}
           {order.refundedAt && (
             <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-              {order.refundStatus === 'FAILED'
+              {order.refundStatus === 'failed'
                 ? 'Please contact support for assistance.'
                 : `Initiated on ${new Date(order.refundedAt).toLocaleDateString()}. Will be credited within 5-7 business days.`
               }

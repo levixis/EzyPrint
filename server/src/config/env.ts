@@ -200,6 +200,31 @@ export const env = {
    */
   SETTLEMENT_RELEASE_HOUR_IST: intFromEnv('SETTLEMENT_RELEASE_HOUR_IST', 6),
 
+  /**
+   * What to do when an order's files no longer match the ones its price was
+   * computed from.
+   *
+   *   'log'     — compare, record the mismatch loudly, and fulfil anyway
+   *   'enforce' — refuse to hand the order to the shop; flag it for a human
+   *
+   * Defaults to 'log', and the default is the conservative one on purpose. This
+   * check sits on the path where a student has *already paid*, so the failure
+   * mode of getting it wrong in the enforce direction is refusing real orders
+   * from real customers who did nothing wrong. The failure mode of getting it
+   * wrong in the log direction is that a fraud we would have caught is instead
+   * only recorded — and the upload guard, which is hard-enforced and needs no
+   * flag, is what actually stops that fraud happening. This is the second line,
+   * so it is the one that gets to be cautious.
+   *
+   * Ship on 'log', watch the logs for false positives across a full checkout
+   * cycle, then set 'enforce'. It is an environment variable rather than a
+   * constant precisely so that switch is not a redeploy — and so it can be
+   * switched *back* in seconds if it starts refusing good orders at 2am.
+   */
+  FINGERPRINT_VERIFY: (process.env.FINGERPRINT_VERIFY === 'enforce' ? 'enforce' : 'log') as
+    | 'enforce'
+    | 'log',
+
   // ── Background scheduler ──
   ENABLE_SCHEDULER: boolFromEnv('ENABLE_SCHEDULER', !isTest),
   SETTLEMENT_SWEEP_INTERVAL_MS: intFromEnv('SETTLEMENT_SWEEP_INTERVAL_MS', 5 * 60 * 1000),

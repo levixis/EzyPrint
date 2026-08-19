@@ -333,6 +333,24 @@ router.post('/:id/mark-paid', authenticate, authorize('ADMIN'), sensitiveLimiter
     const { adminNote, otp } = req.body;
     const payoutId = req.params.id as string;
 
+    // Only IN_TRANSIT rows predating the approve/mark-sent merge can reach
+    // here — `/approve` has gone straight to PAID since, so nothing creates
+    // this state any more. The route stays as the way to finish those rows off.
+    //
+    // Checked before the code is spent, like `/cancel` already does. Consuming
+    // first meant that clicking this on any current payout — where it can never
+    // apply — destroyed the OTP anyway, so every retry needed a fresh email and
+    // failed identically, which reads as "OTP not working" rather than "this
+    // button does not apply to this payout".
+    const existing = await prisma.payout.findUnique({ where: { id: payoutId } });
+    if (!existing) throw ApiError.notFound('Payout not found');
+    if (existing.status !== 'IN_TRANSIT') {
+      throw ApiError.badRequest(
+        `This payout is ${existing.status.toLowerCase().replace(/_/g, ' ')}, not in transit. ` +
+        `Approving a payout already records it as sent.`
+      );
+    }
+
     await otpService.consumeOtp(req.user.userId, `payout_${payoutId}`, otp);
 
     const outboxIds: string[] = [];

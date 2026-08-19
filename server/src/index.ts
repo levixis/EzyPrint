@@ -45,22 +45,20 @@ app.use(helmet());
 
 // ── CORS ──
 /**
- * The origins the Capacitor shell serves the packaged app from.
+ * The origin the Capacitor shell serves the packaged app from.
  *
- * These are not addresses on the internet — nobody can navigate a browser to
- * `capacitor://localhost`, and `https://localhost` resolves to the device
- * itself. They identify the mobile app whose bundle we ship, and the WebView
- * sends them as `Origin` on every request.
+ * This is not an address on the internet — `https://localhost` resolves to the
+ * device itself. It identifies the mobile app whose bundle we ship, and the
+ * WebView sends it as `Origin` on every request.
  *
- * Held in code rather than left to CORS_ORIGINS because they are a property of
- * shipping a Capacitor app, not of any one deployment. As an env var they have
+ * Held in code rather than left to CORS_ORIGINS because it is a property of
+ * shipping a Capacitor app, not of any one deployment. As an env var it has
  * to be remembered for every environment, and forgetting produces a request
  * that returns 200 with no ACAO header — which reaches the app as "Failed to
  * fetch" and looks like the backend is down.
  */
 const NATIVE_APP_ORIGINS = [
   'https://localhost',      // Capacitor Android (default androidScheme since v3)
-  'capacitor://localhost',  // Capacitor iOS
 ];
 
 app.use(

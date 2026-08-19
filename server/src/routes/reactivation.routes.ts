@@ -5,12 +5,16 @@ import { resolveReactivationSchema } from '../validators/schemas';
 import * as otpService from '../services/otp.service';
 import { prisma } from '../utils/prisma';
 import { ApiError } from '../utils/ApiError';
+import { clampListLimit } from '../utils/pagination';
 
 const router = Router();
 
 router.get('/', authenticate, authorize('ADMIN'), async (req, res, next) => {
   try {
     const requests = await prisma.reactivationRequest.findMany({
+      // Bounded like the other admin lists. Low volume today, but "low volume
+      // today" is what every unbounded query had going for it.
+      take: clampListLimit(req.query.limit),
       orderBy: { requestedAt: 'desc' }
     });
     res.json({ success: true, reactivationRequests: requests, data: requests });

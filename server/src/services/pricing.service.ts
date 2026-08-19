@@ -64,6 +64,58 @@ export function isStudentPassActive(
 }
 
 /**
+ * The lowest per-page rate a shop may set, other than free.
+ *
+ * This exists because the rupees-as-paise unit bug has a second entry path that
+ * the signup fix did not close. The conversion from what an owner types to what
+ * is stored happens in the browser (`rupeesToPaise` in the settings modal); the
+ * server has only ever checked `>= 0`, so any caller sending rupees — an old
+ * bundle, a cached client, a direct API call — writes rupees into a paise
+ * column and the shop silently charges a hundredth of its intended price.
+ *
+ * 50 paise is chosen because it sits below any real price (the schema defaults
+ * are 100 and 300) and above everything a plausible rupee entry produces: ₹1
+ * through ₹49 land as 1–49 paise, and every one of them is caught.
+ *
+ * Zero stays legal and is deliberately not treated as suspicious — a shop
+ * running free black-and-white and charging only for colour is a real offer,
+ * and `calculateBaseFee` already handles a zero page cost.
+ */
+export const MIN_CHARGEABLE_PAGE_RATE_PAISE = 50;
+
+/**
+ * Whether a per-page rate is one a shop could have meant.
+ *
+ * Shared by the request schema and the service write site rather than living in
+ * one of them: the schema is the friendly rejection, the write site is the
+ * control that holds however the call arrives.
+ */
+export function isUsablePageRate(paise: number): boolean {
+  return paise === 0 || paise >= MIN_CHARGEABLE_PAGE_RATE_PAISE;
+}
+
+/**
+ * The floor, phrased for the person who typed it.
+ *
+ * Deliberately says rupees and never mentions paise. The shop settings form
+ * takes rupees and converts (`rupeesToPaise`), so the owner has never seen a
+ * paise figure in their life — and the first version of this message read
+ * "Prices are in paise — ₹1.00 a page is 100, not 1", which invites an owner
+ * looking at a rupees field to type 100 and set their price to ₹100 a page.
+ * A validation message that explains the storage unit to someone typing in a
+ * different unit is not a hint, it is a trap.
+ *
+ * Built from the constant so the number in the sentence cannot drift from the
+ * number being enforced.
+ */
+export function pageRateFloorMessage(label: 'B/W' | 'Colour'): string {
+  return (
+    `Minimum ${label} price is ₹${(MIN_CHARGEABLE_PAGE_RATE_PAISE / 100).toFixed(2)} per page. ` +
+    `Enter 0 to offer it free.`
+  );
+}
+
+/**
  * Platform fee on top of page cost. Thresholds read as ₹5 / ₹30 / ₹70 and the
  * fees as ₹2 / ₹3 / ₹4 / ₹5.
  */

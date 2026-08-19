@@ -77,7 +77,16 @@ export const optionalAuthenticate = (
     }
     next();
   } catch (error) {
-    // If token is invalid/expired, we just ignore it and treat as unauthenticated
+    // An expired token is ordinary and expected — sessions end. A token whose
+    // *signature* does not verify is somebody constructing one, which is worth
+    // knowing about; both used to leave here identically and invisibly, so
+    // probing looked exactly like a stale tab.
+    //
+    // Either way the request continues as unauthenticated: this middleware's
+    // contract is that a bad token is not an error, only an absence.
+    if (error instanceof Error && error.name === 'JsonWebTokenError') {
+      console.warn(`[auth] rejected a token with an invalid signature: ${error.message}`);
+    }
     next();
   }
 };

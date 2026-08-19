@@ -193,6 +193,24 @@ async function deliver(rows: OutboxRow[]): Promise<number> {
         data: { attempts: { increment: 1 }, lastError: message },
       });
       console.error('[realtime] batch delivery failed:', message);
+
+      // Say something when a row gives up.
+      //
+      // The attempt cap is what stops a poison row being retried forever, but
+      // crossing it was silent: `pruneOutbox` only deletes rows that were
+      // published, so an exhausted event sat in the table undelivered and
+      // unmentioned, and the shop owner's ledger simply missed it. Reported
+      // once, on the attempt that exhausts the budget.
+      const exhausted = await prisma.realtimeOutbox.count({
+        where: { id: { in: batch.map(r => r.id) }, attempts: MAX_ATTEMPTS },
+      });
+
+      if (exhausted > 0) {
+        console.error(
+          `[realtime] ${exhausted} event(s) exhausted ${MAX_ATTEMPTS} delivery attempts ` +
+          `and will not be retried: ${message}`
+        );
+      }
     }
   }
 

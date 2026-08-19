@@ -25,8 +25,14 @@ import { isStudentPassActive } from './pricing.service';
  * How long a payment-creation claim is honoured before another request may take
  * it over. Long enough to cover a slow Razorpay round trip, short enough that a
  * crashed request does not leave an order unpayable for long.
+ *
+ * Exported because the upload path needs the same number: an order whose
+ * payment claim is live has had a price quoted to Razorpay from its current
+ * files, so those files must not move. The two rules have to agree on when a
+ * claim has lapsed, or there is a window where one considers the order claimed
+ * and the other considers it free.
  */
-const PAYMENT_CLAIM_TTL_MS = 60 * 1000;
+export const PAYMENT_CLAIM_TTL_MS = 60 * 1000;
 
 /**
  * Tell the shop a paid order has arrived.
@@ -151,7 +157,32 @@ type RecoveryOutcome =
  */
 async function flagForReview(orderId: string, reason: string): Promise<void> {
   const marked = await prisma.order.updateMany({
-    where: { id: orderId, paymentVerifiedVia: { not: 'amount_mismatch' } },
+    where: {
+      id: orderId,
+      // The NULL arm is load-bearing, and its absence made this whole function
+      // a silent no-op for the orders it most needed to flag.
+      //
+      // `paymentVerifiedVia` is null until a payment is actually verified, and
+      // SQL three-valued logic means `NULL <> 'amount_mismatch'` evaluates to
+      // NULL rather than true — so `{ not: ... }` alone matched *zero rows* for
+      // any order that had never been through verification. `updateMany`
+      // returned count 0, this function returned early, and no console line and
+      // no admin alert were ever produced.
+      //
+      // That is exactly inverted from what it is for. An order refused at the
+      // payment boundary — wrong amount, or files changed after pricing — is
+      // refused *before* `paymentVerifiedVia` is ever set, so the money was
+      // captured, the order was not fulfilled, and nobody was told. It only
+      // appeared to work when the order had already been fulfilled and the
+      // column carried 'webhook'.
+      //
+      // Found by driving the real endpoint against a real Postgres; a mocked
+      // test cannot see it, because the bug is in how SQL treats NULL.
+      OR: [
+        { paymentVerifiedVia: null },
+        { paymentVerifiedVia: { not: 'amount_mismatch' } },
+      ],
+    },
     data: { paymentVerifiedVia: 'amount_mismatch' },
   });
 
@@ -459,9 +490,18 @@ export async function createPaymentOrder(
   // Guarded write: the unique constraint on razorpayOrderId is the DB-level
   // backstop, and `razorpayOrderId: null` here means we never clobber a value
   // another request somehow recorded first.
+  //
+  // The fingerprint lands in the same statement as the id, because they record
+  // the same fact from two sides: this is the moment the price stopped being
+  // negotiable, and this is the file set it was computed from. Written together
+  // or not at all — an id without a fingerprint would be an order nobody can
+  // later verify, which is the state this column exists to remove.
   const recorded = await prisma.order.updateMany({
     where: { id: orderId, razorpayOrderId: null },
-    data: { razorpayOrderId: rpOrder.id },
+    data: {
+      razorpayOrderId: rpOrder.id,
+      pricedFilesFingerprint: await orderService.fingerprintPricedFiles(prisma, orderId),
+    },
   });
 
   if (recorded.count === 0) {
@@ -554,6 +594,29 @@ export async function verifyPayment(
     throw ApiError.badRequest('Payment verification failed — signature mismatch');
   }
 
+  // The signature proves Razorpay collected this payment against this order. It
+  // says nothing about the order still describing the same work, so the same
+  // file-set check the webhook makes applies here too — this path reaches the
+  // identical PENDING_APPROVAL transition, and guarding one and not the other
+  // would just move the hole to whichever confirmation arrived first.
+  if (!(await orderService.pricedFilesUnchanged(prisma, order))) {
+    const enforceFingerprint = env.FINGERPRINT_VERIFY === 'enforce';
+
+    await flagForReview(
+      orderId,
+      `the files changed after the price was set — signature-verified payment ${razorpayPaymentId} ` +
+      `is for a different file set than the order now holds` +
+      (enforceFingerprint ? '' : ' [FINGERPRINT_VERIFY=log — fulfilled anyway]')
+    );
+
+    if (enforceFingerprint) {
+      throw ApiError.conflict(
+        'The files on this order changed after its price was set, so we have not sent it to the shop. ' +
+        'Your payment is safe and our team has been alerted.'
+      );
+    }
+  }
+
   // Guarded on the status read above. The webhook path may have committed the
   // same transition in the meantime; an unguarded update would overwrite what it
   // wrote instead of deferring to it.
@@ -636,7 +699,7 @@ export async function handleWebhook(
   // the duplicate is absorbed instead of erroring.
   const rpOrderId = event.payload?.payment?.entity?.order_id || null;
 
-  const record = await prisma.webhookEvent.upsert({
+  await prisma.webhookEvent.upsert({
     where: { eventId },
     create: {
       source: 'razorpay',
@@ -648,7 +711,16 @@ export async function handleWebhook(
     update: {}, // already recorded — leave the original payload untouched
   });
 
-  if (record.processed) {
+  // Claim the right to process it, atomically.
+  //
+  // The upsert absorbs a duplicate INSERT, but `processed` alone cannot
+  // serialize two concurrent deliveries: it is read here and written at the end
+  // of `processWebhookEvent`, so a redelivery arriving mid-processing saw
+  // `false` — as the first delivery had — and ran the whole handler a second
+  // time. The order writes are guarded on status and the ledger dedupes on
+  // eventId, so money stayed correct, but both deliveries hit Razorpay and both
+  // notified. Claiming closes the window rather than relying on those.
+  if (!(await claimWebhookEvent(eventId))) {
     return { received: true, status: 'already_processed' };
   }
 
@@ -659,15 +731,78 @@ export async function handleWebhook(
     // Log the error but still return 200 to Razorpay so it stops retrying.
     // The reconciliation job will pick up unprocessed events.
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    await prisma.webhookEvent.update({
-      where: { eventId },
-      data: { processingError: errorMessage },
-    });
+    await releaseWebhookClaim(eventId, errorMessage);
     console.error(`⚠️ Webhook processing failed for event ${eventId}:`, errorMessage);
     return { received: true, status: 'processing_failed' };
   }
 
   return { received: true, status: 'processed' };
+}
+
+/**
+ * How long a processing claim is honoured before another caller may take it.
+ *
+ * Long enough for the slowest handler (a transaction plus a gateway round
+ * trip), short enough that a process killed mid-handler does not strand the
+ * event until the next reconciliation sweep.
+ */
+const WEBHOOK_CLAIM_TTL_MS = 2 * 60 * 1000;
+
+/** Failed attempts after which an event is escalated instead of retried. */
+const MAX_WEBHOOK_ATTEMPTS = 10;
+
+/**
+ * Take exclusive ownership of an unprocessed event.
+ *
+ * Compare-and-swap on `claimedAt`, the same shape `createPaymentOrder` uses for
+ * `paymentAttemptedAt`: exactly one concurrent caller can win, and a claim
+ * older than the TTL is reclaimable so a crash cannot block the event forever.
+ */
+async function claimWebhookEvent(eventId: string): Promise<boolean> {
+  const staleCutoff = new Date(Date.now() - WEBHOOK_CLAIM_TTL_MS);
+
+  const claim = await prisma.webhookEvent.updateMany({
+    where: {
+      eventId,
+      processed: false,
+      OR: [{ claimedAt: null }, { claimedAt: { lt: staleCutoff } }],
+    },
+    data: { claimedAt: new Date() },
+  });
+
+  return claim.count === 1;
+}
+
+/**
+ * Record a failed attempt and release the claim so a retry can pick it up.
+ *
+ * Escalates once when the attempt budget is exhausted. Without that an event
+ * that can never be processed — a malformed payload, a refund whose request row
+ * is gone — was re-attempted by every reconciliation pass forever, and nobody
+ * was ever told.
+ */
+async function releaseWebhookClaim(eventId: string, errorMessage: string): Promise<void> {
+  const updated = await prisma.webhookEvent.update({
+    where: { eventId },
+    data: {
+      processingError: errorMessage,
+      attempts: { increment: 1 },
+      claimedAt: null,
+    },
+    select: { attempts: true, eventType: true },
+  });
+
+  if (updated.attempts === MAX_WEBHOOK_ATTEMPTS) {
+    console.error(
+      `⚠️ Webhook event ${eventId} (${updated.eventType}) has failed ` +
+      `${MAX_WEBHOOK_ATTEMPTS} times and will no longer be retried: ${errorMessage}`
+    );
+    notify.notifyAdmins(
+      `A Razorpay webhook (${updated.eventType}, event ${eventId}) has failed ` +
+      `${MAX_WEBHOOK_ATTEMPTS} times and has been given up on. It needs a human: ${errorMessage}`,
+      'error'
+    );
+  }
 }
 
 /**
@@ -727,7 +862,13 @@ interface RefundParty {
  */
 async function applyRefundProcessed(
   tx: Prisma.TransactionClient,
-  request: { id: string; orderId: string; shopId: string; status: RefundRequestStatus },
+  request: {
+    id: string;
+    orderId: string;
+    shopId: string;
+    status: RefundRequestStatus;
+    attempts: number;
+  },
   refund: { id: string; amount: number },
   outboxIds: string[]
 ): Promise<RefundParty | null> {
@@ -751,7 +892,7 @@ async function applyRefundProcessed(
     where: { id: request.orderId },
     data: {
       refundId: refund.id,
-      refundStatus: 'processed',
+      refundStatus: ledgerService.ORDER_REFUND_STATUS.processed,
       refundAmount: refund.amount,
       refundedAt: new Date(),
     },
@@ -785,7 +926,7 @@ async function applyRefundProcessed(
       counterparty: 'STUDENT',
       createdBy: 'SYSTEM',
       orderId: request.orderId,
-      eventId: `refund:${request.id}`,
+      eventId: ledgerService.refundLedgerEventId(request.id, ledgerService.refundAttemptNumber(request)),
       allowDebt: true,
     }, tx, outboxIds);
   }
@@ -819,15 +960,27 @@ async function applyRefundProcessed(
  */
 async function applyRefundFailed(
   tx: Prisma.TransactionClient,
-  request: { id: string; orderId: string; shopId: string; status: RefundRequestStatus },
+  request: {
+    id: string;
+    orderId: string;
+    shopId: string;
+    status: RefundRequestStatus;
+    attempts: number;
+    razorpayRefundId: string | null;
+  },
   outboxIds: string[]
 ): Promise<RefundParty | null> {
   // Guarding on the statuses that imply a deduction was actually made stops a
   // second arrival from crediting the shop twice.
   if (!['RESOLVED_REFUNDED', 'PROCESSING_REFUND'].includes(request.status)) return null;
 
+  // Reverse the entry *this attempt* wrote. A retry writes its own, so a
+  // request-wide key would reverse the wrong one once a refund has failed more
+  // than once.
+  const attempt = ledgerService.refundAttemptNumber(request);
+
   const deducted = await tx.ledgerEntry.findUnique({
-    where: { eventId: `refund:${request.id}` },
+    where: { eventId: ledgerService.refundLedgerEventId(request.id, attempt) },
   });
 
   if (deducted) {
@@ -835,17 +988,38 @@ async function applyRefundFailed(
       shopId: request.shopId,
       type: 'ADJUSTMENT',
       amount: deducted.amount,
-      description: `Reversal — Razorpay refund failed for order ${request.orderId}`,
+      description:
+        `Reversal — Razorpay refund failed for order ${request.orderId}` +
+        (request.razorpayRefundId ? ` (refund ${request.razorpayRefundId})` : ''),
       counterparty: 'PLATFORM',
       createdBy: 'SYSTEM',
       orderId: request.orderId,
-      eventId: `refund:${request.id}:reversal`,
+      eventId: ledgerService.refundReversalEventId(request.id, attempt),
     }, tx, outboxIds);
   }
 
   const moved = await tx.refundRequest.updateMany({
     where: { id: request.id, status: request.status },
-    data: { status: 'REFUND_FAILED' },
+    data: {
+      status: 'REFUND_FAILED',
+      // Cleared so a retry mints a new refund at the gateway.
+      //
+      // `settleClaimedRefund` skips the Razorpay call entirely when this column
+      // is set — it reads a stored id as "a refund is already in flight", which
+      // is true for an attempt that crashed before committing and false for one
+      // the gateway has definitively failed. Leaving the dead id here made
+      // every retry a silent no-op that parked the request back in
+      // PROCESSING_REFUND to wait for a webhook that had already arrived.
+      //
+      // The id itself is not lost: it is written into the reversal entry's
+      // description above, which is append-only.
+      razorpayRefundId: null,
+      // This attempt is over. Incrementing here — and only here — is what makes
+      // the next try a genuinely new one to both Razorpay and the ledger, while
+      // leaving an attempt that merely lost its transaction on the same number
+      // so its refund is adopted rather than duplicated.
+      attempts: { increment: 1 },
+    },
   });
 
   // The order was never actually refunded. Returning it to COMPLETED is the
@@ -867,7 +1041,13 @@ async function applyRefundFailed(
   // reversal knew otherwise.
   await tx.order.updateMany({
     where: { id: request.orderId },
-    data: { refundStatus: 'FAILED', refundError: 'Refund failed at the gateway' },
+    // Through the shared constant: this was the one value written in capitals,
+    // so every consumer had to know that this single state spelled itself
+    // differently from the other two.
+    data: {
+      refundStatus: ledgerService.ORDER_REFUND_STATUS.failed,
+      refundError: 'Refund failed at the gateway',
+    },
   });
 
   if (moved.count === 0) return null;
@@ -930,6 +1110,24 @@ async function processWebhookEvent(eventType: string, event: any, eventId: strin
         // order marked paid for less than it cost.
         const amountMatches = order ? payment.amount === order.totalPrice : false;
 
+        // And that the files are still the ones that amount was computed from.
+        //
+        // The amount check above compares the payment to `order.totalPrice`,
+        // and `totalPrice` is frozen when the Razorpay order is minted — so it
+        // agrees with itself no matter what happened to the files afterwards.
+        // Swapping a one-page document for a two-hundred-page one leaves both
+        // figures untouched and sails straight through it.
+        const filesMatch = order
+          ? await orderService.pricedFilesUnchanged(tx, order)
+          : false;
+
+        // In 'log' mode the comparison still runs and a mismatch is still
+        // reported — only the refusal is withheld. Nothing about what gets
+        // detected changes when the flag flips, which is what makes watching
+        // 'log' a valid rehearsal for 'enforce' rather than a different test.
+        const enforceFingerprint = env.FINGERPRINT_VERIFY === 'enforce';
+        const filesBlockFulfilment = !filesMatch && enforceFingerprint;
+
         if (order && !amountMatches) {
           // Money moved and we are declining to fulfil against it, so somebody
           // has to be told. A console line in a log nobody reads is how a
@@ -938,6 +1136,15 @@ async function processWebhookEvent(eventType: string, event: any, eventId: strin
           mismatchReason =
             `captured ${payment.amount} paise but the order costs ${order.totalPrice} ` +
             `(payment ${rpPaymentId})`;
+        } else if (order && !filesMatch) {
+          // Recorded either way — the whole point of 'log' mode is that the
+          // evidence is identical and only the consequence differs, so what is
+          // seen in the logs before enforcing is exactly what enforcing acts on.
+          mismatchedOrderId = order.id;
+          mismatchReason =
+            `the files changed after the price was set — paid ${payment.amount} paise for a ` +
+            `different file set than the order now holds (payment ${rpPaymentId})` +
+            (enforceFingerprint ? '' : ' [FINGERPRINT_VERIFY=log — fulfilled anyway]');
         }
 
         // Only process if the order exists, has not been paid already, and the
@@ -951,7 +1158,7 @@ async function processWebhookEvent(eventType: string, event: any, eventId: strin
         // attached to a dead order.
         const claimable = order?.status === 'PENDING_PAYMENT' || order?.status === 'PAYMENT_FAILED';
 
-        if (order && claimable && amountMatches) {
+        if (order && claimable && amountMatches && !filesBlockFulfilment) {
           // Guarded on the status rather than a bare update: the signature path
           // may have committed the same transition between the read above and
           // this write, and only the caller whose update actually lands may
@@ -1174,20 +1381,38 @@ export async function reconcilePayments(thresholdMinutes: number = 15) {
     }
   }
 
-  // Also retry any unprocessed webhook events
+  // Also retry any unprocessed webhook events.
+  //
+  // Bounded on both axes. `attempts` stops an event that can never succeed from
+  // being re-attempted by every pass forever — it is escalated to the admins
+  // once and then left alone — and `take` stops a backlog from making one sweep
+  // run unboundedly long. Neither limit existed, so a single poison payload was
+  // retried every fifteen minutes indefinitely, silently.
   const unprocessedEvents = await prisma.webhookEvent.findMany({
     where: {
       processed: false,
+      attempts: { lt: MAX_WEBHOOK_ATTEMPTS },
       createdAt: { lt: threshold },
     },
+    orderBy: { createdAt: 'asc' },
+    take: 100,
   });
 
+  let retriedWebhooks = 0;
+
   for (const webhookEvent of unprocessedEvents) {
+    // Same claim the live delivery path takes, so a sweep cannot process an
+    // event a webhook delivery is working on at this moment.
+    if (!(await claimWebhookEvent(webhookEvent.eventId))) continue;
+
     try {
       const payload = webhookEvent.payload as any;
       await processWebhookEvent(webhookEvent.eventType, payload, webhookEvent.eventId);
+      retriedWebhooks++;
       console.log(`🔄 Reprocessed webhook event ${webhookEvent.eventId}`);
     } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      await releaseWebhookClaim(webhookEvent.eventId, message);
       console.error(`❌ Failed to reprocess webhook ${webhookEvent.eventId}:`, error);
     }
   }
@@ -1197,7 +1422,8 @@ export async function reconcilePayments(thresholdMinutes: number = 15) {
     reconciled,
     /** Payments that moved money we could not match to an order. Admins alerted. */
     flagged,
-    retriedWebhooks: unprocessedEvents.length,
+    /** Events this pass actually reprocessed — not merely selected. */
+    retriedWebhooks,
   };
 }
 
@@ -1309,6 +1535,40 @@ export async function verifyStudentPassPayment(
 
   if (rpOrder?.notes?.userId !== userId || rpOrder?.notes?.subscription_type !== 'student_pass') {
     throw ApiError.forbidden('This payment does not belong to your Student Pass.');
+  }
+
+  // The same check the webhook branch makes, and for the same reason: a valid
+  // signature proves Razorpay sent this, not that the money moved or that the
+  // right sum moved. Razorpay enforces the order's amount today, so a short
+  // payment cannot reach here — but that is Razorpay's invariant rather than
+  // ours, and it stops holding the moment partial payments are enabled on the
+  // account. This path granted a pass on the signature alone while the webhook
+  // path refused on a mismatch; two answers to one question.
+  //
+  // Read from the payment rather than from the order's `status`. The order flips
+  // to 'paid' asynchronously after capture, and this runs the instant the
+  // client's checkout returns — so gating on the order status would
+  // intermittently refuse passes that were genuinely paid for. The payment
+  // entity is already captured by then, and it is what carries the sum.
+  // Typed through the same narrow `RazorpayPayment` the audit uses rather than
+  // `any`, so a change to any field we depend on is a compile error here rather
+  // than an `undefined` that quietly waves a payment through.
+  const rpPayment = await razorpay.payments.fetch(razorpayPaymentId) as unknown as RazorpayPayment;
+
+  if (rpPayment?.order_id !== razorpayOrderId) {
+    throw ApiError.forbidden('This payment does not belong to that order.');
+  }
+
+  if (rpPayment?.status !== 'captured') {
+    throw ApiError.badRequest('This Student Pass payment has not completed yet.');
+  }
+
+  if (rpPayment?.amount !== env.STUDENT_PASS_PRICE_PAISE) {
+    console.error(
+      `⚠️ Student Pass payment ${razorpayPaymentId} is for ${rpPayment?.amount} paise but ` +
+      `the price is ${env.STUDENT_PASS_PRICE_PAISE} — not activating.`
+    );
+    throw ApiError.badRequest('The amount paid does not match the Student Pass price.');
   }
 
   await activateStudentPass(userId, razorpayPaymentId);

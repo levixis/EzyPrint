@@ -120,7 +120,9 @@ export interface SweepResult {
 export async function runSettlementSweep(now: Date = new Date()): Promise<SweepResult> {
   const due = await prisma.ledgerEntry.groupBy({
     by: ['shopId'],
-    where: { status: 'PENDING', availableAt: { not: null, lte: now } },
+    // Same predicate `settleShop` uses, so this cannot select a shop that then
+    // turns out to have nothing settleable.
+    where: { status: 'PENDING', type: 'ORDER_EARNING', availableAt: { not: null, lte: now } },
     _sum: { amount: true },
     _count: { _all: true },
   });
@@ -151,16 +153,20 @@ async function settleShop(shopId: string, now: Date): Promise<{ entries: number;
     const shop = await tx.shop.findUnique({ where: { id: shopId } });
     if (!shop) return { entries: 0, amount: 0 };
 
-    const dueEntries = await tx.ledgerEntry.findMany({
-      where: { shopId, status: 'PENDING', availableAt: { not: null, lte: now } },
-      select: { id: true, amount: true, type: true },
-    });
-    if (dueEntries.length === 0) return { entries: 0, amount: 0 };
-
-    // Only earnings mature into withdrawable money. A PENDING payout
+    // Narrowed to earnings in the query rather than filtered after it.
+    //
+    // Only earnings mature into withdrawable money — a PENDING payout
     // reservation also lives in this table and must not be swept into the
-    // shop's available balance.
-    const earnings = dueEntries.filter(e => e.type === 'ORDER_EARNING');
+    // shop's available balance. Selecting everything and filtering afterwards
+    // meant any non-earning entry carrying a matured `availableAt` was picked
+    // up on every sweep and never marked, so it stayed PENDING with a past
+    // `availableAt` forever. `buildBalanceSnapshot` reads the earliest such
+    // entry as `nextSettlementAt`, so the shop's dashboard would have promised
+    // a settlement date in the past, permanently.
+    const earnings = await tx.ledgerEntry.findMany({
+      where: { shopId, status: 'PENDING', type: 'ORDER_EARNING', availableAt: { not: null, lte: now } },
+      select: { id: true, amount: true },
+    });
     if (earnings.length === 0) return { entries: 0, amount: 0 };
 
     const total = earnings.reduce((sum, e) => sum + e.amount, 0);

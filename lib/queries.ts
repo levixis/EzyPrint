@@ -400,7 +400,15 @@ export const payoutApi = {
   request: (data: { shopId: string; amount: number; shopOwnerNote?: string }) =>
     api.post<ShopPayout>('/payouts/request', data),
 
-  /** Approve and initiate the transfer. Moves the payout to IN_TRANSIT. */
+  /**
+   * Approve and send, in one act. Moves the payout straight to PAID.
+   *
+   * There is no separate "mark sent" step: a single admin making a UPI transfer
+   * has no gap between authorising and sending, so the second step only asked
+   * them to re-assert something already true — and cost another OTP. Whether
+   * the money *arrived* is the shop's to say, which is what CONFIRMED and
+   * DISPUTED are for.
+   */
   approve: (payoutId: string, otp: string, adminNote?: string) =>
     api.post(`/payouts/${payoutId}/approve`, { otp, adminNote }),
 

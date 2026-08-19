@@ -129,7 +129,110 @@ export async function shopShareOfRefund(
   });
 
   if (!earning) return 0;
-  return Math.min(refundAmount, earning.amount);
+
+  // What the shop has already given back on this order, net of any reversals
+  // for attempts the gateway failed. Without this every refund was capped at
+  // the *full* earning rather than at what remains of it, so two partial
+  // refunds on one order could between them debit the shop more than it was
+  // ever paid.
+  //
+  // The reversal side is matched on its `:reversal` key rather than on the
+  // ADJUSTMENT type. ADJUSTMENT happens to have exactly one writer today — the
+  // refund-failure reversal — but it is a general-purpose correction type, and
+  // the first unrelated adjustment carrying an orderId would otherwise silently
+  // reduce what a shop owes on a refund.
+  const [deducted, reversed] = await Promise.all([
+    tx.ledgerEntry.aggregate({
+      where: { orderId, type: 'REFUND_DEDUCTION', status: { not: 'VOID' } },
+      _sum: { amount: true },
+    }),
+    tx.ledgerEntry.aggregate({
+      where: {
+        orderId,
+        type: 'ADJUSTMENT',
+        status: { not: 'VOID' },
+        eventId: { endsWith: ':reversal' },
+      },
+      _sum: { amount: true },
+    }),
+  ]);
+
+  const alreadyBorne = (deducted._sum.amount ?? 0) - (reversed._sum.amount ?? 0);
+  const remainingLiability = Math.max(0, earning.amount - alreadyBorne);
+
+  return Math.min(refundAmount, remainingLiability);
+}
+
+/**
+ * The three values `Order.refundStatus` may hold.
+ *
+ * The column is free text, and that is how it came to hold `'FAILED'` in
+ * capitals while the other two were lower case — one writer spelled its state
+ * differently and nothing could notice. Every writer now goes through this
+ * constant, so the compiler rejects a fourth spelling.
+ *
+ * Not a Prisma enum only because converting the column would have to rewrite
+ * existing rows, and a value nobody anticipated would fail that migration on
+ * the live database. Worth doing later, deliberately; this closes the drift in
+ * the meantime.
+ */
+export const ORDER_REFUND_STATUS = {
+  /** Accepted by the gateway, not yet settled. */
+  pending: 'pending',
+  /** Confirmed settled — the student has their money. */
+  processed: 'processed',
+  /** The gateway rejected it. The shop's deduction has been reversed. */
+  failed: 'failed',
+} as const;
+
+export type OrderRefundStatus = (typeof ORDER_REFUND_STATUS)[keyof typeof ORDER_REFUND_STATUS];
+
+/**
+ * Which refund attempt is currently live for a request.
+ *
+ * `RefundRequest.attempts` counts attempts the gateway has *definitively
+ * failed* and that have been reversed — not attempts started. That distinction
+ * is the whole point:
+ *
+ *  - A refund that succeeded at Razorpay but whose local transaction did not
+ *    commit is still attempt N. Retrying must present the same idempotency key
+ *    so the gateway hands back the refund it already made, rather than making a
+ *    second one. Counting *starts* instead of *failures* would advance the key
+ *    here and pay the student twice.
+ *  - A refund the gateway failed is over. The next try is attempt N+1 and must
+ *    look new to both Razorpay and the ledger.
+ */
+export function refundAttemptNumber(request: { attempts: number }): number {
+  return request.attempts + 1;
+}
+
+/**
+ * Dedup key for the shop's deduction on one refund attempt.
+ *
+ * Deliberately not keyed on the request id alone. A RefundRequest row is reused
+ * across retries — `orderId` is unique, and both the shop and admin claim paths
+ * update the existing row — so an attempt-blind key made a retry after
+ * REFUND_FAILED indistinguishable from the attempt that failed. The dedup in
+ * `createLedgerEntry` then swallowed it: the first attempt's deduction had
+ * already been reversed, the retry's deduction was discarded as a duplicate,
+ * and the shop was never charged for a refund the student did receive.
+ *
+ * Attempt 1 keeps the original `refund:<id>` shape so every entry already
+ * written stays findable — the reversal lookup depends on that. Only retries
+ * carry a suffix.
+ */
+export function refundLedgerEventId(requestId: string, attempt: number): string {
+  return attempt <= 1 ? `refund:${requestId}` : `refund:${requestId}:${attempt}`;
+}
+
+/**
+ * Dedup key for the compensating credit that undoes one failed attempt.
+ *
+ * Always ends in `:reversal`, which is what lets `shopShareOfRefund` identify a
+ * reversal by its key rather than by its type.
+ */
+export function refundReversalEventId(requestId: string, attempt: number): string {
+  return `${refundLedgerEventId(requestId, attempt)}:reversal`;
 }
 
 export interface CreateLedgerEntryInput {

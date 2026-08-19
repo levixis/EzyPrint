@@ -126,11 +126,19 @@ export const generalLimiter = rateLimit({
 });
 
 /**
- * Auth endpoints — 20 attempts per 15 minutes.
+ * Auth endpoints, per targeted account — 20 attempts per 15 minutes.
  *
- * Keyed on the target account as well as the caller's address, so an attacker
- * spreading attempts across many IPs still exhausts the budget for the single
- * account being attacked.
+ * Bounds the attack on any single account no matter how many addresses it is
+ * spread across. It does NOT bound how many accounts one address may work
+ * through, which is why `authSourceLimiter` below is mounted alongside it.
+ *
+ * These have to be two limiters rather than one. The key was previously
+ * `email ? email : ip` — the address component vanished the moment an email was
+ * present, which is every login and registration attempt, so each target got
+ * its own fresh budget and one host could try 20 passwords against every
+ * account it knew of. A composite `email|ip` key is worse still: changing
+ * either half mints a new bucket, so it bounds neither axis. Two independent
+ * buckets, both of which must have room, is the only shape that does.
  */
 export const authLimiter = rateLimit({
   ...shared,
@@ -143,6 +151,33 @@ export const authLimiter = rateLimit({
   message: {
     success: false,
     message: 'Too many authentication attempts. Please try again after 15 minutes.',
+  },
+});
+
+/**
+ * Credential-verifying endpoints, per source address — 60 attempts per 15 min.
+ *
+ * The other half of the pair: this is what makes password spraying — one or two
+ * common passwords against thousands of known campus addresses — cost the
+ * attacker something.
+ *
+ * Deliberately looser than the per-account limit, and deliberately mounted only
+ * on login, register, google and the password-reset pair rather than on the
+ * whole auth router. A campus puts its entire student body behind one
+ * institutional NAT address, so anything keyed on the address alone has to stay
+ * well clear of ordinary traffic; `/refresh` and `/me` are ordinary traffic and
+ * are excluded entirely. Sixty credential attempts in fifteen minutes from one
+ * address is far above real signup and sign-in volume, and far below a spray
+ * worth running.
+ */
+export const authSourceLimiter = rateLimit({
+  ...shared,
+  windowMs: 15 * 60 * 1000,
+  max: env.isDev ? 500 : 60,
+  keyGenerator: (req: Request) => `authip:${clientKey(req)}`,
+  message: {
+    success: false,
+    message: 'Too many authentication attempts from this network. Please try again later.',
   },
 });
 

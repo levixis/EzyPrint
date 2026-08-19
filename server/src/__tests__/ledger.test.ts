@@ -194,10 +194,23 @@ describe('Refund reversal (refund.failed)', () => {
  * the platform absorbs its own fee instead of clawing it back from the shop.
  */
 describe('Shop liability for a refund', () => {
-  /** Minimal tx double exposing just the lookup shopShareOfRefund performs. */
-  const txWithEarning = (amount: number | null) => ({
+  /**
+   * Minimal tx double exposing the lookups shopShareOfRefund performs: the
+   * order's earning, and what has already been deducted and reversed against
+   * it. `deducted` / `reversed` default to nothing, which is the first-refund
+   * case.
+   */
+  const txWithEarning = (
+    amount: number | null,
+    ledger: { deducted?: number; reversed?: number } = {}
+  ) => ({
     ledgerEntry: {
       findUnique: async () => (amount === null ? null : { amount }),
+      aggregate: async ({ where }: { where: { type: string } }) => ({
+        _sum: {
+          amount: where.type === 'REFUND_DEDUCTION' ? ledger.deducted ?? 0 : ledger.reversed ?? 0,
+        },
+      }),
     },
   });
 
@@ -217,5 +230,42 @@ describe('Shop liability for a refund', () => {
     // against a shop that was never paid.
     const share = await shopShareOfRefund(txWithEarning(null), 'order-1', 500);
     expect(share).toBe(0);
+  });
+
+  /**
+   * A shop can only ever give back what it was paid.
+   *
+   * The cap used to be the full earning on every call, with no account taken of
+   * what earlier refunds on the same order had already deducted — so two
+   * partial refunds could between them debit a shop more than the order ever
+   * earned it.
+   */
+  test('a second partial refund is capped at what is left of the earning', async () => {
+    // Earned 300, already gave back 200. Only 100 of liability remains, even
+    // though the refund being processed is larger than that.
+    const share = await shopShareOfRefund(txWithEarning(300, { deducted: 200 }), 'order-1', 250);
+    expect(share).toBe(100);
+  });
+
+  test('a shop that has already refunded its whole earning owes nothing further', async () => {
+    const share = await shopShareOfRefund(txWithEarning(300, { deducted: 300 }), 'order-1', 300);
+    expect(share).toBe(0);
+  });
+
+  /**
+   * A reversed attempt is not a deduction that stands.
+   *
+   * When Razorpay fails a refund the shop's deduction is reversed by a
+   * compensating ADJUSTMENT credit. The retry must therefore see the full
+   * liability again — netting the reversal off is what makes a retried refund
+   * charge the shop exactly once rather than never.
+   */
+  test('a deduction that was reversed does not reduce liability on the retry', async () => {
+    const share = await shopShareOfRefund(
+      txWithEarning(300, { deducted: 300, reversed: 300 }),
+      'order-1',
+      300
+    );
+    expect(share).toBe(300);
   });
 });

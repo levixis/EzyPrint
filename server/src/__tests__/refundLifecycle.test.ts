@@ -23,7 +23,7 @@
  *
  *   accept   → 'pending',   student told it is in progress
  *   processed→ 'processed', student told it landed
- *   failed   → 'FAILED',    student told it failed, admin view corrected
+ *   failed   → 'failed',    student told it failed, admin view corrected
  *
  * The vocabulary is not new — `types.ts` documents refundStatus as
  * "processed" | "pending" | "FAILED", and both dashboards already render all
@@ -34,6 +34,8 @@ import crypto from 'crypto';
 
 // ── prisma ──
 const mockRefundFindUnique = jest.fn();
+const mockRefundUpdate = jest.fn();
+const mockWebhookUpdateMany = jest.fn();
 const mockRefundFindFirst = jest.fn();
 const mockRefundUpdateMany = jest.fn();
 const mockOrderUpdateMany = jest.fn();
@@ -44,8 +46,20 @@ const mockTransaction = jest.fn();
 
 jest.mock('../utils/prisma', () => ({
   prisma: {
-    refundRequest: { findUnique: mockRefundFindUnique },
-    webhookEvent: { upsert: mockWebhookUpsert, update: mockWebhookUpdate },
+    // `refundRequest.update` is the attempt counter claimed before the gateway
+    // call — each attempt carries its own idempotency key so a retry is a new
+    // refund, not a replay of the failed one.
+    //
+    // `webhookEvent.updateMany` is the processing claim. `processed` alone is
+    // read before the handler runs and written after, so two concurrent
+    // deliveries both passed it; claiming is a compare-and-swap that only one
+    // can win.
+    refundRequest: { findUnique: mockRefundFindUnique, update: mockRefundUpdate },
+    webhookEvent: {
+      upsert: mockWebhookUpsert,
+      update: mockWebhookUpdate,
+      updateMany: mockWebhookUpdateMany,
+    },
     $transaction: mockTransaction,
   },
 }));
@@ -53,7 +67,11 @@ jest.mock('../utils/prisma', () => ({
 // ── collaborators ──
 const mockShopShareOfRefund = jest.fn();
 const mockCreateLedgerEntry = jest.fn();
+// The real `refundLedgerEventId` / `refundReversalEventId` are kept, because
+// which key an attempt writes under is exactly what these tests are pinning —
+// a stub would let the production keys drift without failing anything here.
 jest.mock('../services/ledger.service', () => ({
+  ...jest.requireActual('../services/ledger.service'),
   shopShareOfRefund: mockShopShareOfRefund,
   createLedgerEntry: mockCreateLedgerEntry,
 }));
@@ -131,13 +149,16 @@ beforeEach(() => {
   jest.clearAllMocks();
 
   mockRefundFindUnique.mockResolvedValue(claimedRequest());
+  mockRefundUpdate.mockResolvedValue({ attempts: 1 });
   mockRefundUpdateMany.mockResolvedValue({ count: 1 });
   mockOrderUpdateMany.mockResolvedValue({ count: 1 });
   mockShopShareOfRefund.mockResolvedValue(0);
   mockCreateLedgerEntry.mockResolvedValue(undefined);
   mockLedgerFindUnique.mockResolvedValue({ id: 'ledger_1', amount: 12500 });
   mockWebhookUpsert.mockResolvedValue({ processed: false });
-  mockWebhookUpdate.mockResolvedValue({});
+  mockWebhookUpdate.mockResolvedValue({ attempts: 1, eventType: 'refund.processed' });
+  // count 1 = this delivery won the processing claim, the ordinary case.
+  mockWebhookUpdateMany.mockResolvedValue({ count: 1 });
   mockOrderFindUnique.mockResolvedValue({ userId: 'student_1' });
 
   mockTransaction.mockImplementation(async (callback: (tx: unknown) => Promise<unknown>) =>
@@ -251,6 +272,9 @@ describe('refund.processed confirms it', () => {
       orderId: 'order_1',
       shopId: 'shop_1',
       status: 'PROCESSING_REFUND',
+      // No failed attempts yet: this is attempt 1, which keeps the original
+      // `refund:<id>` ledger key. Only retries carry a suffix.
+      attempts: 0,
     });
   });
 
@@ -310,6 +334,9 @@ describe('accept, then fail', () => {
       orderId: 'order_1',
       shopId: 'shop_1',
       status: statusAtFailure,
+      // Not yet failed, so the attempt being failed here is attempt 1.
+      attempts: 0,
+      razorpayRefundId: 'rfnd_new',
     });
 
     // 2. Razorpay fails it asynchronously.
@@ -334,7 +361,7 @@ describe('accept, then fail', () => {
   test('the order stops claiming the refund was processed', async () => {
     await failAfterAccepting('PROCESSING_REFUND');
 
-    expect(orderDataWith('refundStatus').refundStatus).toBe('FAILED');
+    expect(orderDataWith('refundStatus').refundStatus).toBe('failed');
   });
 
   test('the correction survives a refund that had already been confirmed', async () => {
@@ -343,7 +370,7 @@ describe('accept, then fail', () => {
     // exactly the lie this fixes.
     await failAfterAccepting('RESOLVED_REFUNDED');
 
-    expect(orderDataWith('refundStatus').refundStatus).toBe('FAILED');
+    expect(orderDataWith('refundStatus').refundStatus).toBe('failed');
     expect(mockNotifyRefundFailed).toHaveBeenCalled();
   });
 
@@ -351,6 +378,27 @@ describe('accept, then fail', () => {
     await failAfterAccepting('PROCESSING_REFUND');
 
     expect(requestData().status).toBe('REFUND_FAILED');
+  });
+
+  test('the dead refund id is cleared so a retry reaches the gateway', async () => {
+    await failAfterAccepting('PROCESSING_REFUND');
+
+    // `settleClaimedRefund` reads a stored refund id as "already in flight" and
+    // skips the Razorpay call entirely. Leaving the failed id here made every
+    // retry a silent no-op: the request went back to PROCESSING_REFUND and sat
+    // there waiting for a webhook that had already been delivered, while the
+    // student was never refunded.
+    expect(requestData().razorpayRefundId).toBeNull();
+  });
+
+  test('the attempt is counted, so the retry is a new one to gateway and ledger', async () => {
+    await failAfterAccepting('PROCESSING_REFUND');
+
+    // This is the only place `attempts` advances. Counting failures rather than
+    // starts is what keeps a retry after a *lost transaction* on the same key —
+    // where the refund is real and re-sending it would pay the student twice —
+    // while making a retry after a *failure* look new to both.
+    expect(requestData().attempts).toEqual({ increment: 1 });
   });
 
   test("the shop's ledger deduction is still reversed", async () => {
@@ -381,9 +429,94 @@ describe('accept, then fail', () => {
       orderId: 'order_1',
       shopId: 'shop_1',
       status: 'REFUND_FAILED',
+      attempts: 1,
     });
     await deliver('refund.failed', { id: 'rfnd_new', payment_id: 'pay_1', amount: 12500 });
 
     expect(mockNotifyRefundFailed).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The status lists must stay in step across the three roles.
+ *
+ * `REFUND_FAILED` was added to the shop's claimable list and missed in the
+ * admin route's, which was written out inline beside it — so the retry that
+ * the enum, the cleanup service and the failure notification all promise
+ * answered "invalid state", and a failed refund had no way forward at all.
+ *
+ * The lists are now shared constants rather than inline copies. These pin the
+ * relationships between them, so adding a status to one and forgetting another
+ * fails here rather than in production.
+ */
+describe('who may act on a refund request', () => {
+  test('a failed refund is retryable by both a shop and an admin', async () => {
+    const { SHOP_CLAIMABLE_STATUSES, ADMIN_APPROVABLE_STATUSES } = await import('../services/refund.service');
+
+    expect(SHOP_CLAIMABLE_STATUSES).toContain('REFUND_FAILED');
+    expect(ADMIN_APPROVABLE_STATUSES).toContain('REFUND_FAILED');
+  });
+
+  test('a failed refund can also be denied, so the claim can be closed out', async () => {
+    // Otherwise it stays open forever — and an open claim pins the order's
+    // files, because UNSETTLED_REFUND_STATUSES counts it as a live dispute.
+    const { ADMIN_ACTIONABLE_STATUSES } = await import('../services/refund.service');
+
+    expect(ADMIN_ACTIONABLE_STATUSES).toContain('REFUND_FAILED');
+  });
+
+  test('approving may re-drive an in-flight refund; denying may not', async () => {
+    // A stalled refund can be pushed along. Denying one whose money may already
+    // have moved is not a decision this endpoint can honour.
+    const { ADMIN_ACTIONABLE_STATUSES, ADMIN_APPROVABLE_STATUSES } = await import('../services/refund.service');
+
+    expect(ADMIN_APPROVABLE_STATUSES).toContain('PROCESSING_REFUND');
+    expect(ADMIN_ACTIONABLE_STATUSES).not.toContain('PROCESSING_REFUND');
+  });
+
+  test('everything an admin may act on, an approval may also act on', async () => {
+    const { ADMIN_ACTIONABLE_STATUSES, ADMIN_APPROVABLE_STATUSES } = await import('../services/refund.service');
+
+    for (const status of ADMIN_ACTIONABLE_STATUSES) {
+      expect(ADMIN_APPROVABLE_STATUSES).toContain(status);
+    }
+  });
+
+  test('a settled refund is reopenable by nobody', async () => {
+    const { SHOP_CLAIMABLE_STATUSES, ADMIN_APPROVABLE_STATUSES } = await import('../services/refund.service');
+
+    for (const settled of ['RESOLVED_REFUNDED', 'REFUND_SETTLED_OFFLINE', 'RESOLVED_DENIED'] as const) {
+      expect(SHOP_CLAIMABLE_STATUSES).not.toContain(settled);
+      expect(ADMIN_APPROVABLE_STATUSES).not.toContain(settled);
+    }
+  });
+
+  test('cancelling an order takes over a claim the shop rejected', async () => {
+    // The sequence this pins: student claims a refund, shop rejects it, shop
+    // then cancels the order anyway. The rejection settled a *dispute*; the
+    // cancellation is the shop deciding the order will not be fulfilled, and
+    // that has to return the money regardless. Leaving REJECTED_BY_SHOP out of
+    // this list meant the order was cancelled, the student stayed charged, and
+    // no refund was issued or even queued.
+    const { CANCELLATION_CLAIMABLE_STATUSES } = await import('../services/refund.service');
+
+    expect(CANCELLATION_CLAIMABLE_STATUSES).toContain('REJECTED_BY_SHOP');
+  });
+
+  test('a cancellation never re-claims a refund the gateway failed', async () => {
+    // REFUND_FAILED rows belong to the retry paths, which clear the dead
+    // gateway id and advance the attempt counter first. Re-claiming one here
+    // would present a spent idempotency key and get the dead refund back.
+    const { CANCELLATION_CLAIMABLE_STATUSES } = await import('../services/refund.service');
+
+    expect(CANCELLATION_CLAIMABLE_STATUSES).not.toContain('REFUND_FAILED');
+  });
+
+  test('a cancellation never reopens a finished refund', async () => {
+    const { CANCELLATION_CLAIMABLE_STATUSES } = await import('../services/refund.service');
+
+    for (const settled of ['RESOLVED_REFUNDED', 'REFUND_SETTLED_OFFLINE', 'RESOLVED_DENIED', 'PROCESSING_REFUND'] as const) {
+      expect(CANCELLATION_CLAIMABLE_STATUSES).not.toContain(settled);
+    }
   });
 });

@@ -5,6 +5,7 @@ import { ApiError } from '../utils/ApiError';
 import { validate } from '../middleware/validate';
 import { requestRefundSchema, respondRefundSchema, resolveRefundSchema, shopRefundSchema } from '../validators/schemas';
 import { sensitiveLimiter } from '../middleware/rateLimiter';
+import { clampListLimit } from '../utils/pagination';
 import * as otpService from '../services/otp.service';
 import * as refundService from '../services/refund.service';
 
@@ -21,9 +22,18 @@ router.get('/', authenticate, authorize('ADMIN', 'SHOP_OWNER', 'STUDENT'), async
     } else if (req.user?.userType === 'STUDENT') {
       whereClause = { studentId: req.user.userId };
     }
+    // Clamped like every other list endpoint. This one was unbounded, and for
+    // an admin the where clause is empty — so it read every refund request in
+    // the system, each with its full order joined on. That is the same defect
+    // the payout listing was fixed for, in the sibling that was missed: it
+    // grows with the platform, and the first time it matters is the day it is
+    // slowest to notice.
+    const limit = clampListLimit(req.query.limit);
+
     const requests = await prisma.refundRequest.findMany({
       where: whereClause,
       orderBy: { studentRequestedAt: 'desc' },
+      take: limit,
       include: { order: true }
     });
     res.json({ success: true, data: requests });
@@ -52,20 +62,36 @@ router.get('/history/:orderId', authenticate, authorize('STUDENT', 'ADMIN', 'SHO
 });
 
 // Create refund
-router.post('/', authenticate, authorize('STUDENT'), validate(requestRefundSchema), async (req, res, next) => {
+router.post('/', authenticate, authorize('STUDENT'), sensitiveLimiter, validate(requestRefundSchema), async (req, res, next) => {
   try {
     const { orderId, reason } = req.body;
     if (!req.user) throw ApiError.unauthorized();
-    
+
     const order = await prisma.order.findUnique({ where: { id: orderId } });
     if (!order) throw ApiError.notFound('Order not found');
     if (order.userId !== req.user.userId) throw ApiError.forbidden('Not your order');
     if (order.status === 'PENDING_PAYMENT') throw ApiError.badRequest('Order is unpaid, cannot refund');
-    
+    if (order.status === 'PAYMENT_FAILED') throw ApiError.badRequest('Nothing was charged for this order');
+    if (order.status === 'REFUNDED') throw ApiError.badRequest('This order has already been refunded');
+
+    // `orderId` is unique on RefundRequest, so a second claim is a constraint
+    // violation rather than a second row. Returning the existing claim makes a
+    // double-tap idempotent instead of a 500, and stops a student raising a
+    // fresh claim against an order that was auto-refunded by a cancellation —
+    // which would reopen a dispute and pin the order's files indefinitely.
+    const existing = await prisma.refundRequest.findUnique({ where: { orderId } });
+    if (existing) {
+      return res.json({
+        success: true,
+        data: existing,
+        message: 'You have already raised a refund request for this order.',
+      });
+    }
+
     const request = await prisma.refundRequest.create({
       data: { orderId, studentId: req.user.userId, shopId: order.shopId, reason, status: 'PENDING_SHOP' }
     });
-    
+
     res.json({ success: true, data: request });
   } catch (error) { next(error); }
 });
@@ -153,7 +179,11 @@ router.post('/:id/resolve', authenticate, authorize('ADMIN'), validate(resolveRe
     
     if (action === 'DENY') {
       const updated = await prisma.refundRequest.updateMany({
-        where: { id, status: { in: ['ESCALATED_TO_ADMIN', 'APPROVED_BY_SHOP', 'AUTO_ESCALATED'] } },
+        // Shared with the service rather than written out here. The inline
+        // copy is exactly what drifted last time: `REFUND_FAILED` was added to
+        // the shop's list and missed in this one, so the retry every other part
+        // of the codebase promises answered "invalid state".
+        where: { id, status: { in: refundService.ADMIN_ACTIONABLE_STATUSES } },
         data: { status: 'RESOLVED_DENIED', adminNote, resolvedBy: req.user?.userId, adminResolvedAt: new Date() }
       });
       if (updated.count === 0) throw ApiError.badRequest('Refund request not found or invalid state');
@@ -175,7 +205,10 @@ router.post('/:id/resolve', authenticate, authorize('ADMIN'), validate(resolveRe
 
     // 1. Claim
     const claim = await prisma.refundRequest.updateMany({
-      where: { id, status: { in: ['ESCALATED_TO_ADMIN', 'APPROVED_BY_SHOP', 'AUTO_ESCALATED', 'PROCESSING_REFUND'] } },
+      // Approvable = actionable, plus a refund already in flight that has
+      // stalled. Shared with the service so this list and the shop's cannot
+      // drift apart again.
+      where: { id, status: { in: refundService.ADMIN_APPROVABLE_STATUSES } },
       data: { status: 'PROCESSING_REFUND', refundAmount: requestedAmount, adminNote: adminNote || initialRequest.adminNote }
     });
     if (claim.count === 0) throw ApiError.badRequest('Refund request not found or invalid state');

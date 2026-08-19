@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { authLimiter, passwordResetLimiter } from '../middleware/rateLimiter';
+import { authLimiter, authSourceLimiter, passwordResetLimiter } from '../middleware/rateLimiter';
 import { authenticate } from '../middleware/auth';
 import { validate } from '../middleware/validate';
 import {
@@ -18,18 +18,37 @@ const router = Router();
 router.use(authLimiter);
 
 /**
+ * The second half of the credential-attack budget, applied per source address.
+ *
+ * `authLimiter` keys on the target account when the body carries an email, and
+ * falls back to the address only when it does not — so a request naming an
+ * account was never counted against where it came from. One host could
+ * therefore spray a password across as many accounts as it knew of and hit no
+ * auth limit at all, because each account had its own untouched budget.
+ *
+ * Mounted per route rather than on the router, and only on the routes that
+ * verify a credential. `/refresh`, `/logout` and `/me` are ordinary traffic
+ * from users who are already signed in — a campus puts thousands of them behind
+ * one institutional NAT address, and counting their token refreshes against a
+ * shared per-address budget would read as an outage rather than a protection.
+ * That is the same reasoning that keeps `generalLimiter` off the address, and
+ * it is why this cannot simply be `router.use`.
+ */
+const credentialGuess = [authSourceLimiter];
+
+/**
  * POST /api/v1/auth/register
  * Zod validates: email format, password strength (8-72 chars, uppercase,
  * lowercase, number, special char), name length, type enum, conditional
  * shopName/shopAddress for SHOP_OWNER.
  */
-router.post('/register', validate(registerSchema), authController.register);
+router.post('/register', ...credentialGuess, validate(registerSchema), authController.register);
 
 /**
  * POST /api/v1/auth/login
  * Zod validates: email format, password presence.
  */
-router.post('/login', validate(loginSchema), authController.login);
+router.post('/login', ...credentialGuess, validate(loginSchema), authController.login);
 
 /**
  * POST /api/v1/auth/forgot-password
@@ -40,6 +59,7 @@ router.post('/login', validate(loginSchema), authController.login);
  */
 router.post(
   '/forgot-password',
+  ...credentialGuess,
   passwordResetLimiter,
   validate(forgotPasswordSchema),
   authController.forgotPassword
@@ -55,6 +75,7 @@ router.post(
  */
 router.post(
   '/reset-password',
+  ...credentialGuess,
   validate(resetPasswordSchema),
   authController.resetPasswordHandler
 );
@@ -63,7 +84,7 @@ router.post(
  * POST /api/v1/auth/google
  * Zod validates: idToken presence, optional userType enum.
  */
-router.post('/google', validate(googleAuthSchema), authController.googleAuth);
+router.post('/google', ...credentialGuess, validate(googleAuthSchema), authController.googleAuth);
 
 /**
  * POST /api/v1/auth/refresh

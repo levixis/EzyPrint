@@ -266,14 +266,71 @@ describe('Ticket Schema', () => {
 
 describe('Shop Update Schema', () => {
   test('accepts valid pricing update', () => {
+    // These were 2 and 5 — rupee figures that survived the paise migration in
+    // the test just as they did in the signup path, so this asserted that two
+    // paise a page was a valid price. Same stale-units problem the ceiling test
+    // below documents. 200 and 500 are ₹2.00 and ₹5.00, which is what was meant.
+    expect(validate(updateShopSchema, {
+      body: { pricing: { bwPerPage: 200, colorPerPage: 500 } },
+    }).success).toBe(true);
+  });
+
+  test('rejects a sub-50-paise price, which is rupees sent as paise', () => {
+    // The floor that closes the unit bug's remaining entry path. 2 and 5 are
+    // what arrives when someone types ₹2 and ₹5 and the conversion is skipped.
     expect(validate(updateShopSchema, {
       body: { pricing: { bwPerPage: 2, colorPerPage: 5 } },
+    }).success).toBe(false);
+
+    expect(validate(updateShopSchema, {
+      body: { pricing: { bwPerPage: 49, colorPerPage: 300 } },
+    }).success).toBe(false);
+
+    // 50 paise exactly is the lowest real price and must pass.
+    expect(validate(updateShopSchema, {
+      body: { pricing: { bwPerPage: 50, colorPerPage: 300 } },
+    }).success).toBe(true);
+  });
+
+  test('the rejection message speaks rupees, because that is what the owner typed', () => {
+    /**
+     * The first version read "Prices are in paise — ₹1.00 a page is 100, not 1".
+     * The settings form takes *rupees* and converts, so an owner who reads that
+     * and types 100 into the field they are looking at sets their price to ₹100
+     * a page. A message that explains the storage unit to someone typing in a
+     * different unit is not a hint, it is a trap — and this one would have
+     * turned an under-charging shop into a wildly over-charging one.
+     */
+    const result = validate(updateShopSchema, {
+      body: { pricing: { bwPerPage: 2, colorPerPage: 300 } },
+    });
+
+    expect(result.success).toBe(false);
+    const message = result.errors.map((e: { message: string }) => e.message).join(' | ');
+
+    expect(message).toContain('₹0.50');
+    // No mention of a unit the owner never sees...
+    expect(message).not.toMatch(/paise/i);
+    // ...and no paise figure they could copy into the rupees field in front of
+    // them. These are the exact numbers the old message told them to type.
+    expect(message).not.toContain('100');
+    expect(message).not.toContain('300');
+  });
+
+  test('still accepts zero — a free B&W tier is a real offer', () => {
+    // The floor must not turn "free" into "invalid". `calculateBaseFee` already
+    // handles a zero page cost.
+    expect(validate(updateShopSchema, {
+      body: { pricing: { bwPerPage: 0, colorPerPage: 300 } },
     }).success).toBe(true);
   });
 
   test('rejects negative pricing', () => {
+    // colorPerPage was 5, which the floor above now also rejects — so this
+    // would have passed whether or not the negative check still worked. 300
+    // keeps the negative value as the only reason it fails.
     expect(validate(updateShopSchema, {
-      body: { pricing: { bwPerPage: -1, colorPerPage: 5 } },
+      body: { pricing: { bwPerPage: -1, colorPerPage: 300 } },
     }).success).toBe(false);
   });
 

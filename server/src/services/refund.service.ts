@@ -32,6 +32,29 @@ type RazorpayRefundStatus = 'pending' | 'processed';
  * than issuing a second one. Without it, a network blip during a refund is a
  * double payout.
  */
+/**
+ * The idempotency key for one refund attempt, in the format Razorpay accepts.
+ *
+ * Razorpay constrains the `X-Refund-Idempotency` value to at least 10
+ * characters of letters, digits, hyphens and underscores only. A hyphen is
+ * therefore the separator — a colon reads naturally and is what the ledger's
+ * own event ids use, but it is not in that set, so the gateway would reject
+ * every retry that carried one. A RefundRequest id is a 25-character cuid, so
+ * the length floor is met by the id alone.
+ *
+ * Attempt 1 is the bare request id, unchanged from before retries existed — so
+ * a refund already in flight at the gateway keeps answering to the key it was
+ * created with across a deploy.
+ *
+ * Later attempts are suffixed, and only a *failed* attempt advances the number
+ * (see `refundAttemptNumber`). A crashed-before-commit attempt deliberately
+ * keeps its key: the refund may well have been made, and presenting the same
+ * key is what makes Razorpay return it instead of issuing a second one.
+ */
+function refundGatewayKey(requestId: string, attempt: number): string {
+  return attempt <= 1 ? requestId : `${requestId}-retry-${attempt}`;
+}
+
 async function callRazorpayRefund(
   paymentId: string,
   amountPaise: number,
@@ -114,6 +137,15 @@ export async function settleClaimedRefund(
   let razorpayRefundId = request.razorpayRefundId;
 
   /**
+   * Which attempt this is, and therefore which idempotency keys it uses.
+   *
+   * Read, never incremented here. `attempts` counts attempts the gateway has
+   * failed, so it advances in `applyRefundFailed` and nowhere else — a retry
+   * only becomes a new attempt once the previous one is known to be dead.
+   */
+  const attempt = ledgerService.refundAttemptNumber(request);
+
+  /**
    * Where this refund actually stands, which is not the same as whether the
    * call succeeded.
    *
@@ -140,7 +172,16 @@ export async function settleClaimedRefund(
       const accepted = await callRazorpayRefund(
         request.order.razorpayPaymentId,
         amount,
-        request.id,
+        // Per attempt, not per request. Keyed on the request id alone, a retry
+        // after a failed refund handed Razorpay the key of the refund it had
+        // already failed and got that same dead refund back — so the retry
+        // never issued anything and the student was never paid.
+        //
+        // Only a *failed* attempt advances the number, so this still returns
+        // the original refund when an earlier attempt succeeded at the gateway
+        // and lost its local transaction — which is the case the key was
+        // introduced for and must keep protecting.
+        refundGatewayKey(request.id, attempt),
         request.orderId
       );
       razorpayRefundId = accepted.id;
@@ -155,6 +196,12 @@ export async function settleClaimedRefund(
     // response to read a status from, so this stays PROCESSING_REFUND and
     // waits for the webhook — assuming completion here would be assuming it
     // about a call we never saw the result of.
+    //
+    // This branch is only reachable for a refund that is genuinely in flight.
+    // A refund the gateway *failed* has its id cleared by `applyRefundFailed`
+    // precisely so it does not land here: that id is dead, and treating it as
+    // in-flight is what made a retry a silent no-op that then waited forever
+    // for a webhook that had already been delivered.
   } else {
     // Nothing was ever charged through Razorpay — cash or a free order. There
     // is no asynchronous leg to be honest about, so this settles immediately.
@@ -219,7 +266,9 @@ export async function settleClaimedRefund(
         // shows "Refund Initiated" and the admin badge "Refund Pending" — so
         // the only thing that was ever missing was the server telling the
         // truth about which one applied.
-        refundStatus: isConfirmed ? 'processed' : 'pending',
+        refundStatus: isConfirmed
+          ? ledgerService.ORDER_REFUND_STATUS.processed
+          : ledgerService.ORDER_REFUND_STATUS.pending,
         refundAmount: amount,
       },
     });
@@ -237,7 +286,9 @@ export async function settleClaimedRefund(
         counterparty: 'STUDENT',
         createdBy: options.createdBy,
         orderId: request.orderId,
-        eventId: `refund:${request.id}`,
+        // Per attempt: a retry must be a new entry, not a duplicate of the one
+        // whose reversal already credited the shop back.
+        eventId: ledgerService.refundLedgerEventId(request.id, attempt),
         // The student has already been refunded by Razorpay at this point. If
         // the shop's balance no longer covers it — because they were paid out
         // in the meantime — the shortfall becomes debt offset against future
@@ -281,6 +332,43 @@ export async function settleClaimedRefund(
 }
 
 /**
+ * Statuses an existing refund claim may be taken over from when the order it
+ * belongs to is cancelled.
+ *
+ * `REJECTED_BY_SHOP` is here, and its absence was a bug: the list read as
+ * "already settled or already denied", but a rejected claim is neither — the
+ * student can still escalate it. So this sequence, all of it reachable through
+ * the UI, left a paid order cancelled with the money kept:
+ *
+ *   1. student raises a refund claim; the shop rejects it
+ *   2. the shop then cancels the order, which it may do from PENDING_APPROVAL,
+ *      PRINTING or READY_FOR_PICKUP
+ *   3. this returned null — no refund issued, none queued
+ *
+ * The rejected claim was an argument about a *dispute*. A cancellation is the
+ * shop deciding unilaterally that the order will not be fulfilled, and that
+ * has to return the money whatever was argued earlier.
+ *
+ * `REFUND_FAILED` is deliberately excluded. Those rows belong to the admin and
+ * shop retry paths, which clear the dead gateway id and advance the attempt
+ * counter before trying again; re-claiming one here would reuse a spent
+ * idempotency key. `RESOLVED_*` and `REFUND_SETTLED_OFFLINE` are excluded
+ * because they are genuinely finished.
+ *
+ * Named and exported so it sits beside `SHOP_CLAIMABLE_STATUSES`,
+ * `ADMIN_ACTIONABLE_STATUSES` and `ADMIN_APPROVABLE_STATUSES` rather than
+ * being a fourth inline copy — which is exactly how it came to disagree with
+ * them.
+ */
+export const CANCELLATION_CLAIMABLE_STATUSES: RefundRequestStatus[] = [
+  'PENDING_SHOP',
+  'APPROVED_BY_SHOP',
+  'REJECTED_BY_SHOP',
+  'ESCALATED_TO_ADMIN',
+  'AUTO_ESCALATED',
+];
+
+/**
  * Create the refund request for an order being cancelled after payment.
  *
  * Runs inside the caller's cancellation transaction so the request cannot
@@ -301,8 +389,8 @@ export async function claimCancellationRefund(
   const existing = await tx.refundRequest.findUnique({ where: { orderId: order.id } });
 
   if (existing) {
-    // Already settled or already denied — leave it be.
-    if (!['PENDING_SHOP', 'APPROVED_BY_SHOP', 'ESCALATED_TO_ADMIN', 'AUTO_ESCALATED'].includes(existing.status)) {
+    // Nothing left to take over — see CANCELLATION_CLAIMABLE_STATUSES.
+    if (!CANCELLATION_CLAIMABLE_STATUSES.includes(existing.status)) {
       return null;
     }
 
@@ -333,8 +421,20 @@ export async function claimCancellationRefund(
 // SHOP-INITIATED REFUNDS
 // ────────────────────────────────────────────────────────────
 
-/** Statuses a refund claim can still be taken over from. */
-const CLAIMABLE_STATUSES: RefundRequestStatus[] = [
+/**
+ * Statuses a shop may take a refund claim over from.
+ *
+ * Exported alongside the admin lists below so every caller reads the same
+ * definition. They used to be written out inline at each call site, and the
+ * copies drifted: `REFUND_FAILED` was added here so a shop could retry a
+ * refund the gateway had rejected, and the admin route's own list — the one
+ * the enum, the cleanup service and the failure notification all promise will
+ * work — was left without it. A failed refund had no way forward at all.
+ *
+ * Adding a status to the lifecycle now means adding it in one place per role,
+ * with the three roles visible together.
+ */
+export const SHOP_CLAIMABLE_STATUSES: RefundRequestStatus[] = [
   'PENDING_SHOP',
   'APPROVED_BY_SHOP',
   'REJECTED_BY_SHOP',
@@ -342,6 +442,35 @@ const CLAIMABLE_STATUSES: RefundRequestStatus[] = [
   'AUTO_ESCALATED',
   'REFUND_FAILED',
 ];
+
+/**
+ * Statuses an admin may act on — deny, or approve into a gateway refund.
+ *
+ * `REFUND_FAILED` belongs here because that state exists precisely so an admin
+ * can retry: Razorpay rejected the transfer, the shop's deduction has been
+ * reversed, and somebody has to decide what happens next.
+ */
+export const ADMIN_ACTIONABLE_STATUSES: RefundRequestStatus[] = [
+  'ESCALATED_TO_ADMIN',
+  'APPROVED_BY_SHOP',
+  'AUTO_ESCALATED',
+  'REFUND_FAILED',
+];
+
+/**
+ * What an approval may additionally re-drive.
+ *
+ * `PROCESSING_REFUND` is approvable but not deniable: a refund already in
+ * flight can be pushed along when it has stalled, but denying one whose money
+ * may already have moved is not a decision this endpoint can honour.
+ */
+export const ADMIN_APPROVABLE_STATUSES: RefundRequestStatus[] = [
+  ...ADMIN_ACTIONABLE_STATUSES,
+  'PROCESSING_REFUND',
+];
+
+/** Kept for the shop path's existing call site. */
+const CLAIMABLE_STATUSES = SHOP_CLAIMABLE_STATUSES;
 
 export interface ShopRefundOutcome {
   /** True when the money has actually moved. False means it is waiting on an admin. */

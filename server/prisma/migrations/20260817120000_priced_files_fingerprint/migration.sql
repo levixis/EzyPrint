@@ -1,0 +1,41 @@
+-- ─────────────────────────────────────────────────────────────
+-- Record which file set an order's price was computed from.
+--
+-- One additive, nullable column. No backfill, no rewrite, no index, no
+-- constraint. Nothing existing is read or changed, so this cannot affect an
+-- order, a balance, a payment or an auth record, and the currently deployed
+-- server — which does not know the column exists — is unaffected by it.
+--
+-- WHY
+--
+-- An order's price is frozen when its Razorpay order is minted:
+-- `repriceFromVerifiedPages` runs once, immediately before the gateway call,
+-- and nothing re-prices afterwards. So the amount charged and the file set the
+-- shop is handed are the same thing only by convention — nothing verified it.
+--
+-- The upload path now refuses to change files once a price has been quoted,
+-- which stops this at the door. This column is the second half: proof at the
+-- moment money is confirmed. `payment.captured` and the signature callback both
+-- re-hash the order's current files and compare. A mismatch means the order is
+-- not handed to the shop; it is flagged for review with the payment intact.
+--
+-- Verifying by re-pricing instead would have been wrong: that recomputes with
+-- the shop's *current* rates, and shops change their rates, so a legitimate
+-- payment made either side of a price change would read as tampering. Hashing
+-- the file set separates what the student controls (the files) from what the
+-- shop controls (the rates), and only the first is being asserted here.
+--
+-- NULL SEMANTICS — deliberate, and the reason there is no backfill.
+--
+-- Null means "no fingerprint was recorded for this order". Every order that
+-- exists when this ships carries null, and the check treats null as "nothing to
+-- compare" and passes. It must: a fingerprint invented now would describe the
+-- files as they are today, not as they were when the order was priced, so
+-- backfilling would manufacture evidence rather than record it.
+--
+-- The practical consequence is that orders already at checkout when this
+-- deploys are covered by the upload guard alone, not by this check. That
+-- population drains within one checkout window.
+-- ─────────────────────────────────────────────────────────────
+
+ALTER TABLE "orders" ADD COLUMN "pricedFilesFingerprint" TEXT;

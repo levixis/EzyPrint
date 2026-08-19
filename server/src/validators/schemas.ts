@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { isUsablePageRate, pageRateFloorMessage } from '../services/pricing.service';
 
 /**
  * Zod Validation Schemas — server-side input validation for ALL endpoints.
@@ -14,12 +15,21 @@ import { z } from 'zod';
 // SHARED VALIDATORS
 // ────────────────────────────────────────────────────────────
 
+/**
+ * Order matters here: trim and fold case *before* validating the format.
+ *
+ * The chain used to end `.email().max(255).toLowerCase().trim()`, which checks
+ * the shape first — so an address pasted with a trailing space, which phone
+ * keyboards and copy-from-email routinely produce, was rejected as "Invalid
+ * email format" rather than cleaned up. Normalising first also means the value
+ * stored and matched is the canonical one.
+ */
 const email = z
   .string()
-  .email('Invalid email format')
-  .max(255, 'Email too long')
+  .trim()
   .toLowerCase()
-  .trim();
+  .email('Invalid email format')
+  .max(255, 'Email too long');
 
 /**
  * Password: 8-72 chars (bcrypt truncates at 72), must include:
@@ -176,17 +186,55 @@ export const listUsersSchema = z.object({
 // SHOP SCHEMAS
 // ────────────────────────────────────────────────────────────
 
+/**
+ * A shop's saved bank account or UPI handle.
+ *
+ * Declared here for two reasons. It is what a payout is sent to, and until now
+ * it reached `prisma.payoutMethod.createMany` entirely unvalidated — any
+ * length, any shape, an IFSC that is not one.
+ *
+ * It also has to be declared for `validate` to be able to strip anything it
+ * does not recognise: an undeclared field is dropped, and dropping this one
+ * would silently wipe a shop's payout details on their next settings save.
+ * Every field the service reads is named.
+ */
+const payoutMethod = z.object({
+  // Optional: sent back when editing an existing method, so the row keeps its
+  // id across the delete-and-recreate the service performs.
+  id: z.string().max(64).optional(),
+  type: z.enum(['BANK_ACCOUNT', 'UPI']),
+  accountHolderName: z.string().max(200).optional(),
+  accountNumber: z.string().max(50).optional(),
+  ifscCode: z.string().regex(/^[A-Z]{4}0[A-Z0-9]{6}$/, 'Invalid IFSC Code format').optional(),
+  bankName: z.string().max(200).optional(),
+  upiId: z.string().max(100).optional(),
+  isPrimary: z.boolean().optional(),
+  nickname: z.string().max(100).optional(),
+}).refine(
+  (pm) => (pm.type === 'UPI' ? !!pm.upiId : !!pm.accountNumber && !!pm.ifscCode),
+  { message: 'A UPI method needs a UPI id; a bank method needs an account number and IFSC code' }
+);
+
 export const updateShopSchema = z.object({
   body: z.object({
+    // Capped: a settings save rewrites every row, so an unbounded array is an
+    // unbounded write.
+    payoutMethods: z.array(payoutMethod).max(10).optional(),
     // Paise, and whole ones — a fraction of a paise cannot be charged, and
     // rounding it later is how a quote stops matching the amount taken.
     //
     // The ceiling reads 100000 rather than 1000 because these became paise:
     // the old cap was ₹1000 per page and had silently tightened to ₹10, so a
     // shop pricing colour above that was rejected as invalid.
+    // The floor rejects the rupees-as-paise unit bug at its remaining entry
+    // path. A price between 1 and 49 paise is a hundredth of a rupee a page —
+    // never a real offer, and exactly what arrives when a caller sends rupees
+    // into a paise field. Zero stays legal: a free B&W tier is a real thing.
     pricing: z.object({
-      bwPerPage: z.number().int('Price must be a whole number of paise').min(0).max(100_000),
-      colorPerPage: z.number().int('Price must be a whole number of paise').min(0).max(100_000),
+      bwPerPage: z.number().int('Price must be a whole number of paise').min(0).max(100_000)
+        .refine(isUsablePageRate, { message: pageRateFloorMessage('B/W') }),
+      colorPerPage: z.number().int('Price must be a whole number of paise').min(0).max(100_000)
+        .refine(isUsablePageRate, { message: pageRateFloorMessage('Colour') }),
     }).optional(),
     isOpen: z.boolean().optional(),
     contactPhone: z.string().max(20).optional(),
@@ -212,7 +260,17 @@ export const createOrderSchema = z.object({
     files: z.array(z.object({
       fileName: z.string().min(1).max(500),
       fileType: z.string().min(1).max(50),
-      fileStoragePath: z.string().max(1000).optional(),
+      // `fileStoragePath` and `fileSizeBytes` are deliberately NOT accepted
+      // here. A storage key is proof of possession — it is what
+      // `verifyStorageAccess` resolves back to an owner to decide who may
+      // download a document. Taking one from the request body let a caller
+      // attach somebody else's key to their own order and then read that
+      // person's file through their own ownership of the order they had just
+      // created. Scanned IDs and coursework are what is in that bucket.
+      //
+      // The upload endpoints are the only legitimate way a key reaches the
+      // database, and they already verify the order belongs to the caller
+      // before linking. Order creation writes the rows; upload fills them in.
       fileSizeBytes: z.number().int().positive().optional(),
       copies: z.number().int().min(1).max(999),
       color: z.enum(['BLACK_WHITE', 'COLOR']),
@@ -225,12 +283,27 @@ export const createOrderSchema = z.object({
   }),
 });
 
+/**
+ * REFUNDED is deliberately absent.
+ *
+ * It is a legal edge in VALID_TRANSITIONS and ADMIN bypasses the per-role
+ * table, so an admin could set it here — moving no money, creating no
+ * RefundRequest, writing no REFUND_DEDUCTION and consuming no OTP. The order
+ * then read as refunded on every dashboard while the student had received
+ * nothing and the shop kept its earning. Worse, REFUNDED is terminal for files,
+ * and with no refund request in existence `hasOpenDispute` found nothing to
+ * protect — so the documents were destroyed immediately, taking the evidence
+ * for the refund that now had to be issued by hand.
+ *
+ * The refund routes are the only way to this status. They own the gateway call,
+ * the ledger entry and the step-up code.
+ */
 export const updateOrderStatusSchema = z.object({
   body: z.object({
     status: z.enum([
       'PENDING_PAYMENT', 'PENDING_APPROVAL', 'PRINTING',
       'READY_FOR_PICKUP', 'COMPLETED', 'CANCELLED',
-      'PAYMENT_FAILED', 'REFUNDED',
+      'PAYMENT_FAILED',
     ]),
     shopNotes: z.string().max(1000).optional(),
   }),

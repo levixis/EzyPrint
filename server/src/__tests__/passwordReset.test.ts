@@ -14,6 +14,7 @@
  */
 
 const mockUserFindUnique = jest.fn();
+const mockUserFindFirst = jest.fn();
 const mockUserUpdate = jest.fn();
 const mockTokenUpdateMany = jest.fn();
 const mockTransaction = jest.fn();
@@ -22,6 +23,10 @@ jest.mock('../utils/prisma', () => ({
   prisma: {
     user: {
       findUnique: (...a: unknown[]) => mockUserFindUnique(...a),
+      // Email lookups fall back to a case-insensitive match when the exact
+      // form is not stored, so that an address registered as `Name@gmail.com`
+      // can still request and use a reset code typed in lower case.
+      findFirst: (...a: unknown[]) => mockUserFindFirst(...a),
       update: (...a: unknown[]) => mockUserUpdate(...a),
     },
     refreshToken: { updateMany: (...a: unknown[]) => mockTokenUpdateMany(...a) },
@@ -48,6 +53,8 @@ const USER = { id: 'user_1', email: 'student@campus.edu', name: 'Asha' };
 beforeEach(() => {
   jest.clearAllMocks();
   mockUserFindUnique.mockResolvedValue(USER);
+  // No case-variant row unless a test says otherwise: the exact match answers.
+  mockUserFindFirst.mockResolvedValue(null);
   mockIssueOtp.mockResolvedValue('123456');
   mockSendResetEmail.mockResolvedValue(undefined);
   mockConsumeOtp.mockResolvedValue(undefined);

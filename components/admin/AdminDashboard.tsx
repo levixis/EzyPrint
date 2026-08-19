@@ -311,14 +311,14 @@ const AdminDashboard: React.FC = () => {
 
   // Helper: derive payment tracking status for display
   const getPaymentTrackingStatus = (order: DocumentOrder): { label: string; icon: string; color: string } => {
-    if (order.refundId && order.refundStatus !== 'FAILED') {
+    if (order.refundId && order.refundStatus !== 'failed') {
       return {
         label: order.refundStatus === 'processed' ? 'Refunded' : 'Refund Pending',
         icon: '🔄',
         color: 'bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-400',
       };
     }
-    if (order.refundStatus === 'FAILED') {
+    if (order.refundStatus === 'failed') {
       return {
         label: 'Refund Failed',
         icon: '⚠️',
@@ -1055,9 +1055,9 @@ const AdminDashboard: React.FC = () => {
                                             )}
                                             {order.refundedAt && (
                                               <div className="relative">
-                                                <div className={`absolute -left-[17px] top-0.5 w-2 h-2 rounded-full ${order.refundStatus === 'FAILED' ? 'bg-red-500' : 'bg-purple-500'}`}></div>
-                                                <p className={`text-xs font-medium ${order.refundStatus === 'FAILED' ? 'text-red-600 dark:text-red-400' : 'text-purple-600 dark:text-purple-400'}`}>
-                                                  {order.refundStatus === 'FAILED' ? 'Refund Failed ⚠️' : `Refund ${order.refundStatus === 'processed' ? 'Processed' : 'Initiated'} 🔄`}
+                                                <div className={`absolute -left-[17px] top-0.5 w-2 h-2 rounded-full ${order.refundStatus === 'failed' ? 'bg-red-500' : 'bg-purple-500'}`}></div>
+                                                <p className={`text-xs font-medium ${order.refundStatus === 'failed' ? 'text-red-600 dark:text-red-400' : 'text-purple-600 dark:text-purple-400'}`}>
+                                                  {order.refundStatus === 'failed' ? 'Refund Failed ⚠️' : `Refund ${order.refundStatus === 'processed' ? 'Processed' : 'Initiated'} 🔄`}
                                                 </p>
                                                 <p className="text-[10px] text-gray-400">{new Date(order.refundedAt).toLocaleString()}</p>
                                               </div>
@@ -1104,13 +1104,13 @@ const AdminDashboard: React.FC = () => {
                                               <div>
                                                 <p className="text-[10px] text-gray-400 dark:text-gray-500">Status</p>
                                                 <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
-                                                  order.refundStatus === 'FAILED'
+                                                  order.refundStatus === 'failed'
                                                     ? 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400'
                                                     : order.refundStatus === 'processed'
                                                       ? 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400'
                                                       : 'bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400'
                                                 }`}>
-                                                  {order.refundStatus === 'FAILED' ? '❌ Failed' :
+                                                  {order.refundStatus === 'failed' ? '❌ Failed' :
                                                    order.refundStatus === 'processed' ? '✅ Processed' : '⏳ Pending'}
                                                 </span>
                                               </div>
@@ -1124,7 +1124,7 @@ const AdminDashboard: React.FC = () => {
                                                 <p className="text-xs text-red-500 bg-red-50 dark:bg-red-900/20 px-2 py-1 rounded">Error: {order.refundError}</p>
                                               )}
                                               {/* Retry refund if it failed */}
-                                              {order.refundStatus === 'FAILED' && order.razorpayPaymentId && (
+                                              {order.refundStatus === 'failed' && order.razorpayPaymentId && (
                                                 <Button
                                                   size="sm"
                                                   variant="primary"

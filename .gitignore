@@ -28,8 +28,6 @@ android/app/build/
 android/.gradle/
 android/build/
 android/app/google-services.json
-ios/App/Pods/
-ios/DerivedData/
 
 # ── SECURITY: Never commit secrets ──
 # Environment variables (Razorpay keys, API secrets, etc.)
@@ -76,3 +74,15 @@ test-render.tsx
 # published; it does not retract what is already there.
 AI_STATE_HANDOFF.md
 LAUNCH_RUNBOOK.md
+
+# Bug-hunt output — same policy as the handover docs above, more so.
+#
+# BUG_HUNT_REPORT.md catalogues every finding from the security review with the
+# exact sequence that triggers each one, which of them are mitigated rather than
+# fixed, and which are still open. pricing-audit.sql carries schema-level
+# queries against live financial tables.
+#
+# Publishing that to a public repo in the same push that fixes the findings
+# hands over a tested exploit list — including the parts that are not fixed yet.
+# Kept on disk, maintained, and not pushed.
+codebase-analysis-docs/

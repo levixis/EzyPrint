@@ -6,7 +6,7 @@ import { enqueueShopEvent, publishQueued } from './realtime.service';
 import { claimCancellationRefund, settleClaimedRefund } from './refund.service';
 import { purgeOrderFiles, isTerminalForFiles } from './cleanup.service';
 import * as notify from './notify.service';
-import type { OrderStatus, PrintColor } from '@prisma/client';
+import type { OrderStatus, PrintColor, Prisma, PrismaClient } from '@prisma/client';
 import crypto from 'crypto';
 
 /**
@@ -117,7 +117,6 @@ interface CreateOrderInput {
   files: Array<{
     fileName: string;
     fileType: string;
-    fileStoragePath?: string;
     fileSizeBytes?: number;
     pageCount: number;
     color: PrintColor;
@@ -163,8 +162,38 @@ export async function createOrder(input: CreateOrderInput) {
   // Generate a 6-digit pickup code
   const pickupCode = crypto.randomInt(100000, 999999).toString();
 
+  /**
+   * The file fields an order may be created with, named one by one.
+   *
+   * Deliberately not `...f`. The controller reaches here as `{ ...req.body }`,
+   * so anything the client sends is in scope, and `fileStoragePath` used to be
+   * among the fields written straight through. A storage key is proof of
+   * possession — it is what `verifyStorageAccess` resolves back to an owner to
+   * decide who may download a document — so accepting one from the request let
+   * a caller attach somebody else's key to their own order and then read that
+   * person's file through their own ownership of it. Scanned IDs and coursework
+   * are what is in that bucket.
+   *
+   * `createOrderSchema` also drops the field, but that is not what makes this
+   * safe: `validate` parses for errors and does not write the parsed body back,
+   * so Zod's stripping never reaches the handler. This allowlist is the control
+   * that actually holds, and it holds no matter how the caller got here.
+   *
+   * Storage keys are set by the upload endpoints, which verify the order
+   * belongs to the caller before linking anything to it.
+   */
+  const files = input.files.map((f) => ({
+    fileName: f.fileName,
+    fileType: f.fileType,
+    fileSizeBytes: f.fileSizeBytes,
+    pageCount: f.pageCount,
+    color: f.color,
+    copies: f.copies,
+    doubleSided: f.doubleSided,
+  }));
+
   // Legacy fields fallback from first file
-  const firstFile = input.files[0];
+  const firstFile = files[0];
 
   const order = await prisma.order.create({
     data: {
@@ -173,7 +202,9 @@ export async function createOrder(input: CreateOrderInput) {
       shopName: shop.name,
       fileName: firstFile.fileName,
       fileType: firstFile.fileType,
-      fileStoragePath: firstFile.fileStoragePath,
+      // No `fileStoragePath` here either: the order's copy is denormalised from
+      // the first file, and the upload endpoint fills it in once it has checked
+      // the order belongs to the caller.
       fileSizeBytes: firstFile.fileSizeBytes,
       copies: firstFile.copies,
       color: firstFile.color,
@@ -187,18 +218,7 @@ export async function createOrder(input: CreateOrderInput) {
       userName: input.userName,
       isPremiumOrder: input.isPremiumOrder || false,
       status: 'PENDING_PAYMENT',
-      files: {
-        create: input.files.map((f) => ({
-          fileName: f.fileName,
-          fileType: f.fileType,
-          fileStoragePath: f.fileStoragePath,
-          fileSizeBytes: f.fileSizeBytes,
-          pageCount: f.pageCount,
-          color: f.color,
-          copies: f.copies,
-          doubleSided: f.doubleSided,
-        })),
-      },
+      files: { create: files },
     },
     select: orderSelect,
   });
@@ -375,6 +395,20 @@ export async function updateOrderStatus(
   // Without this a student could drive any order by id, not just their own.
   if (requesterType === 'STUDENT' && order.userId !== requesterId) {
     throw ApiError.forbidden('This is not your order');
+  }
+
+  // REFUNDED is reachable only by actually refunding.
+  //
+  // Defence in depth behind `updateOrderStatusSchema`, which no longer offers
+  // the value: this is a service other code calls, and the status means "the
+  // student got their money back". Setting it without moving money makes every
+  // dashboard state something untrue and destroys the order's files on the way
+  // out. `settleClaimedRefund` and `applyRefundProcessed` write it once the
+  // gateway confirms, which is the only place that can honestly claim it.
+  if (newStatus === 'REFUNDED') {
+    throw ApiError.badRequest(
+      'An order becomes REFUNDED by refunding it. Resolve the refund request instead.'
+    );
   }
 
   // Legality of the transition, independent of who is asking.
@@ -559,6 +593,79 @@ function formatOrder(order: any) {
 // ────────────────────────────────────────────────────────────
 // PRICE VERIFICATION
 // ────────────────────────────────────────────────────────────
+
+/**
+ * A hash of everything about an order's files that its price was computed from.
+ *
+ * Ordered by `OrderFile.id`, which is the ordering every other read of these
+ * rows already uses, so the same file set always hashes the same way.
+ *
+ * `verifiedPageCount` is the figure pricing uses, falling back to the
+ * client-claimed `pageCount` for orders predating server-side counting — the
+ * same fallback `repriceFromVerifiedPages` makes, so the hash describes exactly
+ * the inputs that produced the price.
+ *
+ * `fileStoragePath` is included even though it does not affect the price. Two
+ * different documents with identical page counts cost the same, so a swap
+ * between them is invisible to any amount-based check — but it is still a
+ * substitution of what the shop was asked to print, after the shop approved it.
+ * The key is the only thing that distinguishes them.
+ *
+ * Shop rates are deliberately *not* in here. Rates are the shop's to change and
+ * change legitimately between checkout and capture; folding them in would make
+ * an ordinary price update look like tampering.
+ */
+export async function fingerprintPricedFiles(
+  client: Prisma.TransactionClient | PrismaClient,
+  orderId: string
+): Promise<string> {
+  const files = await client.orderFile.findMany({
+    where: { orderId },
+    orderBy: { id: 'asc' },
+    select: {
+      id: true,
+      verifiedPageCount: true,
+      pageCount: true,
+      color: true,
+      copies: true,
+      doubleSided: true,
+      fileStoragePath: true,
+    },
+  });
+
+  const canonical = files
+    .map((f) =>
+      [
+        f.id,
+        f.verifiedPageCount ?? f.pageCount,
+        f.color,
+        f.copies,
+        f.doubleSided ? 'D' : 'S',
+        f.fileStoragePath ?? '',
+      ].join(':')
+    )
+    .join('|');
+
+  return crypto.createHash('sha256').update(canonical).digest('hex');
+}
+
+/**
+ * Whether an order's files are still the ones its price was computed from.
+ *
+ * A null fingerprint passes. That is not a gap being waved through — it means
+ * the order was priced before this check existed, so there is genuinely nothing
+ * to compare against, and refusing would strand payments that are perfectly
+ * legitimate. Those orders are covered by the upload guard instead.
+ */
+export async function pricedFilesUnchanged(
+  client: Prisma.TransactionClient | PrismaClient,
+  order: { id: string; pricedFilesFingerprint: string | null }
+): Promise<boolean> {
+  if (!order.pricedFilesFingerprint) return true;
+
+  const current = await fingerprintPricedFiles(client, order.id);
+  return current === order.pricedFilesFingerprint;
+}
 
 export interface RepriceResult {
   /** True when the verified price differs from what the order currently says. */

@@ -136,6 +136,7 @@ export async function purgeTicketAttachments(ticketId: string): Promise<number> 
   });
 
   let removed = 0;
+  let failed = 0;
 
   for (const attachment of attachments) {
     try {
@@ -143,16 +144,27 @@ export async function purgeTicketAttachments(ticketId: string): Promise<number> 
       await prisma.ticketAttachment.delete({ where: { id: attachment.id } });
       removed++;
     } catch (error) {
+      failed++;
       console.error(`[cleanup] could not delete ${attachment.storageKey} for ticket ${ticketId}:`, error);
     }
   }
 
-  // Stamped even when there was nothing to remove, so the sweep stops
-  // reconsidering this ticket.
-  await prisma.ticket.updateMany({
-    where: { id: ticketId },
-    data: { attachmentsCleanedAt: new Date(), attachmentPaths: [] },
-  });
+  // Stamped only when there is genuinely nothing left, which includes the case
+  // where there was nothing to remove in the first place — that ticket is done
+  // and the sweep should stop reconsidering it.
+  //
+  // It used to be stamped unconditionally, and `sweepUndeletedFiles` selects on
+  // `attachmentsCleanedAt: null`. So a single failed delete — a few seconds of
+  // R2 being unreachable is enough — marked the ticket clean forever while its
+  // attachments stayed in the bucket. `purgeOrderFiles` gets this right twenty
+  // lines above, and says why: the flag is the source of truth, so it must not
+  // claim a file is gone while the bytes are still there.
+  if (failed === 0) {
+    await prisma.ticket.updateMany({
+      where: { id: ticketId },
+      data: { attachmentsCleanedAt: new Date(), attachmentPaths: [] },
+    });
+  }
 
   return removed;
 }

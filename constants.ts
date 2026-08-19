@@ -18,9 +18,17 @@ export const SUPPORTED_MIME_TYPES = [
   'image/jpeg', 'image/png', 'image/webp',
 ];
 
-// Default pricing for new shops, can be overridden by shop owner
+/**
+ * Default pricing for new shops, in PAISE. Overridable by the shop owner.
+ *
+ * These read 100 and 300 (₹1.00 and ₹3.00), not 1 and 3. The rupee figures are
+ * what they were before money became paise, and leaving them here — inert, but
+ * one import away from being used — is how that bug gets reintroduced. The
+ * server does not read this: `Shop.bwPerPage` / `colorPerPage` carry the same
+ * defaults in schema.prisma, which is the authority.
+ */
 export const DEFAULT_SHOP_PRICING = {
-  bwPerPage: 1,
-  colorPerPage: 3,
+  bwPerPage: 100,
+  colorPerPage: 300,
 };
 

@@ -306,6 +306,20 @@ model Order {
   paymentAttemptedAt DateTime?
   paymentVerifiedVia String?
 
+  /// Hash of the file set this order's price was computed from, stamped at the
+  /// moment the Razorpay order is created and never rewritten.
+  ///
+  /// The price is frozen when the gateway order is minted, so "the files the
+  /// student was charged for" and "the files the shop is handed" are only the
+  /// same thing if something checks. This is that something: at capture, the
+  /// current file set is re-hashed and compared, and a mismatch means the order
+  /// is not fulfilled — it is flagged for a human instead.
+  ///
+  /// Nullable, and null means "no fingerprint was recorded". Orders created
+  /// before this column existed carry null and are not blocked by a check they
+  /// could never satisfy.
+  pricedFilesFingerprint String?
+
   // Refund tracking
   refundId                   String?
   refundStatus               String?
@@ -705,6 +719,25 @@ model RefundRequest {
   refundAmount     Int?
   razorpayRefundId String?
 
+  /// How many refund attempts the gateway has *failed* on this request.
+  ///
+  /// Counts abandoned attempts, not started ones, and is incremented only when
+  /// a refund is confirmed failed. The attempt now live is therefore
+  /// `attempts + 1`, and every idempotency key derived from this request — the
+  /// Razorpay `X-Refund-Idempotency` header and the shop's `REFUND_DEDUCTION`
+  /// ledger `eventId` — carries that number.
+  ///
+  /// Both halves of that matter:
+  ///
+  ///  - Keying on the request id alone meant a retry after a failure presented
+  ///    the key of the refund Razorpay had already failed, got that dead refund
+  ///    back, and issued nothing — while the ledger deduped the shop's
+  ///    deduction away, so nobody was charged for the refund either.
+  ///  - Counting *starts* rather than *failures* would break the opposite case:
+  ///    an attempt that succeeded at the gateway but lost its local transaction
+  ///    must retry under the same key, or the student is refunded twice.
+  attempts         Int                 @default(0)
+
   // Response tracking
   shopResponse   String?
   adminNote      String?
@@ -743,9 +776,24 @@ model WebhookEvent {
   processingError String?  // Error message if processing failed
   processedAt     DateTime?
 
+  /// Set by whichever delivery is currently processing this event.
+  ///
+  /// `processed` alone cannot serialize two concurrent deliveries: it is read
+  /// before the work starts and written after, so both see false and both run.
+  /// Claiming is a compare-and-swap on this column, and a claim older than the
+  /// TTL is reclaimable so a crashed processor cannot strand the event.
+  claimedAt       DateTime?
+  /// Failed processing attempts. Retries stop at MAX_WEBHOOK_ATTEMPTS so a
+  /// permanently unprocessable event is escalated once instead of being
+  /// re-attempted by every reconciliation pass forever.
+  attempts        Int      @default(0)
+
   createdAt DateTime @default(now())
 
   @@index([processed, createdAt])
+  /// The reconciliation sweep selects unprocessed events that still have
+  /// retries left, so it filters on both columns together.
+  @@index([processed, attempts])
   @@index([razorpayOrderId])
   @@map("webhook_events")
 }
@@ -892,6 +940,27 @@ model JobHeartbeat {
   /// takes 40x longer than usual is a warning ahead of an outage.
   lastDurationMs  Int?
   consecutiveFailures Int @default(0)
+
+  /// Lease held by the instance currently running this job, and when it lapses.
+  ///
+  /// Replaces the Postgres session-level advisory lock the scheduler used to
+  /// take. `pg_try_advisory_lock` and `pg_advisory_unlock` are scoped to a
+  /// session, and at runtime this connects through Neon's PgBouncer pooler
+  /// (see the `directUrl` note at the top of this file), where a session is not
+  /// pinned across statements — so the unlock could land on a different backend
+  /// than the lock, silently fail, and leave the job locked forever. Every
+  /// later run then read that as "another instance is running it" and skipped,
+  /// which would have stopped settlement, reconciliation and the payment audit
+  /// dead with nothing logged.
+  ///
+  /// A lease is used rather than a transaction-scoped advisory lock because
+  /// holding a transaction open for a job's whole duration pins a pooled
+  /// connection, and several of these jobs open their own transactions while
+  /// running — with a connection limit of 10 that is a route to the pool
+  /// deadlocking on itself. A lease row needs no connection held at all, and
+  /// expires on its own if the process dies.
+  lockedUntil DateTime?
+  lockedBy    String?
 
   updatedAt DateTime @updatedAt
 

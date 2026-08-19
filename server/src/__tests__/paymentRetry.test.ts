@@ -23,6 +23,9 @@ const mockOrderFindUnique = jest.fn();
 const mockOrderUpdateMany = jest.fn();
 const mockOrderFindMany = jest.fn();
 const mockWebhookFindMany = jest.fn();
+const mockWebhookUpdateMany = jest.fn();
+const mockWebhookUpdate = jest.fn();
+const mockOrderFindFirst = jest.fn();
 const mockOrdersFetch = jest.fn();
 const mockOrdersFetchPayments = jest.fn();
 const mockOrdersCreate = jest.fn();
@@ -37,7 +40,23 @@ jest.mock('../utils/prisma', () => ({
       updateMany: mockOrderUpdateMany,
       findMany: mockOrderFindMany,
     },
-    webhookEvent: { findMany: mockWebhookFindMany },
+    // `updateMany` is the processing claim: the sweep takes exclusive ownership
+    // of an event before reprocessing it, so it cannot run one that a live
+    // webhook delivery is working on at the same moment. `update` records a
+    // failed attempt and releases that claim.
+    webhookEvent: {
+      findMany: mockWebhookFindMany,
+      updateMany: mockWebhookUpdateMany,
+      update: mockWebhookUpdate,
+    },
+    // `processWebhookEvent` does its work in a transaction. Running the callback
+    // against the same doubles is enough here — this suite is about which
+    // events get dispatched, not about what the handlers write.
+    $transaction: (fn: (tx: unknown) => unknown) =>
+      fn({
+        order: { findFirst: mockOrderFindFirst, updateMany: mockOrderUpdateMany },
+        webhookEvent: { update: mockWebhookUpdate },
+      }),
   },
 }));
 
@@ -58,6 +77,10 @@ jest.mock('../services/notify.service', () => ({
 
 jest.mock('../services/order.service', () => ({
   repriceFromVerifiedPages: mockReprice,
+  // Stamped alongside `razorpayOrderId` — the moment the price is frozen is the
+  // moment the file set it was computed from has to be recorded.
+  fingerprintPricedFiles: jest.fn().mockResolvedValue('fp_at_checkout'),
+  pricedFilesUnchanged: jest.fn().mockResolvedValue(true),
 }));
 
 jest.mock('../services/ledger.service', () => ({}));
@@ -84,6 +107,11 @@ beforeEach(() => {
   mockReprice.mockResolvedValue({ changed: false, previousTotal: 12500, totalPrice: 12500, unverifiable: [] });
   mockOrderUpdateMany.mockResolvedValue({ count: 1 });
   mockNotifyNewOrder.mockResolvedValue(undefined);
+  // The sweep claims each event before reprocessing it; count 1 means this
+  // caller won the claim, which is the ordinary single-instance case.
+  mockWebhookUpdateMany.mockResolvedValue({ count: 1 });
+  mockWebhookUpdate.mockResolvedValue({ attempts: 1, eventType: 'payment.captured' });
+  mockOrderFindFirst.mockResolvedValue(null);
   // Fallback for reads the tests do not sequence explicitly — notably the one
   // announcePaidOrder makes after a recovery. `mockResolvedValueOnce` chains in
   // individual tests are consumed before this.
@@ -338,11 +366,31 @@ describe('reconciliation', () => {
   test('retries unprocessed webhooks even when no orders are stuck', async () => {
     mockOrderFindMany.mockResolvedValue([]);
     mockWebhookFindMany.mockResolvedValue([
-      { eventId: 'evt_1', eventType: 'payment.captured', payload: {} },
+      { eventId: 'evt_1', eventType: 'payment.captured', payload: { payload: { payment: { entity: {} } } } },
     ]);
 
     const result = await reconcilePayments(15);
 
     expect(result.retriedWebhooks).toBe(1);
+  });
+
+  /**
+   * An event another caller is already processing is left alone.
+   *
+   * The claim is what stops the sweep and a live webhook delivery running the
+   * same handler at the same moment. `retriedWebhooks` counts what this pass
+   * actually reprocessed rather than what it selected, so a lost claim reports
+   * honestly instead of taking credit for someone else's work.
+   */
+  test('skips an event whose claim is held by another caller', async () => {
+    mockOrderFindMany.mockResolvedValue([]);
+    mockWebhookFindMany.mockResolvedValue([
+      { eventId: 'evt_1', eventType: 'payment.captured', payload: { payload: { payment: { entity: {} } } } },
+    ]);
+    mockWebhookUpdateMany.mockResolvedValue({ count: 0 });
+
+    const result = await reconcilePayments(15);
+
+    expect(result.retriedWebhooks).toBe(0);
   });
 });

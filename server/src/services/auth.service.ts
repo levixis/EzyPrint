@@ -62,6 +62,40 @@ interface AuthResponse {
 }
 
 /**
+ * Match an email address without being defeated by capitalisation.
+ *
+ * `User.email` is unique and was matched exactly everywhere, while the schemas
+ * that lowercase it (`registerSchema`, `loginSchema`, `forgotPasswordSchema`)
+ * have no effect: `validate` parses the request to reject bad input and never
+ * writes the parsed body back, so Zod's `.toLowerCase()` never reaches a
+ * handler. The stored address is therefore whatever the user typed, and:
+ *
+ *   - signing in as `Name@gmail.com` after registering as `name@gmail.com`
+ *     failed with "invalid credentials", as did the password reset
+ *   - the same person could hold two accounts differing only in case
+ *
+ * Matching case-insensitively fixes both without touching stored data. The
+ * alternative — normalising input and lowercasing every existing row — would
+ * lock out anyone whose address is stored mixed-case until that migration ran,
+ * and would fail outright where two rows collide once folded.
+ *
+ * Exact match is attempted first. That keeps the common path on the unique
+ * index rather than a scan, and makes the result deterministic if two rows
+ * differing only in case already exist: the address as typed wins, instead of
+ * whichever row the database happened to return.
+ */
+export async function findUserIdByEmail(email: string): Promise<string | null> {
+  const exact = await prisma.user.findUnique({ where: { email }, select: { id: true } });
+  if (exact) return exact.id;
+
+  const insensitive = await prisma.user.findFirst({
+    where: { email: { equals: email, mode: 'insensitive' } },
+    select: { id: true },
+  });
+  return insensitive?.id ?? null;
+}
+
+/**
  * Register a new user with email and password.
  */
 export async function registerWithEmail(
@@ -71,8 +105,12 @@ export async function registerWithEmail(
 ): Promise<AuthResponse> {
   const { email, password, name, type, shopName, shopAddress, referralCode } = input;
 
-  // Check if email already exists
-  const existingUser = await prisma.user.findUnique({ where: { email } });
+  // Check if email already exists.
+  //
+  // Case-insensitively, or the same person registers twice by capitalising
+  // differently and then cannot tell which of the two accounts holds their
+  // orders — and for a shop owner, which one holds the money.
+  const existingUser = await findUserIdByEmail(email);
   if (existingUser) {
     throw ApiError.conflict('An account with this email already exists');
   }
@@ -133,8 +171,13 @@ export async function registerWithEmail(
           ownerUserId: newUser.id,
           name: shopName,
           address: shopAddress,
-          bwPerPage: 1,
-          colorPerPage: 3,
+          // Pricing is deliberately not set here — the schema holds the
+          // defaults (100 / 300 paise). These lines used to pass 1 and 3,
+          // rupee figures that survived the paise migration because it
+          // converted stored data rather than code, so every shop registered
+          // through this path priced a page at one paise. The Google path was
+          // corrected and this one was missed; both now defer to the schema,
+          // because one source of truth cannot drift from itself.
           isOpen: false,
           isApproved: false,
         },
@@ -183,11 +226,17 @@ export async function loginWithEmail(
   deviceInfo?: string,
   ip?: string
 ): Promise<AuthResponse> {
-  // Find user by email
-  const user = await prisma.user.findUnique({ 
-    where: { email },
-    include: { shop: { select: { id: true, name: true, isApproved: true, isArchived: true, isRejected: true, rejectionReason: true } } }
-  });
+  // Find user by email, tolerating capitalisation — signing in as
+  // `Name@gmail.com` having registered as `name@gmail.com` used to fail as
+  // "invalid email or password", which is indistinguishable from a wrong
+  // password and so was unreportable by the person it happened to.
+  const userId = await findUserIdByEmail(email);
+  const user = userId
+    ? await prisma.user.findUnique({
+        where: { id: userId },
+        include: { shop: { select: { id: true, name: true, isApproved: true, isArchived: true, isRejected: true, rejectionReason: true } } }
+      })
+    : null;
 
   if (!user || !user.password) {
     // Intentionally vague error — don't reveal if email exists
@@ -374,12 +423,17 @@ export async function loginWithGoogle(
 ): Promise<AuthResponse | { isNewUser: true; googleUser: GoogleUserInfo }> {
   const googleUser = await verifyGoogleToken(token);
 
-  // Check if user already exists (by googleId or email)
+  // Check if user already exists (by googleId or email).
+  //
+  // The email arm is case-insensitive for the same reason as the password
+  // path: an account registered as `Name@gmail.com` must be recognised when
+  // Google reports the address in lower case, or signing in with Google
+  // silently creates a second account rather than linking the existing one.
   let user = await prisma.user.findFirst({
     where: {
       OR: [
         { googleId: googleUser.googleId },
-        { email: googleUser.email },
+        { email: { equals: googleUser.email, mode: 'insensitive' } },
       ],
     },
     include: { shop: { select: { id: true, name: true, isApproved: true, isArchived: true, isRejected: true, rejectionReason: true } } },
