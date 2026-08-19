@@ -116,7 +116,15 @@ export function isHealthCheckPath(path: string): boolean {
 export const generalLimiter = rateLimit({
   ...shared,
   windowMs: 15 * 60 * 1000,
-  max: env.isDev ? 1000 : 100,
+  // 300, not 100. The bucket is per access token, and nobody had checked it
+  // against what the client actually sends: a signed-in session polled 165
+  // requests per fifteen minutes, so the app rate-limited its own users from
+  // about the nine-minute mark of every token lifetime. The client now sends
+  // far less (see POLL_INTERVAL / SLOW_POLL_INTERVAL in AppContext), and this
+  // is the headroom on top of that fix rather than a substitute for it — a
+  // student with a live order still sends ~120, which the old ceiling of 100
+  // would have refused even after the polling change.
+  max: env.isDev ? 1000 : 300,
   keyGenerator: tokenOrClientKey,
   skip: (req: Request) => isHealthCheckPath(req.path),
   message: {

@@ -221,6 +221,31 @@ const VALID_STATUS_TRANSITIONS: Record<string, string[]> = {
 // ── Polling interval (ms) — replaces Firebase onSnapshot real-time listeners ──
 const POLL_INTERVAL = 15_000; // 15 seconds
 
+/**
+ * Everything that is not an order the student is actively waiting on.
+ *
+ * Was 60s. At that rate a signed-in session spent 165 requests per fifteen
+ * minutes against a 100-request server budget, so the app rate-limited its own
+ * users: 429s from roughly the nine-minute mark of every access-token lifetime,
+ * and because the failure is a silent refetch it showed up as a screen that
+ * quietly stopped updating rather than as an error.
+ */
+const SLOW_POLL_INTERVAL = 5 * 60_000; // 5 minutes
+
+/**
+ * Order states worth polling for.
+ *
+ * These are the ones where the shop is going to change something and the
+ * student is watching for it. Everything else — paid-but-unconfirmed, finished,
+ * cancelled, refunded — either resolves through a different path or is not
+ * going to change again, so a timer asking about it is pure cost.
+ */
+const LIVE_ORDER_STATUSES: OrderStatus[] = [
+  OrderStatus.PENDING_APPROVAL,
+  OrderStatus.PRINTING,
+  OrderStatus.READY_FOR_PICKUP,
+];
+
 export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const [currentUser, setCurrentUserInternal] = useState<User | null>(null);
   const [isLoadingAuth, setIsLoadingAuth] = useState<boolean>(true);
@@ -685,34 +710,80 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
   }, [currentUser, fetchShops, fetchOrders, fetchNotifications, fetchPayouts, fetchTickets, fetchRefundRequests, fetchReactivationRequests, fetchStudentPassHolders]);
 
-  // Polling interval for data refresh
+  /**
+   * Whether this account has an order the shop is still going to act on.
+   *
+   * Drives the fast poll below. Admins are excluded deliberately: `orders` is
+   * the caller's own list, an admin's working set is `allOrders`, and putting
+   * the admin dashboard on a 15-second timer is how one signed-in operator
+   * costs more than the entire student body.
+   */
+  const hasLiveOrder = useMemo(
+    () =>
+      currentUser?.type !== UserType.ADMIN &&
+      orders.some((order) => LIVE_ORDER_STATUSES.includes(order.status)),
+    [orders, currentUser?.type]
+  );
+
+  /**
+   * Poll only while something is actually in flight.
+   *
+   * A timer is the wrong instrument for "tell me when my order is ready" and
+   * always was: a backgrounded app cannot poll at all — Android freezes the
+   * WebView's timers — so the notification a student actually needs has to
+   * arrive by push. Polling only keeps a foreground screen fresh, which is
+   * worth doing while the student is watching an order move and worth nothing
+   * the rest of the time.
+   *
+   * The order fetch is the only thing on the fast timer now. Notifications
+   * moved to the slow one: the push carrying a notification already triggers
+   * its own refetch (see the registerPushNotifications handler), so polling
+   * them every fifteen seconds was paying for the same data twice.
+   */
   useEffect(() => {
     if (!currentUser) return;
 
-    // Order status is what a student actively watches, so it stays on the fast
-    // interval. Shop owners get their orders pushed over the real-time channel
-    // instead — see useShopLedger.
-    const intervalId = setInterval(() => {
-      fetchOrders();
-      fetchNotifications();
-    }, POLL_INTERVAL);
+    const timers: ReturnType<typeof setInterval>[] = [];
 
-    // Everything that changes rarely. Shop listings in particular were being
-    // refetched every 15 seconds by every signed-in user, which alone kept the
-    // database from ever idling.
-    const slowIntervalId = setInterval(() => {
+    if (hasLiveOrder) {
+      timers.push(setInterval(() => { fetchOrders(); }, POLL_INTERVAL));
+    }
+
+    timers.push(setInterval(() => {
+      fetchNotifications();
       fetchShops();
       fetchPayouts();
       fetchTickets();
       fetchRefundRequests();
       fetchReactivationRequests();
-    }, POLL_INTERVAL * 4); // 60 seconds
+    }, SLOW_POLL_INTERVAL));
 
-    return () => {
-      clearInterval(intervalId);
-      clearInterval(slowIntervalId);
+    return () => { timers.forEach(clearInterval); };
+  }, [currentUser, hasLiveOrder, fetchOrders, fetchNotifications, fetchShops, fetchPayouts, fetchTickets, fetchRefundRequests, fetchReactivationRequests]);
+
+  /**
+   * Coming back to the tab is a better refresh signal than any interval.
+   *
+   * It is what makes dropping the idle poll safe: a student who left the app
+   * open on a finished order and comes back to it gets current data on the
+   * first frame they can see, rather than up to five minutes later. The native
+   * side has the same thing already, on `appStateChange`.
+   */
+  useEffect(() => {
+    if (!currentUser || Capacitor.isNativePlatform()) return;
+
+    const onFocus = () => {
+      if (document.visibilityState !== 'visible') return;
+      void fetchOrders();
     };
-  }, [currentUser, fetchOrders, fetchNotifications, fetchShops, fetchPayouts, fetchTickets, fetchRefundRequests, fetchReactivationRequests]);
+
+    document.addEventListener('visibilitychange', onFocus);
+    window.addEventListener('focus', onFocus);
+    return () => {
+      document.removeEventListener('visibilitychange', onFocus);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [currentUser, fetchOrders]);
 
   /**
    * Refetch orders the moment the app comes back to the foreground.
