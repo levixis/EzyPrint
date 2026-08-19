@@ -15,9 +15,9 @@ import { Card } from '../common/Card';
  *
  * A privacy policy that describes an intended system rather than the running
  * one is not a rounding error; it is the document with legal weight. Where
- * behaviour is imperfect — files on abandoned orders, deletion blocked for
- * accounts with financial history — it says so plainly rather than describing
- * the version that ships later.
+ * behaviour is imperfect — deletion is still blocked for accounts with
+ * financial history — it says so plainly rather than describing the version
+ * that ships later.
  */
 const LAST_UPDATED = '19 August 2026';
 
@@ -75,7 +75,7 @@ const PrivacyPolicyPage: React.FC = () => {
           <ul>
             <li><strong>When your order finishes.</strong> Once an order is Completed, Cancelled or Refunded, the file is deleted automatically — normally within minutes.</li>
             <li><strong>While a dispute is open.</strong> If you have raised a refund request or a support ticket about an order, the file is kept until that is resolved, because it is the only record of what was actually sent to the shop. It is deleted once the dispute closes.</li>
-            <li><strong>Orders that never finish.</strong> If an order never reaches one of those final states — most commonly an order you uploaded but never paid for — its file is currently retained rather than deleted. We are changing this so that unpaid orders are cancelled and their files deleted automatically. Until that ships, you can cancel such an order yourself from your order list, which deletes the file.</li>
+            <li><strong>Orders you never pay for.</strong> An order that is still unpaid after 3 days is cancelled automatically and its file deleted. You can also cancel it yourself at any time from your order list, which deletes the file immediately.</li>
           </ul>
           <p>Order records themselves — amounts, dates, statuses — are retained after the document is deleted, because they are financial records.</p>
 

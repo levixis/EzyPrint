@@ -5,6 +5,7 @@ import { reconcilePayments, auditCapturedPayments, reconcileStuckRefunds } from 
 import * as notify from './notify.service';
 import { dispatchOutbox, pruneOutbox } from './realtime.service';
 import { sweepUndeletedFiles } from './cleanup.service';
+import { expireStaleUnpaidOrders } from './payment.service';
 import { sweepExpiredReferralCodes } from './referral.service';
 import {
   recordJobStart,
@@ -351,6 +352,20 @@ export function startScheduler(): void {
 
   schedule('outbox-prune', 6 * 60 * 60 * 1000, async () => {
     await withJobLease('outbox-prune', () => pruneOutbox());
+  });
+
+  // Orders uploaded and never paid for. Both the inline purge and the retention
+  // sweep are gated on a terminal status, so these keep their documents
+  // indefinitely — and they are the largest population that never reaches one.
+  // Cancelling them hands the files to the machinery that already exists.
+  schedule('expire-unpaid', env.UNPAID_ORDER_EXPIRY_INTERVAL_MS, async () => {
+    const result = await withJobLease('expire-unpaid', () => expireStaleUnpaidOrders());
+    if (result && (result.cancelled > 0 || result.stillPaid > 0 || result.skipped > 0)) {
+      console.log(
+        `[scheduler] expire-unpaid cancelled ${result.cancelled} of ${result.examined} ` +
+        `(${result.stillPaid} turned out paid, ${result.skipped} left for the next run)`
+      );
+    }
   });
 
   // Backstop for the inline deletion that runs when an order finishes or a

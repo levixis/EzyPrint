@@ -35,6 +35,17 @@ import { isStudentPassActive } from './pricing.service';
 export const PAYMENT_CLAIM_TTL_MS = 60 * 1000;
 
 /**
+ * Who the expiry job acts as.
+ *
+ * `updateOrderStatus` takes a requester so it can enforce role rules, and a
+ * scheduled job has no user behind it. ADMIN is the right role — the job is
+ * doing what an operator would — and a synthetic id keeps it distinguishable
+ * from a real admin in the notification fan-out, which excludes the actor.
+ * Since no student holds this id, the student is always told.
+ */
+const SYSTEM_ACTOR_ID = 'system:expire-unpaid';
+
+/**
  * Tell the shop a paid order has arrived.
  *
  * Three independent paths move an order into PENDING_APPROVAL — signature
@@ -1326,6 +1337,105 @@ async function processWebhookEvent(eventType: string, event: any, eventId: strin
  *
  * Called by: a cron service hitting POST /api/v1/payments/reconcile
  */
+/**
+ * Cancel orders that were uploaded and never paid for, and let retention take
+ * their documents.
+ *
+ * Lives here rather than in `order.service` for two reasons: the question this
+ * job asks is "did this payment ever actually happen", which is payment
+ * reconciliation; and it needs `adoptCapturedPayment`, which is module-private
+ * here. `order.service` importing this file would also be a cycle — this one
+ * already imports that one.
+ *
+ * Cancelling rather than deleting the files directly is deliberate. CANCELLED
+ * is already a terminal status, so `updateOrderStatus` runs the existing
+ * retention path and there is no second definition anywhere of when bytes may
+ * go. Nulling `fileStoragePath` while leaving the order payable would produce
+ * an order that can still be paid for and has nothing to print.
+ *
+ * Why this exists at all: both the inline purge and the retention sweep are
+ * gated on a terminal status, so an order that never reaches one keeps its
+ * document forever. Most of that population is exactly this — uploaded, never
+ * paid, walked away. The app also told students their draft "will expire
+ * automatically", which was not true of anything until this ran.
+ */
+export async function expireStaleUnpaidOrders(
+  now: Date = new Date()
+): Promise<{ examined: number; cancelled: number; stillPaid: number; skipped: number }> {
+  const cutoff = new Date(now.getTime() - env.UNPAID_ORDER_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
+
+  const stale = await prisma.order.findMany({
+    where: {
+      status: { in: ['PENDING_PAYMENT', 'PAYMENT_FAILED'] },
+      uploadedAt: { lt: cutoff },
+    },
+    select: { id: true, status: true, razorpayOrderId: true, totalPrice: true },
+    // Bounded like every other sweep: a backlog is worked through over
+    // successive runs rather than in one transaction-hogging pass.
+    take: 100,
+  });
+
+  const result = { examined: stale.length, cancelled: 0, stillPaid: 0, skipped: 0 };
+
+  for (const order of stale) {
+    /**
+     * Ask the gateway before cancelling anything that ever reached checkout.
+     *
+     * A Razorpay order outlives our idea of the payment: the sheet can be
+     * completed days later, and a capture whose webhook was lost looks exactly
+     * like an abandoned draft from here. Cancelling one of those destroys the
+     * document for an order somebody actually paid for.
+     *
+     * Deliberately not relying on `reconcilePayments` having already adopted
+     * it. It almost certainly has, well inside three days — and that reasoning
+     * is precisely what would keep this check missing until the once-a-year
+     * case where it had not.
+     */
+    if (order.razorpayOrderId) {
+      let recovery: RecoveryOutcome;
+      try {
+        recovery = await adoptCapturedPayment({
+          id: order.id,
+          status: order.status,
+          razorpayOrderId: order.razorpayOrderId,
+          totalPrice: order.totalPrice,
+        });
+      } catch (error) {
+        // Fail closed. Not knowing whether money moved is not the same as
+        // knowing it did not, and the cost of guessing wrong here is a paid
+        // student's file deleted. Leave it for the next run.
+        console.error(`[expire-unpaid] gateway check failed for ${order.id}, leaving it:`, error);
+        result.skipped += 1;
+        continue;
+      }
+
+      if (recovery.outcome !== 'unpaid') {
+        // recovered / claimed_elsewhere: it was paid after all, and
+        // adoptCapturedPayment has just moved it on. needs_review: a human has
+        // to look, and it has already been flagged.
+        result.stillPaid += 1;
+        continue;
+      }
+    }
+
+    try {
+      // Through the ordinary transition, so the student is notified, the files
+      // are purged, and `claimCancellationRefund` gets its say — it returns
+      // null when `razorpayPaymentId` is null, so a genuinely unpaid order has
+      // no refund side effect.
+      await orderService.updateOrderStatus(order.id, 'CANCELLED', SYSTEM_ACTOR_ID, 'ADMIN');
+      result.cancelled += 1;
+    } catch (error) {
+      // Someone paid or cancelled it between the query and here; the status
+      // guard inside `updateOrderStatus` refused. Nothing to do.
+      console.error(`[expire-unpaid] could not cancel ${order.id}:`, error);
+      result.skipped += 1;
+    }
+  }
+
+  return result;
+}
+
 export async function reconcilePayments(thresholdMinutes: number = 15) {
   const threshold = new Date(Date.now() - thresholdMinutes * 60 * 1000);
 

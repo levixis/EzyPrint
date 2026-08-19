@@ -262,6 +262,23 @@ export const env = {
   OUTBOX_DISPATCH_INTERVAL_MS: intFromEnv('OUTBOX_DISPATCH_INTERVAL_MS', 10 * 1000),
   /** How often to retry file deletions the inline purge missed. */
   FILE_RETENTION_SWEEP_INTERVAL_MS: intFromEnv('FILE_RETENTION_SWEEP_INTERVAL_MS', 60 * 60 * 1000),
+
+  /**
+   * How long an order may sit unpaid before it is cancelled and its files
+   * deleted.
+   *
+   * Three days, not seven. The upload-then-pay flow is a single session, so a
+   * gap beyond a day is already abandonment in practice; the cost of being
+   * wrong is one re-upload, and what it buys is fewer document-days of scanned
+   * IDs and coursework sitting in object storage. When the downside of the
+   * tighter setting is that small and the thing being held is that sensitive,
+   * tighter wins.
+   *
+   * Whatever this is, the copy in `AppContext` has to say the same number — it
+   * is the only promise the app makes to a student about their own documents.
+   */
+  UNPAID_ORDER_EXPIRY_DAYS: intFromEnv('UNPAID_ORDER_EXPIRY_DAYS', 3),
+  UNPAID_ORDER_EXPIRY_INTERVAL_MS: intFromEnv('UNPAID_ORDER_EXPIRY_INTERVAL_MS', 60 * 60 * 1000),
   // ── Shop-initiated refunds ──
   /**
    * How much a shop can refund on its own authority before an admin is needed.

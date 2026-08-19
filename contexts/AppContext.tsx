@@ -1445,7 +1445,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       }
     } catch (uploadError: unknown) {
       addNotification({
-        message: `Upload failed: ${getErrorMessage(uploadError)}. Your draft order will expire automatically if payment is not completed.`,
+        message: `Upload failed: ${getErrorMessage(uploadError)}. Unpaid orders are cancelled after 3 days and their files deleted.`,
         type: 'error',
         targetUserId: userId
       });
