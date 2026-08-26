@@ -281,8 +281,14 @@ export async function createLedgerEntry(
     const shop = await tx.shop.findUnique({ where: { id: data.shopId } });
     if (!shop) throw ApiError.notFound('Shop not found');
 
-    if (!Number.isInteger(data.amount) || data.amount < 0) {
-      throw ApiError.badRequest('Ledger amount must be a non-negative whole number of paise');
+    // Zero is rejected, not just negatives. A zero-amount entry moves no money
+    // but still writes an immutable row, increments `financialVersion` and
+    // emits a real-time balance event — a movement in the ledger that did not
+    // move anything. No caller passes one today (`creditOrderEarning` returns
+    // early on a zero page cost, and `shopShareOfRefund`'s result is guarded by
+    // `> 0`), so this closes the hole before something starts.
+    if (!Number.isInteger(data.amount) || data.amount <= 0) {
+      throw ApiError.badRequest('Ledger amount must be a positive whole number of paise');
     }
 
     // Deterministic dedup: if this event was already recorded, do nothing

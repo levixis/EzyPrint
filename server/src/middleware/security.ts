@@ -49,7 +49,17 @@ function stripNullBytes(value: unknown): unknown {
 export function sanitizeBody(req: Request, _res: Response, next: NextFunction) {
   // Skip webhook routes and raw buffers to preserve the exact bytes the HMAC
   // was computed over.
-  if (req.originalUrl && req.originalUrl.includes('/webhook')) return next();
+  // Anchored on the route rather than matched as a substring. The exemption
+  // exists to preserve the exact bytes an HMAC was computed over, so it must
+  // apply to the webhook route and nothing that merely contains the word —
+  // `includes('/webhook')` would have handed the same pass to a future
+  // `/shops/webhook-test`.
+  //
+  // Reads `path` when Express has parsed one and falls back to `originalUrl`
+  // minus its query string, so this holds whether it is mounted on a real
+  // request or called directly.
+  const routePath = (req.path || req.originalUrl || '').split('?')[0];
+  if (routePath.endsWith('/payments/webhook')) return next();
   if (Buffer.isBuffer(req.body)) return next();
 
   if (req.body && typeof req.body === 'object') {
@@ -64,7 +74,10 @@ export function sanitizeBody(req: Request, _res: Response, next: NextFunction) {
 export function blockPathTraversal(req: Request, _res: Response, next: NextFunction) {
   const params = Object.values(req.params);
   const hasDotDot = params.some(
-    (p) => typeof p === 'string' && (p.includes('..') || p.includes('%2e%2e'))
+    // Percent-encoding is case-insensitive per RFC 3986, so `%2E%2E` and
+    // `%2e%2E` are the same sequence as `%2e%2e`. Matching only the lowercase
+    // form left the other three spellings through.
+    (p) => typeof p === 'string' && (p.includes('..') || p.toLowerCase().includes('%2e%2e'))
   );
   if (hasDotDot) {
     return _res.status(400).json({

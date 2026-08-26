@@ -73,6 +73,17 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * How long any single request may take before it is abandoned.
+ *
+ * Generous rather than tight: a cold Render instance genuinely takes ~30s to
+ * answer its first request. Shared by the refresh call and the main wrapper so
+ * the two cannot drift apart — the refresh used to have no deadline at all.
+ */
+const REQUEST_TIMEOUT_MS = 45_000;
+/** Uploads are bounded by the student's connection rather than by us. */
+const UPLOAD_TIMEOUT_MS = 180_000;
+
 // ── Refresh logic ──
 let refreshPromise: Promise<boolean> | null = null;
 
@@ -81,11 +92,33 @@ async function attemptRefresh(): Promise<boolean> {
   if (!rt) return false;
 
   try {
-    const res = await fetch(`${API_BASE}/auth/refresh`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ refreshToken: rt }),
-    });
+    // A deadline, but deliberately no retry. Replaying a refresh whose rotation
+    // already landed presents a consumed token, trips reuse detection and
+    // revokes every session the user has.
+    //
+    // Without the deadline this was the one call in the app that could hang for
+    // ever, and the worst possible one to lose: `refreshTokenOnce` dedupes on
+    // `refreshPromise`, which is cleared in a `.finally()` that a hung fetch
+    // never reaches. So a single stalled refresh — a phone moving between
+    // cells mid-POST is enough — left every later 401 awaiting the same dead
+    // promise, with no error and no recovery short of reloading the app.
+    // Same AbortController shape the wrapper below uses, rather than
+    // `AbortSignal.timeout`: one idiom for one job, and the timer is cleared on
+    // the way out instead of being left to fire into nothing.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+    let res: Response;
+    try {
+      res = await fetch(`${API_BASE}/auth/refresh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refreshToken: rt }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
 
     if (!res.ok) {
       clearTokens();
@@ -146,7 +179,17 @@ async function apiFetch<T = unknown>(
   path: string,
   options: RequestInit = {},
   retry = true,
-  networkRetry = true
+  networkRetry = true,
+  /**
+   * Parse a successful response as a Blob instead of sniffing its content type.
+   *
+   * The download endpoint types its response from the *file's* extension —
+   * docx, pptx, xlsx, images and text/plain all come back alongside pdf and
+   * octet-stream. The sniffing below only recognises the last two, so anything
+   * else would fall through to `res.text()` and be corrupted. The caller knows
+   * it asked for a file, so it says so rather than leaving it to be guessed.
+   */
+  asBlob = false
 ): Promise<T> {
   const url = `${API_BASE}${path}`;
 
@@ -173,7 +216,7 @@ async function apiFetch<T = unknown>(
   // after any quiet period. Uploads get longer still, since they are bounded by
   // the student's connection rather than by us.
   const isUpload = options.body instanceof FormData;
-  const timeoutMs = isUpload ? 180_000 : 45_000;
+  const timeoutMs = isUpload ? UPLOAD_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -191,7 +234,7 @@ async function apiFetch<T = unknown>(
 
     if (neverArrived && networkRetry && isReplayable(options.method ?? 'GET')) {
       await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
-      return apiFetch<T>(path, options, retry, false);
+      return apiFetch<T>(path, options, retry, false, asBlob);
     }
 
     if (timedOut) {
@@ -214,10 +257,17 @@ async function apiFetch<T = unknown>(
     if (refreshed) {
       // Network retry is granted afresh: the refreshed call is a new attempt
       // and deserves the same tolerance for a blip as the first one.
-      return apiFetch<T>(path, options, false, true);
+      return apiFetch<T>(path, options, false, true, asBlob);
     }
     clearTokens();
     throw new ApiError('Session expired. Please log in again.', 401, 'AUTH_EXPIRED');
+  }
+
+  // Only on success: an error response is JSON from the error handler, and
+  // handing that back as a Blob would turn every failure into a file the user
+  // downloads. Falling through gets it parsed and thrown like any other.
+  if (asBlob && res.ok) {
+    return (await res.blob()) as unknown as T;
   }
 
   // Parse response
@@ -291,19 +341,17 @@ export function upload<T = unknown>(path: string, formData: FormData): Promise<T
   });
 }
 
-/** Download a file as Blob */
-export async function downloadBlob(path: string): Promise<Blob> {
-  const url = `${API_BASE}${path}`;
-  const headers: Record<string, string> = {};
-  if (accessToken) {
-    headers['Authorization'] = `Bearer ${accessToken}`;
-  }
-
-  const res = await fetch(url, { headers });
-  if (!res.ok) {
-    throw new ApiError(`Download failed: ${res.statusText}`, res.status);
-  }
-  return res.blob();
+/**
+ * Download a file as a Blob.
+ *
+ * Goes through `apiFetch` rather than calling `fetch` directly. It used to do
+ * the latter, which meant it was the one request in the app with no deadline,
+ * no retry and — the part that actually bit — no 401 → refresh. Access tokens
+ * last 15 minutes, so a download attempted after one expired failed outright
+ * while every other call in the app silently refreshed and carried on.
+ */
+export function downloadBlob(path: string): Promise<Blob> {
+  return apiFetch<Blob>(path, { method: 'GET' }, true, true, true);
 }
 
 export { API_BASE };

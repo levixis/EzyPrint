@@ -13,7 +13,16 @@ import { ApiError } from '../utils/ApiError';
  * execute the guarded action twice — which for a payout means paying twice.
  */
 
-const OTP_TTL_MS = 5 * 60 * 1000;
+export const OTP_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * The same window, phrased for the email that carries the code.
+ *
+ * `email.service` hardcoded "5 minutes" in both the text and the HTML body, so
+ * changing the TTL here would have left the mail confidently stating the old
+ * one. Exported so there is a single source for the number and the sentence.
+ */
+export const OTP_TTL_LABEL = `${OTP_TTL_MS / 60000} minutes`;
 const MAX_FAILED_ATTEMPTS = 3;
 const LOCKOUT_MS = 15 * 60 * 1000;
 

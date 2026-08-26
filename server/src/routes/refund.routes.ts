@@ -29,10 +29,14 @@ router.get('/', authenticate, authorize('ADMIN', 'SHOP_OWNER', 'STUDENT'), async
     // grows with the platform, and the first time it matters is the day it is
     // slowest to notice.
     const limit = clampListLimit(req.query.limit);
+    // `take` bounds the page size; without `skip` it always returned the first
+    // page, so anything older than `limit` was unreachable through the API.
+    const page = Math.max(1, Number(req.query.page) || 1);
 
     const requests = await prisma.refundRequest.findMany({
       where: whereClause,
       orderBy: { studentRequestedAt: 'desc' },
+      skip: (page - 1) * limit,
       take: limit,
       include: { order: true }
     });

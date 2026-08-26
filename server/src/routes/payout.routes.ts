@@ -5,7 +5,7 @@ import { z } from 'zod';
 import * as ledgerService from '../services/ledger.service';
 import { ApiError } from '../utils/ApiError';
 import type { Request, Response, NextFunction } from 'express';
-import { requestPayoutSchema, otpGuardedSchema, manualPayoutWithOtpSchema } from '../validators/schemas';
+import { requestPayoutSchema, otpGuardedSchema, manualPayoutWithOtpSchema, disputePayoutSchema } from '../validators/schemas';
 import * as otpService from '../services/otp.service';
 import * as realtimeService from '../services/realtime.service';
 import * as notifyService from '../services/notify.service';
@@ -208,7 +208,11 @@ router.get('/', authenticate, authorize('ADMIN', 'SHOP_OWNER'), async (req, res,
   try {
     // Clamped like every other list endpoint (see user/ticket/ledger services).
     // This one was unbounded, so `?limit=1000000` read out every payout row.
+    // `take` alone is not pagination: it bounded the page size and then always
+    // returned the first page, so a shop with more payouts than the limit had
+    // no way to reach the older ones. `skip` is the half that was missing.
     const limit = clampListLimit(req.query.limit);
+    const page = Math.max(1, Number(req.query.page) || 1);
     const shopId = req.query.shopId as string;
 
     const whereClause = payoutScopeFor(
@@ -221,6 +225,7 @@ router.get('/', authenticate, authorize('ADMIN', 'SHOP_OWNER'), async (req, res,
 
     const payouts = await prisma.payout.findMany({
       where: whereClause,
+      skip: (page - 1) * limit,
       take: limit,
       orderBy: { createdAt: 'desc' }
     });
@@ -526,7 +531,7 @@ router.post('/:id/cancel', authenticate, authorize('SHOP_OWNER', 'ADMIN'), sensi
   } catch (error) { next(error); }
 });
 
-router.post('/:id/confirm', authenticate, authorize('SHOP_OWNER'), async (req, res, next) => {
+router.post('/:id/confirm', authenticate, authorize('SHOP_OWNER'), sensitiveLimiter, async (req, res, next) => {
   try {
     if (!req.user) throw ApiError.unauthorized();
 
@@ -547,7 +552,15 @@ router.post('/:id/confirm', authenticate, authorize('SHOP_OWNER'), async (req, r
   }
 });
 
-router.post('/:id/dispute', authenticate, authorize('SHOP_OWNER'), async (req, res, next) => {
+/**
+ * `sensitiveLimiter` and a schema, to match every other payout mutation.
+ *
+ * `shopOwnerNote` reached `prisma.payout.update` straight from the body with no
+ * length bound and no type check — the only write on this router that did. And
+ * this route plus `/confirm` were the two that carried no rate limiter, so the
+ * pair could be driven as fast as a token allowed.
+ */
+router.post('/:id/dispute', authenticate, authorize('SHOP_OWNER'), sensitiveLimiter, validate(disputePayoutSchema), async (req, res, next) => {
   try {
     if (!req.user) throw ApiError.unauthorized();
     const { shopOwnerNote } = req.body;

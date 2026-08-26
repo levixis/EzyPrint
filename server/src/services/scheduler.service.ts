@@ -412,9 +412,21 @@ export function startScheduler(): void {
   );
 }
 
+/**
+ * Stop every timer this module started.
+ *
+ * `clearTimeout` and `clearInterval` are interchangeable in Node — both take a
+ * Timeout object and both work — so this was never a live bug. It is written
+ * out properly anyway because the array holds both kinds (`schedule` pushes an
+ * interval, `scheduleCatchUp` pushes a timeout) and relying on the two being
+ * the same function is relying on an implementation detail rather than a
+ * documented contract.
+ */
 export function stopScheduler(): void {
   while (timers.length) {
     const timer = timers.pop();
-    if (timer) clearInterval(timer);
+    if (!timer) continue;
+    clearInterval(timer);
+    clearTimeout(timer);
   }
 }

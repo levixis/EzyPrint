@@ -1,5 +1,9 @@
 import nodemailer from 'nodemailer';
 import { env } from '../config/env';
+// Both codes this file sends are issued by `otp.service.issueOtp` — the
+// password reset goes through it too — so they genuinely share one TTL, and
+// the sentence describing it should come from the same place as the number.
+import { OTP_TTL_LABEL } from './otp.service';
 
 let transporter: nodemailer.Transporter | null = null;
 
@@ -206,7 +210,7 @@ export async function sendPasswordResetEmail(
   await deliver({
     to,
     subject: `Reset your EzyPrint password — code ${otp}`,
-    text: `${plainGreeting}\n\nUse this code to set a new EzyPrint password: ${otp}\n\nIt expires in 5 minutes and can be used once.\n\nIf you did not ask to reset your password, you can ignore this email — your current password still works and nothing has changed.`,
+    text: `${plainGreeting}\n\nUse this code to set a new EzyPrint password: ${otp}\n\nIt expires in ${OTP_TTL_LABEL} and can be used once.\n\nIf you did not ask to reset your password, you can ignore this email — your current password still works and nothing has changed.`,
     html: `
       <div style="font-family: 'Inter', sans-serif; max-width: 480px; margin: 0 auto; padding: 32px; background: #1a1a2e; border-radius: 16px; color: #e0e0e0;">
         <div style="text-align: center; margin-bottom: 24px;">
@@ -218,7 +222,7 @@ export async function sendPasswordResetEmail(
         <div style="text-align: center; padding: 24px; background: #16213e; border-radius: 12px; margin: 24px 0;">
           <p style="font-size: 36px; font-weight: 800; letter-spacing: 8px; color: #ef4444; margin: 0;">${otp}</p>
         </div>
-        <p style="color: #888; font-size: 13px;">It expires in <strong>5 minutes</strong> and can be used once.</p>
+        <p style="color: #888; font-size: 13px;">It expires in <strong>${OTP_TTL_LABEL}</strong> and can be used once.</p>
         <p style="color: #666; font-size: 11px; margin-top: 24px; border-top: 1px solid #333; padding-top: 16px;">
           Didn't ask for this? Ignore this email — your current password still works and nothing has changed.
         </p>
@@ -238,7 +242,7 @@ export async function sendOTPEmail(to: string, otp: string, actionLabel?: string
     to,
     // Header values are not HTML; both transports encode them. Body values are.
     subject: `Verification Code: ${otp} (${action})`,
-    text: `You are attempting to perform a sensitive account action.\n\nYour verification code is: ${otp}\n\nThis code expires in 5 minutes. If you did not request this, please secure your account immediately.`,
+    text: `You are attempting to perform a sensitive account action.\n\nYour verification code is: ${otp}\n\nThis code expires in ${OTP_TTL_LABEL}. If you did not request this, please secure your account immediately.`,
     html: `
       <div style="font-family: 'Inter', sans-serif; max-width: 480px; margin: 0 auto; padding: 32px; background: #1a1a2e; border-radius: 16px; color: #e0e0e0;">
         <div style="text-align: center; margin-bottom: 24px;">
@@ -250,7 +254,7 @@ export async function sendOTPEmail(to: string, otp: string, actionLabel?: string
           <p style="color: #888; font-size: 12px; margin: 0 0 8px;">Your verification code</p>
           <p style="font-size: 36px; font-weight: 800; letter-spacing: 8px; color: #ef4444; margin: 0;">${otp}</p>
         </div>
-        <p style="color: #888; font-size: 13px;">This code expires in <strong>5 minutes</strong>.</p>
+        <p style="color: #888; font-size: 13px;">This code expires in <strong>${OTP_TTL_LABEL}</strong>.</p>
         <p style="color: #666; font-size: 11px; margin-top: 24px; border-top: 1px solid #333; padding-top: 16px;">If you did not request this, please secure your account immediately.</p>
       </div>
     `,

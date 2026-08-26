@@ -402,12 +402,12 @@ export async function getShopAggregate(shopId: string, ownerUserId: string, isAd
   }
 
   // Compute aggregate from orders
-  const [orderStats, payoutStats] = await Promise.all([
+  const [orderStats, payoutStats, pendingPayoutCount] = await Promise.all([
     prisma.order.groupBy({
       by: ['status'],
       where: { shopId },
       _count: true,
-      _sum: { totalPrice: true, baseFee: true },
+      _sum: { totalPrice: true, baseFee: true, pageCost: true },
     }),
     /**
      * Everything that has actually left, whoever has acknowledged it.
@@ -426,8 +426,17 @@ export async function getShopAggregate(shopId: string, ownerUserId: string, isAd
     prisma.payout.aggregate({
       where: { shopId, status: { in: ['PAID', 'IN_TRANSIT', 'CONFIRMED'] } },
       _sum: { amount: true },
-      _count: true,
     }),
+    /**
+     * Payouts still waiting on an admin — which is what `pendingPayoutCount`
+     * has always claimed to hold.
+     *
+     * It was previously the `_count` of the aggregate above, so the field named
+     * "pending" reported the number of payouts that had already been *sent*.
+     * The two are near enough opposites: a shop with every payout settled and
+     * nothing outstanding read as its busiest.
+     */
+    prisma.payout.count({ where: { shopId, status: 'PENDING' } }),
   ]);
 
   const validOrderStatuses = ['PENDING_APPROVAL', 'PRINTING', 'READY_FOR_PICKUP', 'COMPLETED', 'REFUNDED'];
@@ -446,7 +455,16 @@ export async function getShopAggregate(shopId: string, ownerUserId: string, isAd
     }
 
     if (revenueStatuses.includes(stat.status)) {
-      totalRevenue += stat._sum.totalPrice || 0;
+      // `pageCost`, not `totalPrice`. The shop earns the page cost; `baseFee` is
+      // the platform's commission and is reported separately as `totalBaseFees`.
+      //
+      // This summed `totalPrice`, which already contains `baseFee` — and
+      // AdminDashboard then computes `shopEarnings + platformFees` from these
+      // two figures, so every base fee was counted twice in the platform-wide
+      // revenue total. The dashboard's own fallback path (when an aggregate is
+      // missing) sums `pageCost` for earnings and `baseFee` for fees, which is
+      // what this always meant to return.
+      totalRevenue += stat._sum.pageCost || 0;
       totalBaseFees += stat._sum.baseFee || 0;
     }
 
@@ -470,7 +488,7 @@ export async function getShopAggregate(shopId: string, ownerUserId: string, isAd
       totalBaseFees,
       totalPaidOut: payoutStats._sum.amount || 0,
       pendingPayouts: shop.pendingBalance,
-      pendingPayoutCount: payoutStats._count,
+      pendingPayoutCount,
     },
     update: {
       totalOrders,
@@ -480,7 +498,7 @@ export async function getShopAggregate(shopId: string, ownerUserId: string, isAd
       totalBaseFees,
       totalPaidOut: payoutStats._sum.amount || 0,
       pendingPayouts: shop.pendingBalance,
-      pendingPayoutCount: payoutStats._count,
+      pendingPayoutCount,
     },
   });
 

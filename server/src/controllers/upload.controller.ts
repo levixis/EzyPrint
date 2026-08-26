@@ -522,6 +522,12 @@ export async function downloadFile(req: Request, res: Response, next: NextFuncti
     const contentType = contentTypeMap[ext] || 'application/octet-stream';
     res.setHeader('Content-Type', contentType);
     res.setHeader('Content-Length', buffer.length);
+    // Without this a PDF or image renders in the tab instead of downloading,
+    // which is not what a "download" endpoint should do. The filename is the
+    // storage key's basename, quoted — keys are server-generated, but quoting
+    // keeps a stray character out of the header regardless.
+    const downloadName = path.basename(storageKey).replace(/["\\]/g, '');
+    res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
     res.send(buffer);
   } catch (error) { next(error); }
 }
@@ -580,15 +586,5 @@ export async function deleteFileHandler(req: Request, res: Response, next: NextF
     }
 
     res.json({ success: true, message: 'File deleted successfully' });
-  } catch (error) { next(error); }
-}
-
-// Clean up orphaned files in S3 if they aren't linked in the DB
-export async function cleanupOrphans(req: Request, res: Response, next: NextFunction) {
-  try {
-    // Only admins or system chron job
-    if (req.user?.userType !== 'ADMIN') throw ApiError.forbidden();
-    // In a real scenario, you'd list objects in S3 and check DB.
-    res.json({ success: true, message: 'Cleanup job triggered' });
   } catch (error) { next(error); }
 }

@@ -158,24 +158,30 @@ export async function saveBankDetails(req: Request, res: Response, next: NextFun
       }
     }
 
-    const { accountNumber, ifscCode, accountHolderName, accountType, upiId } = req.body;
+    const { accountNumber, ifscCode, accountHolderName, accountType, upiId, bankName } = req.body;
     
     // Validate inputs
-    if (!accountNumber || !ifscCode || !accountHolderName || !accountType) {
+    if (!accountNumber || !ifscCode || !accountHolderName || !accountType || !bankName) {
       await prisma.bankAccessLog.create({ data: { shopId, userId: req.user.userId, userRole: req.user.userType as any, action: 'EDIT', ip: req.ip || '', success: false } });
       throw ApiError.badRequest('Missing required bank details');
     }
 
+    // `bankName` is read from the body like every other field here. It used to
+    // be hardcoded to 'Unknown' on create and left untouched on update, which
+    // made the round trip nonsense: `saveBankDetailsSchema` rejects a request
+    // without it ("Bank name is required"), the settings form has an input for
+    // it, and `ShopSettingsModal` renders it straight back — so every shop was
+    // made to type a bank name and then shown "Unknown" for ever.
     const bankDetails = await prisma.bankDetails.upsert({
       where: { shopId },
       create: { 
         shopId, accountNumber, ifscCode, accountHolderName, 
-        accountType: accountType as any, upiId, bankName: 'Unknown', 
+        accountType: accountType as any, upiId, bankName, 
         isVerified: false 
       },
       update: { 
         accountNumber, ifscCode, accountHolderName, 
-        accountType: accountType as any, upiId, 
+        accountType: accountType as any, upiId, bankName, 
         isVerified: false, verifiedAt: null, verifiedBy: null 
       },
     });

@@ -403,6 +403,20 @@ export const requestPayoutSchema = z.object({
   }),
 });
 
+/**
+ * The note a shop attaches when it says a payout never arrived.
+ *
+ * Bounded because it was not: `/payouts/:id/dispute` read `shopOwnerNote`
+ * straight from the body and wrote it, the only unvalidated write on that
+ * router. 1000 matches `shopOwnerNote` on the request schema next door, so the
+ * same field has the same limit wherever it is set.
+ */
+export const disputePayoutSchema = z.object({
+  body: z.object({
+    shopOwnerNote: z.string().max(1000).optional(),
+  }),
+});
+
 export const actionPayoutSchema = z.object({
   body: z.object({
     adminNote: z.string().max(1000).optional(),

@@ -450,6 +450,35 @@ export function assertProductionConfig(): void {
     problems.push('ALERT_EMAIL is empty — nobody is told when the app breaks.');
   }
 
+  // ── CORS ──
+  //
+  // `origin` reaches the `cors` package as an array, and array entries are
+  // compared with `===`. A literal '*' therefore matches no origin at all: it
+  // is a wildcard only when passed as a bare string, and even then a browser
+  // refuses it alongside `credentials: true`. What the caller gets is a 200
+  // with no `Access-Control-Allow-Origin` header, which surfaces in the web app
+  // as "Failed to fetch" and reads as the backend being down.
+  //
+  // The mobile build is allowed separately by NATIVE_APP_ORIGINS in index.ts,
+  // so it keeps working throughout — which is exactly what makes this hard to
+  // attribute when only the website is broken.
+  const isLocalOrigin = (o: string) => /^https?:\/\/localhost(:\d+)?$/i.test(o);
+
+  if (env.CORS_ORIGINS.includes('*')) {
+    problems.push(
+      'CORS_ORIGINS contains "*". The cors package matches array entries literally, ' +
+      'so "*" allows nothing rather than everything — every browser request is ' +
+      'answered without an Access-Control-Allow-Origin header and fails. List the ' +
+      "web app's origins explicitly, e.g. https://ezyprint.co.in"
+    );
+  } else if (env.CORS_ORIGINS.every(isLocalOrigin)) {
+    problems.push(
+      `CORS_ORIGINS is ${JSON.stringify(env.CORS_ORIGINS)}, which allows no deployed ` +
+      'web origin — the site cannot call this API. (It defaults to localhost when ' +
+      'unset, so this is what an unset variable looks like.)'
+    );
+  }
+
   if (problems.length > 0) {
     throw new Error(
       `\n❌ Refusing to start in production with this configuration:\n\n` +
