@@ -147,6 +147,14 @@ const MAX_ATTEMPTS = 10;
  * which is what makes delivery survive a crash between commit and publish.
  */
 export async function dispatchOutbox(limit = 100): Promise<number> {
+  // Nothing to deliver *with*. `deliver` returns 0 without touching the rows in
+  // this case — no publish, and no failed attempt either — so selecting them
+  // meant re-reading the same oldest hundred every ten seconds forever, making
+  // no progress and never reaching the attempt cap. Production cannot get here
+  // (`requireSecret` refuses to boot without Pusher credentials); a developer's
+  // machine does it all day.
+  if (!getPusher()) return 0;
+
   const rows = await prisma.realtimeOutbox.findMany({
     where: { publishedAt: null, attempts: { lt: MAX_ATTEMPTS } },
     orderBy: { createdAt: 'asc' },
@@ -218,15 +226,58 @@ async function deliver(rows: OutboxRow[]): Promise<number> {
 }
 
 /**
- * Remove delivered events older than the retention window.
+ * Remove events past the retention window — delivered or definitively not.
  *
  * The outbox is a delivery buffer, not an audit log — `ledger_entries` is the
  * financial record of truth.
+ *
+ * This deleted only *published* rows, which left the one population that can
+ * never leave on its own: a row that exhausted `MAX_ATTEMPTS` is excluded from
+ * `dispatchOutbox` by the same cap, so it was neither retried nor pruned. Every
+ * ledger movement writes one of these, so a sustained Pusher outage left a
+ * permanent row per money movement and nothing ever removed them.
+ *
+ * Exhausted rows are reported rather than quietly dropped: each one is a balance
+ * event a shop's ledger view never received, and by the time it is pruned the
+ * only remaining trace is this alert.
  */
 export async function pruneOutbox(olderThanDays = 7): Promise<number> {
   const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000);
+
+  const abandoned = await prisma.realtimeOutbox.findMany({
+    where: { publishedAt: null, attempts: { gte: MAX_ATTEMPTS }, createdAt: { lt: cutoff } },
+    select: { id: true, channel: true, event: true, lastError: true },
+  });
+
+  if (abandoned.length > 0) {
+    console.error(
+      `[realtime] dropping ${abandoned.length} event(s) that never delivered:`,
+      abandoned.map((r) => `${r.channel}/${r.event} (${r.lastError ?? 'no error recorded'})`)
+    );
+    // Imported lazily: notify.service reads shops and users, and this module is
+    // imported by the ledger write path — a static import would make that a
+    // cycle. Fire-and-forget, because a pruning sweep must not fail on a
+    // notification.
+    void import('./notify.service')
+      .then((notify) =>
+        notify.notifyAdmins(
+          `${abandoned.length} real-time balance event(s) were never delivered after ` +
+          `${MAX_ATTEMPTS} attempts and have now been pruned. Affected shops may show a ` +
+          `stale ledger until they refresh.`,
+          'error'
+        )
+      )
+      .catch((error) => console.error('[realtime] could not report abandoned events:', error));
+  }
+
   const result = await prisma.realtimeOutbox.deleteMany({
-    where: { publishedAt: { not: null, lt: cutoff } },
+    where: {
+      createdAt: { lt: cutoff },
+      OR: [
+        { publishedAt: { not: null } },
+        { publishedAt: null, attempts: { gte: MAX_ATTEMPTS } },
+      ],
+    },
   });
   return result.count;
 }

@@ -177,34 +177,57 @@ router.post('/:id/resolve', authenticate, authorize('ADMIN'), validate(resolveRe
     const id = req.params.id as string;
     if (!req.user) throw ApiError.unauthorized();
 
+    // Everything the server can refuse on its own is checked before the code is
+    // spent — the same ordering `/payouts/:id/cancel` and `/mark-paid` already
+    // use. `consumeOtp` deletes the code atomically and has no rollback, so
+    // consuming first meant a resolve the server was never going to allow still
+    // destroyed the OTP: every retry needed a fresh email and failed
+    // identically, which reads as "OTP not working" rather than "another admin
+    // already resolved this". At five codes per fifteen minutes, a confused
+    // operator locks themselves out of the OTP channel in under a minute —
+    // during a refund incident, which is when this route gets used.
+    const initialRequest = await prisma.refundRequest.findUnique({ where: { id }, include: { order: true } });
+    if (!initialRequest) throw ApiError.notFound('Refund request not found');
+
+    // Shared with the service rather than written out here. The inline copy is
+    // exactly what drifted last time: `REFUND_FAILED` was added to the shop's
+    // list and missed in this one, so the retry every other part of the
+    // codebase promises answered "invalid state".
+    const admissible = action === 'DENY'
+      ? refundService.ADMIN_ACTIONABLE_STATUSES
+      : refundService.ADMIN_APPROVABLE_STATUSES;
+
+    if (!admissible.includes(initialRequest.status)) {
+      throw ApiError.badRequest(
+        `This refund is ${initialRequest.status.toLowerCase().replace(/_/g, ' ')} and cannot be ` +
+        `${action === 'DENY' ? 'denied' : 'approved'}.`
+      );
+    }
+
+    const requestedAmount = refundAmount || initialRequest.order.totalPrice;
+    if (action === 'APPROVE') {
+      if (requestedAmount > initialRequest.order.totalPrice) {
+        throw ApiError.badRequest('Refund cannot exceed order total');
+      }
+      if (initialRequest.status === 'PROCESSING_REFUND' && initialRequest.refundAmount && initialRequest.refundAmount !== requestedAmount) {
+        throw ApiError.badRequest('Cannot change refund amount for a request that is already processing');
+      }
+    }
+
     // Step-up verification, scoped to this refund request. Both branches move
     // money or close out a student's claim.
     await otpService.consumeOtp(req.user.userId, `refund_${id}`, otp);
-    
+
     if (action === 'DENY') {
       const updated = await prisma.refundRequest.updateMany({
-        // Shared with the service rather than written out here. The inline
-        // copy is exactly what drifted last time: `REFUND_FAILED` was added to
-        // the shop's list and missed in this one, so the retry every other part
-        // of the codebase promises answered "invalid state".
+        // Still guarded, despite the check above: that read is outside any
+        // transaction, so a second admin resolving in the meantime must lose
+        // the race rather than have their decision silently overwritten.
         where: { id, status: { in: refundService.ADMIN_ACTIONABLE_STATUSES } },
         data: { status: 'RESOLVED_DENIED', adminNote, resolvedBy: req.user?.userId, adminResolvedAt: new Date() }
       });
       if (updated.count === 0) throw ApiError.badRequest('Refund request not found or invalid state');
       return res.json({ success: true, data: await prisma.refundRequest.findUnique({ where: { id } }) });
-    }
-
-    // APPROVE flow -> Segregated transaction
-    const initialRequest = await prisma.refundRequest.findUnique({ where: { id }, include: { order: true } });
-    if (!initialRequest) throw ApiError.notFound();
-    
-    const requestedAmount = refundAmount || initialRequest.order.totalPrice;
-    if (requestedAmount > initialRequest.order.totalPrice) {
-      throw ApiError.badRequest('Refund cannot exceed order total');
-    }
-    
-    if (initialRequest.status === 'PROCESSING_REFUND' && initialRequest.refundAmount && initialRequest.refundAmount !== requestedAmount) {
-      throw ApiError.badRequest('Cannot change refund amount for a request that is already processing');
     }
 
     // 1. Claim
@@ -213,7 +236,16 @@ router.post('/:id/resolve', authenticate, authorize('ADMIN'), validate(resolveRe
       // stalled. Shared with the service so this list and the shop's cannot
       // drift apart again.
       where: { id, status: { in: refundService.ADMIN_APPROVABLE_STATUSES } },
-      data: { status: 'PROCESSING_REFUND', refundAmount: requestedAmount, adminNote: adminNote || initialRequest.adminNote }
+      data: {
+        status: 'PROCESSING_REFUND',
+        refundAmount: requestedAmount,
+        adminNote: adminNote || initialRequest.adminNote,
+        // Stamped here rather than only in `settleClaimedRefund`, for the same
+        // reason as the shop path: this column is what the shop's daily refund
+        // velocity cap counts, and a row that is in flight but unstamped is
+        // invisible to it for the length of a gateway round trip.
+        adminResolvedAt: new Date(),
+      }
     });
     if (claim.count === 0) throw ApiError.badRequest('Refund request not found or invalid state');
 

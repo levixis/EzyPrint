@@ -371,6 +371,20 @@ export const env = {
   /** Days to keep system events before the sweep deletes them. */
   SYSTEM_EVENT_RETENTION_DAYS: intFromEnv('SYSTEM_EVENT_RETENTION_DAYS', 30),
 
+  // ── Retention on the tables nothing else sweeps ──
+  /**
+   * Days to keep in-app notifications a user has already read.
+   *
+   * Unread ones are never deleted on age — an unread notification is something
+   * the person has not seen yet, and quietly removing it is worse than keeping
+   * a row. Ninety days is well past the point where a read notification is
+   * anything but weight: the durable record of what happened is the order, the
+   * ledger entry or the ticket it refers to.
+   */
+  NOTIFICATION_RETENTION_DAYS: intFromEnv('NOTIFICATION_RETENTION_DAYS', 90),
+  /** How often the retention job runs over refresh tokens, OTPs and notifications. */
+  RETENTION_SWEEP_INTERVAL_MS: intFromEnv('RETENTION_SWEEP_INTERVAL_MS', 24 * 60 * 60 * 1000),
+
   // ── Helpers ──
   isDev,
   isProd,

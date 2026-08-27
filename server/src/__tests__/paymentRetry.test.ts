@@ -112,6 +112,15 @@ beforeEach(() => {
   mockWebhookUpdateMany.mockResolvedValue({ count: 1 });
   mockWebhookUpdate.mockResolvedValue({ attempts: 1, eventType: 'payment.captured' });
   mockOrderFindFirst.mockResolvedValue(null);
+  // `mockReset`, not just the `clearAllMocks` above. `mockClear` empties
+  // `mock.calls` but leaves a `mockResolvedValueOnce` chain queued, so a test
+  // that queued three reads and made two handed its leftover to the next test —
+  // which then took a preflight it never asked for and diverged silently. That
+  // is a hard failure to attribute: the test that breaks is not the one at
+  // fault. Resetting here means each test's chain starts empty.
+  mockOrderFindUnique.mockReset();
+  mockOrdersFetch.mockReset();
+  mockOrdersFetchPayments.mockReset();
   // Fallback for reads the tests do not sequence explicitly — notably the one
   // announcePaidOrder makes after a recovery. `mockResolvedValueOnce` chains in
   // individual tests are consumed before this.
@@ -124,9 +133,8 @@ describe('retrying a failed payment', () => {
     mockOrdersFetch.mockResolvedValue({ status: 'created' });
 
     mockOrderFindUnique
-      .mockResolvedValueOnce(failedOrder())                             // preflight
-      .mockResolvedValueOnce(failedOrder({ status: 'PENDING_PAYMENT' })) // after reopen
-      .mockResolvedValueOnce(failedOrder({ status: 'PENDING_PAYMENT' })); // main read
+      .mockResolvedValueOnce(failedOrder())                              // preflight
+      .mockResolvedValueOnce(failedOrder({ status: 'PENDING_PAYMENT' })); // after reopen
 
     const result = await createPaymentOrder('order_1', 'student_1');
 
@@ -259,7 +267,6 @@ describe('retrying a failed payment', () => {
 
     mockOrderFindUnique
       .mockResolvedValueOnce(failedOrder())
-      .mockResolvedValueOnce(failedOrder({ status: 'PENDING_PAYMENT' }))
       .mockResolvedValueOnce(failedOrder({ status: 'PENDING_PAYMENT' }));
 
     const result = await createPaymentOrder('order_1', 'student_1');

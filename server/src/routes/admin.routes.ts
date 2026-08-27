@@ -11,6 +11,45 @@ import type { Request, Response, NextFunction } from 'express';
 
 const router = Router();
 
+/**
+ * Whether this caller may be issued a code for this action.
+ *
+ * The route had `authenticate` and no `authorize`, so any signed-in student or
+ * shop owner could have the server mail them a live code for `DELETE_USER`, or
+ * for any `payout_*` / `refund_*` / `reactivation_*` id in the system. The
+ * admin-only *consumers* re-check the role, so on its own that was only noise —
+ * but `/payouts/:id/cancel` accepts a shop owner, and `consumeOtp` is keyed on
+ * `(userId, actionId)`. A step-up factor the first factor can mint for itself
+ * is not a second factor, and that is what turned a payout dispute into a way
+ * to be paid twice.
+ *
+ * Authorised per action rather than per route, because one route issues codes
+ * for six different kinds of action with six different owners.
+ *
+ * Exported for tests: this is the gate, and it is worth asserting directly.
+ */
+export async function mayRequestOtpFor(
+  user: { id: string; type: string },
+  actionId: string
+): Promise<boolean> {
+  // Acting on your own account needs nothing but a session — that is the point.
+  if (actionId === 'DELETE_OWN_ACCOUNT' || actionId === 'ARCHIVE_OWN_SHOP') return true;
+
+  if (user.type === 'ADMIN') return true;
+
+  // Everything below this line is an admin action; the only non-admin exception
+  // is a shop owner cancelling a payout that belongs to their own shop.
+  const payoutId = actionId.startsWith('payout_') ? actionId.slice('payout_'.length) : null;
+  if (!payoutId || user.type !== 'SHOP_OWNER') return false;
+
+  const payout = await prisma.payout.findUnique({
+    where: { id: payoutId },
+    select: { shop: { select: { ownerUserId: true } } },
+  });
+
+  return payout?.shop?.ownerUserId === user.id;
+}
+
 // ────────────────────────────────────────────────────────────
 // POST /api/v1/admin/otp — Request a one-time verification code
 // ────────────────────────────────────────────────────────────
@@ -29,6 +68,13 @@ router.post('/otp', authenticate, otpRequestLimiter, async (req: Request, res: R
       select: { id: true, email: true, type: true },
     });
     if (!user || !user.email) throw ApiError.badRequest('Account lacks a verified email address.');
+
+    // Deliberately the same refusal whether the action is out of reach or the id
+    // names nothing: a caller must not be able to enumerate which payout ids
+    // exist by watching which ones produce a different error.
+    if (!(await mayRequestOtpFor(user, actionId))) {
+      throw ApiError.forbidden('You cannot request a verification code for this action.');
+    }
 
     const otp = await otpService.issueOtp(user.id, actionId);
 

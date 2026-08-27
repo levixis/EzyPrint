@@ -17,10 +17,20 @@
  */
 
 const mockOrderFindFirst = jest.fn();
+const mockPassFindUnique = jest.fn();
+const mockPassFindFirst = jest.fn();
 const mockPaymentsAll = jest.fn();
 
 jest.mock('../utils/prisma', () => ({
-  prisma: { order: { findFirst: mockOrderFindFirst } },
+  prisma: {
+    order: { findFirst: mockOrderFindFirst },
+    // Pass payments are audited now rather than skipped, so this suite has to
+    // answer for the purchase table as well.
+    studentPassPurchase: {
+      findUnique: mockPassFindUnique,
+      findFirst: mockPassFindFirst,
+    },
+  },
 }));
 
 jest.mock('razorpay', () =>
@@ -56,7 +66,11 @@ const lostPayment = (overrides: Record<string, unknown> = {}) => ({
 beforeEach(() => {
   mockOrderFindFirst.mockReset();
   mockPaymentsAll.mockReset();
+  mockPassFindUnique.mockReset();
+  mockPassFindFirst.mockReset();
   mockPaymentsAll.mockResolvedValue({ items: [] });
+  mockPassFindUnique.mockResolvedValue(null);
+  mockPassFindFirst.mockResolvedValue(null);
 });
 
 describe('a captured payment with no order', () => {
@@ -136,11 +150,61 @@ describe('what the audit deliberately ignores', () => {
     expect(result.checked).toBe(0);
   });
 
-  test('Student Pass payments, which have no order by design', async () => {
+  test('a Student Pass payment that has its purchase row', async () => {
+    // These used to be skipped outright — "not orders and have no order row by
+    // design", which was true and was precisely why a double-charged pass was
+    // invisible to the one check that walks from Razorpay inward. They have a
+    // row now, so a matched one is accounted for like anything else.
+    mockPaymentsAll.mockResolvedValue({
+      items: [lostPayment({ id: 'pay_pass', notes: { userId: 'u_1', purchaseId: 'p_1', subscription_type: 'student_pass' } })],
+    });
+    mockPassFindUnique.mockResolvedValue({ id: 'p_1' });
+
+    const result = await auditCapturedPayments();
+
+    expect(result.orphans).toHaveLength(0);
+  });
+
+  test('a Student Pass payment from before the purchase table existed', async () => {
+    // Indistinguishable from a genuine orphan by inspection, so the floor
+    // decides: anything captured before the first purchase we ever recorded
+    // predates the table and is not something a human can act on.
+    mockPaymentsAll.mockResolvedValue({
+      items: [lostPayment({ id: 'pay_old', notes: { userId: 'u_1', subscription_type: 'student_pass' } })],
+    });
+    mockPassFindUnique.mockResolvedValue(null);
+    mockPassFindFirst.mockResolvedValue({ createdAt: new Date() }); // recorded after this payment
+
+    const result = await auditCapturedPayments();
+
+    expect(result.orphans).toHaveLength(0);
+  });
+});
+
+describe('what the audit now catches that it could not before', () => {
+  test('a Student Pass payment with no purchase behind it', async () => {
+    // The double-charge this whole line of work is about. Before the purchase
+    // table there was nothing to check against, so this was unreportable.
+    mockPaymentsAll.mockResolvedValue({
+      items: [lostPayment({ id: 'pay_orphan_pass', notes: { userId: 'u_1', subscription_type: 'student_pass' } })],
+    });
+    mockPassFindUnique.mockResolvedValue(null);
+    mockPassFindFirst.mockResolvedValue({ createdAt: new Date(Date.now() - 365 * 24 * 60 * 60 * 1000) });
+
+    const result = await auditCapturedPayments();
+
+    expect(result.orphans).toHaveLength(1);
+    expect(result.orphans[0].paymentId).toBe('pay_orphan_pass');
+  });
+
+  test('and reports nothing when no pass has ever been recorded', async () => {
+    // No floor to compare against means no pass payment is auditable yet, which
+    // is correct rather than an excuse to flag everything.
     mockPaymentsAll.mockResolvedValue({
       items: [lostPayment({ id: 'pay_pass', notes: { userId: 'u_1', subscription_type: 'student_pass' } })],
     });
-    mockOrderFindFirst.mockResolvedValue(null);
+    mockPassFindUnique.mockResolvedValue(null);
+    mockPassFindFirst.mockResolvedValue(null);
 
     const result = await auditCapturedPayments();
 

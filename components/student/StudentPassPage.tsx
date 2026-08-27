@@ -57,6 +57,19 @@ const StudentPassPage: React.FC = () => {
         try {
             const data = await paymentApi.createPassOrder();
 
+            // The server asks the gateway before replacing a checkout that has
+            // gone stale, because a UPI collect approved after the sheet was
+            // dismissed is a real payment that looks like an abandoned one from
+            // here. When it reports the money already arrived, the pass is
+            // active: show that rather than opening a checkout the student
+            // would be charged by twice.
+            if (data.paid) {
+                setStatusMessage('');
+                await upgradeToStudentPass();
+                setIsProcessing(false);
+                return;
+            }
+
             setStatusMessage('Opening payment gateway...');
 
             const baseOptions: Record<string, unknown> = {

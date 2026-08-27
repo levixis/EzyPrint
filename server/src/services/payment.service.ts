@@ -8,7 +8,7 @@ import * as ledgerService from './ledger.service';
 import * as realtimeService from './realtime.service';
 import * as orderService from './order.service';
 import * as notify from './notify.service';
-import { isStudentPassActive } from './pricing.service';
+import { isStudentPassActive, PASS_DURATION_MS } from './pricing.service';
 
 /**
  * Payment Service — Razorpay integration with production-grade safety.
@@ -33,6 +33,27 @@ import { isStudentPassActive } from './pricing.service';
  * and the other considers it free.
  */
 export const PAYMENT_CLAIM_TTL_MS = 60 * 1000;
+
+/**
+ * How long an unpaid Student Pass checkout holds the one open slot.
+ *
+ * Not a lock TTL — the slot is held by a row and enforced by a partial unique
+ * index, so nothing depends on this number for correctness. It only decides
+ * when an unpaid checkout stops being the one the student is offered and a
+ * fresh gateway order is minted instead.
+ *
+ * Fifteen minutes, which is longer than the old five-minute claim precisely
+ * because it is no longer a lock. A student returning inside it is handed the
+ * *same* Razorpay order rather than a refusal, so a generous window costs them
+ * nothing and buys the one thing that matters: while it holds, there is exactly
+ * one gateway order in existence and a second capture is impossible.
+ *
+ * Past it, `createStudentPassOrder` asks the gateway whether the abandoned
+ * checkout was paid before minting anything new — the same question
+ * `adoptCapturedPayment` asks for a print order — so even the sequential case
+ * cannot quietly become two payments.
+ */
+export const PASS_CHECKOUT_EXPIRY_MS = 15 * 60 * 1000;
 
 /**
  * Who the expiry job acts as.
@@ -173,28 +194,30 @@ async function flagForReview(orderId: string, reason: string): Promise<void> {
       // The NULL arm is load-bearing, and its absence made this whole function
       // a silent no-op for the orders it most needed to flag.
       //
-      // `paymentVerifiedVia` is null until a payment is actually verified, and
-      // SQL three-valued logic means `NULL <> 'amount_mismatch'` evaluates to
-      // NULL rather than true — so `{ not: ... }` alone matched *zero rows* for
-      // any order that had never been through verification. `updateMany`
-      // returned count 0, this function returned early, and no console line and
-      // no admin alert were ever produced.
-      //
-      // That is exactly inverted from what it is for. An order refused at the
-      // payment boundary — wrong amount, or files changed after pricing — is
-      // refused *before* `paymentVerifiedVia` is ever set, so the money was
-      // captured, the order was not fulfilled, and nobody was told. It only
-      // appeared to work when the order had already been fulfilled and the
-      // column carried 'webhook'.
+      // The dedup column is null until an order is actually flagged, and SQL
+      // three-valued logic means `NULL <> '<reason>'` evaluates to NULL rather
+      // than true — so `{ not: ... }` alone matched *zero rows* for any order
+      // that had never been flagged, which is every order this exists for.
+      // `updateMany` returned count 0, this function returned early, and no
+      // console line and no admin alert were ever produced.
       //
       // Found by driving the real endpoint against a real Postgres; a mocked
       // test cannot see it, because the bug is in how SQL treats NULL.
+      //
+      // The dedup now runs on `needsReviewReason` rather than on
+      // `paymentVerifiedVia`. That column records *which path* confirmed a
+      // payment — 'signature', 'webhook', 'recovery' — and overwriting it with a
+      // flag sentinel destroyed that answer for exactly the orders someone was
+      // about to investigate. Keying on the reason also keeps the useful half of
+      // the old behaviour: the reconciliation sweep revisiting the same stuck
+      // order produces the same sentence and stays silent, while a second,
+      // genuinely different problem on that order still announces.
       OR: [
-        { paymentVerifiedVia: null },
-        { paymentVerifiedVia: { not: 'amount_mismatch' } },
+        { needsReviewReason: null },
+        { needsReviewReason: { not: reason } },
       ],
     },
-    data: { paymentVerifiedVia: 'amount_mismatch' },
+    data: { needsReviewReason: reason, flaggedForReviewAt: new Date() },
   });
 
   if (marked.count === 0) return;
@@ -376,61 +399,22 @@ export async function createPaymentOrder(
     : preflight;
   if (!current) throw ApiError.notFound('Order not found');
 
-  // ── Price the order from pages the server counted, before charging ──
-  //
-  // `pageCount` reaches the order from the browser and is the multiplier in
-  // `pageCount × rate × copies`. Every other pricing input already comes from
-  // the database; this is the last one that did not, and understating it
-  // understated the bill — a 200-page PDF declared as one page was charged as
-  // one page and printed as two hundred.
-  //
-  // Done before the Razorpay order exists, which is the last moment the price
-  // can still move without a student having been charged. If it moves we stop
-  // rather than charging the corrected figure: the amount taken must be the
-  // amount that was on screen when they agreed to it.
-  if (!current.razorpayOrderId && current.status === 'PENDING_PAYMENT') {
-    const repriced = await orderService.repriceFromVerifiedPages(orderId);
-
-    if (repriced.unverifiable.length > 0) {
-      throw ApiError.badRequest(
-        `We could not read the page count for ${repriced.unverifiable.join(', ')}. ` +
-        `Please re-upload ${repriced.unverifiable.length > 1 ? 'these files' : 'this file'} before paying.`
-      );
-    }
-
-    if (repriced.changed) {
-      throw ApiError.conflict(
-        `The page count for this order was different from what was submitted, so the ` +
-        `total is now ₹${(repriced.totalPrice / 100).toFixed(2)} instead of ` +
-        `₹${(repriced.previousTotal / 100).toFixed(2)}. Please review and pay again.`
-      );
-    }
-  }
-
-  const order = await prisma.order.findUnique({ where: { id: orderId } });
-  if (!order) throw ApiError.notFound('Order not found');
-  if (order.userId !== userId) throw ApiError.forbidden('This is not your order');
-
   // Fast path: a Razorpay order already exists, so hand back the same one.
-  if (order.razorpayOrderId && order.status === 'PENDING_PAYMENT') {
+  if (current.razorpayOrderId && current.status === 'PENDING_PAYMENT') {
     return {
-      razorpayOrderId: order.razorpayOrderId,
-      amount: order.totalPrice,
+      razorpayOrderId: current.razorpayOrderId,
+      amount: current.totalPrice,
       currency: 'INR',
       orderId,
       key: env.RAZORPAY_KEY_ID,
     };
   }
 
-  if (order.status !== 'PENDING_PAYMENT') {
-    throw ApiError.badRequest(`Order is in ${order.status} status, not PENDING_PAYMENT`);
+  if (current.status !== 'PENDING_PAYMENT') {
+    throw ApiError.badRequest(`Order is in ${current.status} status, not PENDING_PAYMENT`);
   }
 
-  if (order.totalPrice < 100) {
-    throw ApiError.badRequest('Minimum order amount is ₹1');
-  }
-
-  // ── Claim the right to create, atomically, BEFORE calling Razorpay ──
+  // ── Claim the right to create, atomically, BEFORE anything else ──
   //
   // The read above cannot be trusted on its own: two taps on "Pay" produce two
   // requests that both see razorpayOrderId as null, both call Razorpay, and both
@@ -461,11 +445,11 @@ export async function createPaymentOrder(
     // Lost the race. Either the winner has already recorded its Razorpay order
     // (return it — this is the genuine idempotent hit), or it is still in
     // flight and the client should retry in a moment.
-    const current = await prisma.order.findUnique({ where: { id: orderId } });
-    if (current?.razorpayOrderId) {
+    const winner = await prisma.order.findUnique({ where: { id: orderId } });
+    if (winner?.razorpayOrderId) {
       return {
-        razorpayOrderId: current.razorpayOrderId,
-        amount: current.totalPrice,
+        razorpayOrderId: winner.razorpayOrderId,
+        amount: winner.totalPrice,
         currency: 'INR',
         orderId,
         key: env.RAZORPAY_KEY_ID,
@@ -473,6 +457,79 @@ export async function createPaymentOrder(
     }
     throw ApiError.conflict('A payment is already being set up for this order. Please try again in a moment.');
   }
+
+  /**
+   * Hand the order back so the student can retry immediately rather than
+   * waiting out the stale-claim TTL.
+   *
+   * Every exit between here and the moment `razorpayOrderId` is recorded has to
+   * go through this, because the claim is what freezes the order's files: a
+   * claim left behind by a refusal locks the student out of fixing the very
+   * thing they were refused for.
+   */
+  const releaseClaim = async () => {
+    await prisma.order
+      .updateMany({ where: { id: orderId, razorpayOrderId: null }, data: { paymentAttemptedAt: null } })
+      .catch((error) => console.error(`[payment] could not release the claim on ${orderId}:`, error));
+  };
+
+  // ── Price the order from pages the server counted, before charging ──
+  //
+  // `pageCount` reaches the order from the browser and is the multiplier in
+  // `pageCount × rate × copies`. Every other pricing input already comes from
+  // the database; this is the last one that did not, and understating it
+  // understated the bill — a 200-page PDF declared as one page was charged as
+  // one page and printed as two hundred.
+  //
+  // Inside the claim, deliberately. This used to run *before* it, and the
+  // fingerprint that certifies "these are the files that price was computed
+  // from" was written *after* it — so the two straddled the one thing that
+  // freezes an order's files. An upload committing in that gap was allowed by
+  // the upload guard (no claim yet, no razorpayOrderId yet) and left the price
+  // describing the old file set while the fingerprint described the new one.
+  // Both downstream checks then passed on a swapped document: the captured
+  // amount still equalled `totalPrice`, and `pricedFilesUnchanged` still
+  // matched. Everything from here to the `razorpayOrderId` write now happens
+  // with the files held.
+  const repriced = await orderService.repriceFromVerifiedPages(orderId);
+
+  if (repriced.unverifiable.length > 0) {
+    await releaseClaim();
+    throw ApiError.badRequest(
+      `We could not read the page count for ${repriced.unverifiable.join(', ')}. ` +
+      `Please re-upload ${repriced.unverifiable.length > 1 ? 'these files' : 'this file'} before paying.`
+    );
+  }
+
+  // If it moves we stop rather than charging the corrected figure: the amount
+  // taken must be the amount that was on screen when they agreed to it.
+  if (repriced.changed) {
+    await releaseClaim();
+    throw ApiError.conflict(
+      `The page count for this order was different from what was submitted, so the ` +
+      `total is now ₹${(repriced.totalPrice / 100).toFixed(2)} instead of ` +
+      `₹${(repriced.previousTotal / 100).toFixed(2)}. Please review and pay again.`
+    );
+  }
+
+  // Read under the claim, so this is the figure the fingerprint below belongs to.
+  const order = await prisma.order.findUnique({ where: { id: orderId } });
+  if (!order) throw ApiError.notFound('Order not found');
+  if (order.userId !== userId) throw ApiError.forbidden('This is not your order');
+
+  if (order.totalPrice < 100) {
+    await releaseClaim();
+    throw ApiError.badRequest('Minimum order amount is ₹1');
+  }
+
+  // Hashed here rather than after the gateway call, from the same held state the
+  // price was just read from. The claim does hold across the round trip — the
+  // upload guard refuses while it is live — but it lapses at
+  // PAYMENT_CLAIM_TTL_MS, and a gateway call slower than that would reopen the
+  // exact gap this ordering exists to close. Taking both figures from one moment
+  // means the fingerprint cannot describe a file set the amount was not computed
+  // from, whatever Razorpay does with the time in between.
+  const pricedFilesFingerprint = await orderService.fingerprintPricedFiles(prisma, orderId);
 
   const razorpay = getRazorpay();
 
@@ -489,12 +546,7 @@ export async function createPaymentOrder(
       },
     });
   } catch (error) {
-    // Release the claim so the student can retry immediately rather than
-    // waiting out the stale-claim TTL.
-    await prisma.order.updateMany({
-      where: { id: orderId, razorpayOrderId: null },
-      data: { paymentAttemptedAt: null },
-    });
+    await releaseClaim();
     throw error;
   }
 
@@ -511,7 +563,7 @@ export async function createPaymentOrder(
     where: { id: orderId, razorpayOrderId: null },
     data: {
       razorpayOrderId: rpOrder.id,
-      pricedFilesFingerprint: await orderService.fingerprintPricedFiles(prisma, orderId),
+      pricedFilesFingerprint,
     },
   });
 
@@ -1084,15 +1136,21 @@ async function processWebhookEvent(eventType: string, event: any, eventId: strin
       // student who closed the browser before the verify call ran: they are
       // charged either way, so the pass must not depend on the tab staying open.
       if (payment.notes?.subscription_type === 'student_pass' && payment.notes?.userId) {
-        // The signature proves Razorpay sent this, not that the sum is right.
-        if (payment.amount !== env.STUDENT_PASS_PRICE_PAISE) {
-          console.error(
-            `⚠️ Student Pass paid ${payment.amount} but the price is ` +
-            `${env.STUDENT_PASS_PRICE_PAISE} (payment ${rpPaymentId}) — not activating.`
-          );
+        // Resolved against the purchase row this payment belongs to, which is
+        // what makes the amount check honest (it compares against what the
+        // student was quoted, not against today's price) and what stops a
+        // second capture overwriting the first beyond recovery.
+        const purchase = await findPassPurchase(payment);
+
+        if (purchase) {
+          await applyPassCapture(purchase.id, rpPaymentId, payment.amount, payment.notes.userId);
         } else {
-          await activateStudentPass(payment.notes.userId, rpPaymentId);
+          // No purchase row: a checkout minted before the table existed, whose
+          // payment landed after the deploy. Honoured as it was sold, and
+          // alerted — see `applyLegacyPassCapture`.
+          await applyLegacyPassCapture(payment.notes.userId, rpPaymentId, payment.amount);
         }
+
         await prisma.webhookEvent.update({
           where: { eventId },
           data: { processed: true, processedAt: new Date() },
@@ -1460,6 +1518,21 @@ export async function reconcilePayments(thresholdMinutes: number = 15) {
       razorpayOrderId: true,
       totalPrice: true,
     },
+    // Bounded like the expiry sweep and the webhook retry below, which this sat
+    // between while being the only one of the three that was not.
+    //
+    // The working set is not the handful of genuinely stuck payments — it is
+    // every abandoned checkout, which keeps `razorpayOrderId` and a stale
+    // `paymentAttemptedAt` until `expireStaleUnpaidOrders` cancels it three days
+    // later. Each one costs *two* gateway calls inside `adoptCapturedPayment`,
+    // re-spent every fifteen minutes, so a few hundred abandoned carts is tens
+    // of thousands of Razorpay calls a day to learn nothing. Worse, a sweep that
+    // outruns its own interval halves the reconciliation rate for the real stuck
+    // payments, because `schedule`'s overlap guard skips the next tick.
+    //
+    // Oldest first, so a backlog drains in order rather than starving its tail.
+    orderBy: { paymentAttemptedAt: 'asc' },
+    take: 100,
   });
 
   // No early return when there is nothing stuck. There used to be one, and it
@@ -1548,7 +1621,39 @@ export async function reconcilePayments(thresholdMinutes: number = 15) {
  * and notes carry the user id — that is what lets the webhook activate the pass
  * if the student closes the browser before the verify call runs.
  */
-export async function createStudentPassOrder(userId: string) {
+export interface PassCheckoutResult {
+  razorpayOrderId: string;
+  amount: number;
+  currency: string;
+  key: string;
+  /** True when this call found the pass already paid for and applied it. */
+  paid?: boolean;
+  /** Human-readable, shown when `paid` is true. */
+  message?: string;
+}
+
+/**
+ * Open — or re-open — a Student Pass checkout.
+ *
+ * Every purchase now has a row, and that row is what makes a second charge
+ * impossible rather than unlikely. Three properties do the work, in the order a
+ * request meets them:
+ *
+ *  1. An open checkout is *returned*, not refused. The student who taps twice
+ *     gets the same Razorpay order back, so there is only ever one order for
+ *     them to pay — which is a better answer than an error and a stronger
+ *     guarantee than a lock, because Razorpay itself will not let one order be
+ *     paid twice.
+ *  2. A stale checkout is asked about at the gateway before anything new is
+ *     minted, exactly as `adoptCapturedPayment` does for a print order. A UPI
+ *     collect approved after the sheet was dismissed is adopted rather than
+ *     charged again.
+ *  3. The insert is serialised by a partial unique index on
+ *     `userId WHERE status = 'OPEN'`. Two concurrent requests cannot both
+ *     create an open checkout; Postgres refuses the second in the index, with
+ *     no timer and no compare-and-swap to get wrong.
+ */
+export async function createStudentPassOrder(userId: string): Promise<PassCheckoutResult> {
   const user = await prisma.user.findUnique({
     where: { id: userId },
     select: { type: true, hasStudentPass: true, studentPassActivatedAt: true },
@@ -1562,18 +1667,117 @@ export async function createStudentPassOrder(userId: string) {
     throw ApiError.badRequest('Your Student Pass is still active.');
   }
 
-  const razorpay = getRazorpay();
-  const rpOrder = await razorpay.orders.create({
-    amount: env.STUDENT_PASS_PRICE_PAISE,
-    currency: 'INR',
-    // Unique per attempt: Razorpay rejects a duplicate receipt, and a retry
-    // after an abandoned checkout must not collide with the earlier attempt.
-    receipt: `pass_${userId.slice(-8)}_${Date.now()}`,
-    notes: {
-      userId,
-      subscription_type: 'student_pass',
-    },
+  const open = await prisma.studentPassPurchase.findFirst({
+    where: { userId, status: 'OPEN' },
   });
+
+  if (open) {
+    // ── Still live: hand back the same checkout ──
+    //
+    // The idempotent hit, and the reason this path is a return rather than the
+    // 400 a lock would have to give. One gateway order means one possible
+    // capture, so the student tapping "Buy" again is harmless — and being shown
+    // the sheet again is what they were asking for.
+    if (open.razorpayOrderId && open.expiresAt > new Date()) {
+      return {
+        razorpayOrderId: open.razorpayOrderId,
+        amount: open.amountPaise,
+        currency: 'INR',
+        key: env.RAZORPAY_KEY_ID,
+      };
+    }
+
+    // ── Expired, or never got its gateway order ──
+    //
+    // Ask before replacing it. A Razorpay order outlives our idea of the
+    // checkout: the sheet can be dismissed and the collect approved twenty
+    // minutes later, and that capture looks exactly like an abandoned checkout
+    // from here. Minting a second order without looking is how one payment
+    // becomes two, and it is the case a TTL alone could never see.
+    if (open.razorpayOrderId) {
+      const adopted = await adoptPaidPassCheckout(open.id, open.razorpayOrderId, userId);
+      if (adopted) return adopted;
+    }
+
+    // Genuinely unpaid. Free the slot; the row stays, so a capture arriving
+    // even later still finds the purchase it belongs to.
+    await prisma.studentPassPurchase.updateMany({
+      where: { id: open.id, status: 'OPEN' },
+      data: { status: 'ABANDONED' },
+    });
+  }
+
+  // ── Claim the one open slot ──
+  //
+  // The partial unique index is the serialisation. A concurrent request that
+  // loses does not retry into a second gateway order — it reads the winner's
+  // checkout and returns that, which is the same answer the fast path above
+  // gives and the same single order.
+  let purchase: { id: string };
+  try {
+    purchase = await prisma.studentPassPurchase.create({
+      data: {
+        userId,
+        amountPaise: env.STUDENT_PASS_PRICE_PAISE,
+        expiresAt: new Date(Date.now() + PASS_CHECKOUT_EXPIRY_MS),
+      },
+      select: { id: true },
+    });
+  } catch (error) {
+    if (!isUniqueViolation(error)) throw error;
+
+    const winner = await prisma.studentPassPurchase.findFirst({
+      where: { userId, status: 'OPEN', razorpayOrderId: { not: null } },
+    });
+    if (winner?.razorpayOrderId) {
+      return {
+        razorpayOrderId: winner.razorpayOrderId,
+        amount: winner.amountPaise,
+        currency: 'INR',
+        key: env.RAZORPAY_KEY_ID,
+      };
+    }
+    // The winner has the slot but has not heard back from Razorpay yet. A
+    // moment, not a failure.
+    throw ApiError.conflict(
+      'Your Student Pass checkout is being set up. Please try again in a moment.'
+    );
+  }
+
+  /** Give the slot back, so a refusal never leaves the student unable to buy. */
+  const abandon = async () => {
+    await prisma.studentPassPurchase
+      .updateMany({ where: { id: purchase.id, status: 'OPEN' }, data: { status: 'ABANDONED' } })
+      .catch((error) =>
+        console.error(`[payment] could not abandon pass checkout ${purchase.id}:`, error)
+      );
+  };
+
+  let rpOrder: { id: string };
+  try {
+    const razorpay = getRazorpay();
+    rpOrder = await razorpay.orders.create({
+      amount: env.STUDENT_PASS_PRICE_PAISE,
+      currency: 'INR',
+      // The purchase id, so the gateway order and the row name each other. The
+      // receipt used to carry a timestamp for uniqueness; a cuid is unique by
+      // construction and is something we can look up.
+      receipt: `pass_${purchase.id}`,
+      notes: {
+        userId,
+        purchaseId: purchase.id,
+        subscription_type: 'student_pass',
+      },
+    });
+
+    await prisma.studentPassPurchase.update({
+      where: { id: purchase.id },
+      data: { razorpayOrderId: rpOrder.id },
+    });
+  } catch (error) {
+    await abandon();
+    throw error;
+  }
 
   return {
     razorpayOrderId: rpOrder.id,
@@ -1583,37 +1787,390 @@ export async function createStudentPassOrder(userId: string) {
   };
 }
 
+/** Prisma's unique-constraint violation, without importing its error classes. */
+function isUniqueViolation(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && (error as { code?: string }).code === 'P2002';
+}
+
+/**
+ * Adopt a pass checkout Razorpay turns out to have been paid.
+ *
+ * The mirror of `adoptCapturedPayment` on the order path, and it exists for the
+ * same reason: the money is gone from the student's account either way, so the
+ * only question is whether we notice. Returning a result means "do not mint
+ * anything new"; returning null means the gateway agrees nobody paid.
+ *
+ * A gateway lookup that fails returns null deliberately — see the call site.
+ */
+async function adoptPaidPassCheckout(
+  purchaseId: string,
+  razorpayOrderId: string,
+  userId: string
+): Promise<PassCheckoutResult | null> {
+  let captured: { id: string; amount: number } | null = null;
+
+  try {
+    const razorpay = getRazorpay();
+    const rpOrder = await razorpay.orders.fetch(razorpayOrderId);
+    if (rpOrder.status !== 'paid') return null;
+
+    const payments = await razorpay.orders.fetchPayments(razorpayOrderId);
+    const hit = (payments as { items?: Array<{ id: string; status: string; amount: number }> })
+      .items?.find((p) => p.status === 'captured');
+    captured = hit ? { id: hit.id, amount: hit.amount } : null;
+  } catch (error) {
+    // Fail *open* here, unlike the order path, and the difference is deliberate.
+    // There the cost of guessing wrong is a paid student's file deleted; here it
+    // is a second gateway order, which the capture path then reconciles against
+    // its own purchase row and stacks. Blocking a student from buying a pass
+    // because Razorpay is briefly unreachable is the worse trade.
+    console.error(`[payment] could not check pass checkout ${razorpayOrderId} before replacing it:`, error);
+    return null;
+  }
+
+  if (!captured) {
+    // Razorpay says paid but lists no capture. Money is somewhere in that gap,
+    // so this is not a green light to charge again.
+    await prisma.studentPassPurchase.updateMany({
+      where: { id: purchaseId, status: 'OPEN' },
+      data: { status: 'REFUSED', refusedReason: 'gateway reports the order paid but lists no capture' },
+    });
+    notify.notifyAdmins(
+      `Student Pass order ${razorpayOrderId} (user ${userId}) is paid at Razorpay but lists no ` +
+      `captured payment. The pass was not activated and this needs a human.`,
+      'error'
+    );
+    throw ApiError.conflict(
+      'We have found a payment against your Student Pass but cannot match it yet. ' +
+      'Our team has been alerted — please do not pay again.'
+    );
+  }
+
+  const outcome = await applyPassCapture(purchaseId, captured.id, captured.amount, userId);
+
+  if (!outcome.applied) {
+    throw ApiError.conflict(
+      'We have found a payment against your Student Pass but the amount does not match. ' +
+      'Our team has been alerted — please do not pay again.'
+    );
+  }
+
+  return {
+    razorpayOrderId,
+    amount: captured.amount,
+    currency: 'INR',
+    key: env.RAZORPAY_KEY_ID,
+    paid: true,
+    message: 'Your earlier payment did go through — your Student Pass is active.',
+  };
+}
+
+export interface PassCaptureOutcome {
+  /** True when the pass was actually applied. False means the money was refused. */
+  applied: boolean;
+  /** Present when applied; carries whether the window was stacked. */
+  activation?: PassActivation;
+}
+
+/**
+ * Resolve one captured pass payment against the purchase it belongs to.
+ *
+ * The single place a pass capture is applied, reached from all three directions
+ * — the webhook, the client's verify call, and the adoption check when a stale
+ * checkout is replaced. Three copies of "the money landed, apply the pass" is
+ * how they come to disagree about what a paid pass looks like.
+ *
+ * Idempotent through the purchase's own status: only an OPEN or ABANDONED
+ * purchase can be paid, so a redelivered webhook, or the verify call racing it,
+ * matches nothing and applies nothing.
+ *
+ * ABANDONED is accepted deliberately. A checkout that expired unpaid still has
+ * its row, and a UPI collect approved half an hour later is a real payment for
+ * a real purchase — refusing it because we had given up waiting would take the
+ * student's money and deliver nothing.
+ */
+export async function applyPassCapture(
+  purchaseId: string,
+  paymentId: string,
+  amountPaise: number,
+  userId: string
+): Promise<PassCaptureOutcome> {
+  const purchase = await prisma.studentPassPurchase.findUnique({ where: { id: purchaseId } });
+
+  if (!purchase) {
+    // A capture whose purchase does not exist. The audit is what finds these;
+    // this is only the path that refuses to guess.
+    console.error(`⚠️ Student Pass payment ${paymentId} names purchase ${purchaseId}, which does not exist.`);
+    notify.notifyAdmins(
+      `A captured Student Pass payment (${paymentId}, user ${userId}) refers to a purchase ` +
+      `that does not exist. The pass was not activated — this needs a human.`,
+      'error'
+    );
+    return { applied: false };
+  }
+
+  if (purchase.status === 'PAID' || purchase.status === 'REFUSED') {
+    // Already resolved by whichever path arrived first.
+    return { applied: purchase.status === 'PAID' };
+  }
+
+  // Judged against what the student was quoted when this checkout was minted,
+  // not against the current price. A price change while a checkout is open is
+  // an ordinary thing to do and must not turn a good payment into a refused
+  // one — which is exactly what comparing against `env` would have done.
+  if (amountPaise !== purchase.amountPaise) {
+    const reason =
+      `captured ${amountPaise} paise but this checkout was quoted ${purchase.amountPaise}`;
+
+    console.error(`⚠️ Student Pass payment ${paymentId} refused — ${reason}.`);
+
+    await prisma.studentPassPurchase.updateMany({
+      where: { id: purchase.id, status: { in: ['OPEN', 'ABANDONED'] } },
+      data: { status: 'REFUSED', razorpayPaymentId: paymentId, refusedReason: reason },
+    });
+
+    // Money moved and nothing is being delivered, so somebody has to be told.
+    // The purchase row is what makes this recoverable: it names the payment, the
+    // student and the sum, which is everything a refund needs.
+    notify.notifyAdmins(
+      `A Student Pass payment was refused — ${reason} (payment ${paymentId}, user ${userId}, ` +
+      `purchase ${purchase.id}). The pass was NOT activated and the money has not been returned.`,
+      'error'
+    );
+
+    return { applied: false };
+  }
+
+  const activation = await prisma.$transaction(async (tx) => {
+    const claimed = await tx.studentPassPurchase.updateMany({
+      where: { id: purchase.id, status: { in: ['OPEN', 'ABANDONED'] } },
+      data: { status: 'PAID', razorpayPaymentId: paymentId },
+    });
+
+    // Another delivery got here first. Its transaction applied the pass; this
+    // one must not apply it again.
+    if (claimed.count === 0) return null;
+
+    const result = await activateStudentPass(userId, paymentId, tx);
+
+    await tx.studentPassPurchase.update({
+      where: { id: purchase.id },
+      data: { appliedFrom: result.activatedAt },
+    });
+
+    return result;
+  });
+
+  if (!activation) return { applied: true };
+
+  reportStackedPass(activation, userId, paymentId);
+  return { applied: true, activation };
+}
+
+/**
+ * Apply a pass capture that has no purchase row, the way the old code did.
+ *
+ * Only one population can reach this: a checkout minted before
+ * `student_pass_purchases` existed, whose payment lands after the deploy. Its
+ * notes carry no `purchaseId` and its gateway order is in no row, so
+ * `findPassPurchase` cannot match it — and refusing on that basis would charge
+ * a student ₹49 and give them nothing, for the crime of being mid-checkout
+ * while we shipped.
+ *
+ * So it keeps the behaviour it was minted under, including comparing against
+ * `STUDENT_PASS_PRICE_PAISE` — which was the correct quote for those checkouts,
+ * because it is the figure they were opened at.
+ *
+ * Alerted either way. This population drains within one checkout window and
+ * should then never appear again; a payment arriving here a week after the
+ * deploy is not a legacy checkout, it is something worth looking at.
+ */
+export async function applyLegacyPassCapture(
+  userId: string,
+  paymentId: string,
+  amountPaise: number
+): Promise<PassCaptureOutcome> {
+  if (amountPaise !== env.STUDENT_PASS_PRICE_PAISE) {
+    console.error(
+      `⚠️ Student Pass payment ${paymentId} has no purchase row and is for ${amountPaise} paise, ` +
+      `not ${env.STUDENT_PASS_PRICE_PAISE} — not activating.`
+    );
+    notify.notifyAdmins(
+      `A Student Pass payment (${paymentId}, user ${userId}) has no purchase record and does not ` +
+      `match the price. The pass was NOT activated and the money has not been returned.`,
+      'error'
+    );
+    return { applied: false };
+  }
+
+  console.warn(
+    `[payment] Student Pass payment ${paymentId} has no purchase row — treating it as a checkout ` +
+    `minted before the table existed.`
+  );
+  notify.notifyAdmins(
+    `A Student Pass payment (${paymentId}, user ${userId}) arrived with no purchase record. It has ` +
+    `been honoured as a checkout opened before purchases were recorded. If this appears well after ` +
+    `that deploy, it needs a look.`,
+    'warning'
+  );
+
+  const activation = await activateStudentPass(userId, paymentId);
+  reportStackedPass(activation, userId, paymentId);
+
+  return { applied: true, activation };
+}
+
+/**
+ * Find the purchase a captured pass payment belongs to.
+ *
+ * `notes.purchaseId` is set on every checkout this code mints, so the match is
+ * exact. The gateway order id is the fallback, which covers a payment made
+ * against a checkout minted before notes carried the id.
+ */
+async function findPassPurchase(payment: {
+  order_id?: string | null;
+  notes?: Record<string, string | undefined> | null;
+}): Promise<{ id: string } | null> {
+  const claimed = payment.notes?.purchaseId;
+  if (claimed) {
+    const byId = await prisma.studentPassPurchase.findUnique({
+      where: { id: claimed },
+      select: { id: true },
+    });
+    if (byId) return byId;
+  }
+
+  if (!payment.order_id) return null;
+
+  return prisma.studentPassPurchase.findUnique({
+    where: { razorpayOrderId: payment.order_id },
+    select: { id: true },
+  });
+}
+
+/**
+ * Tell the admins when a student has paid for a pass they already hold.
+ *
+ * `activateStudentPass` now grants the extra days rather than losing them, so
+ * nothing is broken by the time this runs — but the student has been charged
+ * twice for something they only meant to buy once, and that is a refund
+ * decision a person has to make. Nothing else can surface it: a pass has no
+ * order row, and `auditCapturedPayments` skips pass payments by design.
+ */
+function reportStackedPass(activation: PassActivation, userId: string, paymentId: string): void {
+  if (!activation.stacked) return;
+
+  console.warn(
+    `⚠️ Student Pass payment ${paymentId} arrived for user ${userId} who already held a live pass — ` +
+    `extended instead of reset.`
+  );
+  notify.notifyAdmins(
+    `Student ${userId} paid for a Student Pass while one was still active (payment ${paymentId}). ` +
+    `Their pass has been extended rather than reset, so no days were lost — but they have been ` +
+    `charged twice and may be owed a refund.`,
+    'warning'
+  );
+}
+
+export interface PassActivation {
+  /** True when this call was the one that applied the pass. */
+  activated: boolean;
+  /**
+   * True when a pass that was *still live* got extended — i.e. this is a second
+   * payment for a pass the student already holds. Worth a human's attention:
+   * they have been charged twice, and the platform now owes them either the
+   * extra days (which this grants) or a refund.
+   */
+  stacked: boolean;
+  /** The start of the 30-day window now in force. */
+  activatedAt: Date | null;
+}
+
 /**
  * Turn a paid pass payment into an active pass.
  *
  * Idempotent through `studentPassPaymentId`: re-running with the same payment
- * id matches no row and changes nothing, so a verify call racing the webhook
- * cannot grant two passes or move the expiry forward twice. A *different*
- * payment id is allowed through, which is what makes renewal work.
+ * id changes nothing, so a verify call racing the webhook cannot grant two
+ * passes or move the expiry forward twice. A *different* payment id is allowed
+ * through, which is what makes renewal work.
  *
- * Returns whether this call was the one that activated it.
+ * A different payment id used to overwrite `studentPassActivatedAt` with the
+ * current time, and that lost days the student had paid for. Nothing dedupes
+ * two open pass checkouts — a pass has no local row to claim, unlike a print
+ * order — so a dismissed sheet followed by a second attempt, with the first
+ * UPI collect approved later, produced two captures. The second reset the
+ * window: ₹98 charged, thirty days delivered, and no record of the first
+ * payment left anywhere, because `studentPassPaymentId` had just been
+ * overwritten and `auditCapturedPayments` skips pass payments by design.
+ *
+ * So a second payment now *stacks*: the new window begins where the live one
+ * ends, and the student gets the sixty days they paid for. The read and the
+ * write share a transaction, so two captures arriving together cannot both read
+ * the same expiry and both extend from it.
  */
-export async function activateStudentPass(userId: string, paymentId: string): Promise<boolean> {
-  const activated = await prisma.user.updateMany({
-    where: {
-      id: userId,
-      // The null branch is required, not defensive. `{ not: x }` compiles to a
-      // SQL inequality, and NULL <> 'x' is NULL rather than true, so a column
-      // that has never been set matches nothing — which is every first-time
-      // buyer. Without this the guard silently excluded exactly the case it was
-      // meant to allow, and a paid pass never activated.
-      OR: [
-        { studentPassPaymentId: null },
-        { studentPassPaymentId: { not: paymentId } },
-      ],
-    },
-    data: {
-      hasStudentPass: true,
-      studentPassActivatedAt: new Date(),
-      studentPassPaymentId: paymentId,
-    },
-  });
-  return activated.count > 0;
+export async function activateStudentPass(
+  userId: string,
+  paymentId: string,
+  /**
+   * Join the caller's transaction.
+   *
+   * `applyPassCapture` passes its own, so marking the purchase paid and
+   * applying the pass commit together — a purchase recorded as PAID against a
+   * student whose pass never moved would be the worst of both records.
+   */
+  txClient?: Prisma.TransactionClient
+): Promise<PassActivation> {
+  const execute = async (tx: Prisma.TransactionClient): Promise<PassActivation> => {
+    const user = await tx.user.findUnique({
+      where: { id: userId },
+      select: { hasStudentPass: true, studentPassActivatedAt: true, studentPassPaymentId: true },
+    });
+
+    if (!user) return { activated: false, stacked: false, activatedAt: null };
+
+    // Already applied by whichever of verify/webhook got here first.
+    if (user.studentPassPaymentId === paymentId) {
+      return { activated: false, stacked: false, activatedAt: user.studentPassActivatedAt };
+    }
+
+    const stillActive = isStudentPassActive(user.hasStudentPass, user.studentPassActivatedAt);
+
+    // Extend from the moment the live window ends, not from now. `activatedAt`
+    // is the *start* of the window in force, so a future value is correct and
+    // `isStudentPassActive` — `now < activatedAt + PASS_DURATION_MS` — keeps
+    // returning true throughout the gap.
+    const activatedAt = stillActive && user.studentPassActivatedAt
+      ? new Date(user.studentPassActivatedAt.getTime() + PASS_DURATION_MS)
+      : new Date();
+
+    const applied = await tx.user.updateMany({
+      where: {
+        id: userId,
+        // The null branch is required, not defensive. `{ not: x }` compiles to a
+        // SQL inequality, and NULL <> 'x' is NULL rather than true, so a column
+        // that has never been set matches nothing — which is every first-time
+        // buyer. Without this the guard silently excluded exactly the case it was
+        // meant to allow, and a paid pass never activated.
+        OR: [
+          { studentPassPaymentId: null },
+          { studentPassPaymentId: { not: paymentId } },
+        ],
+      },
+      data: {
+        hasStudentPass: true,
+        studentPassActivatedAt: activatedAt,
+        studentPassPaymentId: paymentId,
+      },
+    });
+
+    return {
+      activated: applied.count > 0,
+      stacked: stillActive && applied.count > 0,
+      activatedAt,
+    };
+  };
+
+  return txClient ? execute(txClient) : prisma.$transaction(execute);
 }
 
 /**
@@ -1673,15 +2230,28 @@ export async function verifyStudentPassPayment(
     throw ApiError.badRequest('This Student Pass payment has not completed yet.');
   }
 
-  if (rpPayment?.amount !== env.STUDENT_PASS_PRICE_PAISE) {
-    console.error(
-      `⚠️ Student Pass payment ${razorpayPaymentId} is for ${rpPayment?.amount} paise but ` +
-      `the price is ${env.STUDENT_PASS_PRICE_PAISE} — not activating.`
-    );
-    throw ApiError.badRequest('The amount paid does not match the Student Pass price.');
-  }
+  // Through the same path the webhook uses, so the two cannot come to different
+  // conclusions about what a paid pass looks like. It owns the amount check as
+  // well — judged against what this checkout was quoted rather than against the
+  // current price, so a price change mid-checkout does not refuse a good
+  // payment — and it owns marking the purchase resolved either way.
+  const purchase = await findPassPurchase({
+    order_id: razorpayOrderId,
+    notes: rpOrder?.notes as Record<string, string | undefined> | null,
+  });
 
-  await activateStudentPass(userId, razorpayPaymentId);
+  // A checkout minted before purchases were recorded has no row to match, and
+  // refusing it would fail the verify call for a student who has already paid.
+  const outcome = purchase
+    ? await applyPassCapture(purchase.id, razorpayPaymentId, rpPayment.amount ?? 0, userId)
+    : await applyLegacyPassCapture(userId, razorpayPaymentId, rpPayment.amount ?? 0);
+
+  if (!outcome.applied) {
+    throw ApiError.badRequest(
+      'The amount paid does not match what this Student Pass checkout was for. ' +
+      'Our team has been alerted — please do not pay again.'
+    );
+  }
 
   const user = await prisma.user.findUnique({
     where: { id: userId },
@@ -1717,10 +2287,19 @@ export interface PaymentAuditResult {
   /** Captured but too recent to judge yet; see `graceMinutes`. */
   skippedTooRecent: number;
   orphans: OrphanPayment[];
+  /**
+   * True when the page cap was reached, so the window holds payments this pass
+   * never looked at. An empty `orphans` does not mean "nothing is wrong" when
+   * this is set — it means "nothing is wrong in the part we could see".
+   */
+  truncated: boolean;
 }
 
 /** Razorpay caps a page at 100. */
 const AUDIT_PAGE_SIZE = 100;
+
+/** Pages one audit pass will walk before it reports the window as truncated. */
+const AUDIT_MAX_PAGES = 10;
 
 /**
  * The part of a Razorpay payment this audit reads.
@@ -1777,9 +2356,18 @@ export async function auditCapturedPayments(options?: {
 
   const captured: RazorpayPayment[] = [];
   let skip = 0;
+  let truncated = false;
   // Bounded so a wide window cannot spin: 10 pages is 1000 payments, far more
   // than this platform sees in a day, and the window is the real control.
-  for (let page = 0; page < 10; page++) {
+  //
+  // But "far more than we see" is a growth assumption with nothing asserting
+  // it, and hitting the cap used to be indistinguishable from finding nothing.
+  // Razorpay returns newest first, so the payments dropped are the *oldest* in
+  // the window — exactly the ones past the grace period that are ripe to be
+  // judged. This is the only check that can see a payment whose order no longer
+  // exists, so it silently covering less than it claims is the worst way for it
+  // to fail. `truncated` makes the cap visible to the caller.
+  for (let page = 0; page < AUDIT_MAX_PAGES; page++) {
     const response = (await razorpay.payments.all({
       from: Math.floor(windowStart.getTime() / 1000),
       count: AUDIT_PAGE_SIZE,
@@ -1790,11 +2378,20 @@ export async function auditCapturedPayments(options?: {
     captured.push(...items.filter((p) => p?.status === 'captured'));
 
     if (items.length < AUDIT_PAGE_SIZE) break;
+
     skip += AUDIT_PAGE_SIZE;
+    truncated = page === AUDIT_MAX_PAGES - 1;
   }
 
   let skippedTooRecent = 0;
   const orphans: OrphanPayment[] = [];
+  /**
+   * When pass purchases started being recorded, read once and only if needed.
+   *
+   * `undefined` means not looked up yet; `null` means no purchase has ever
+   * been recorded, so no pass payment is auditable.
+   */
+  let passRecordsBegan: Date | null | undefined;
 
   for (const payment of captured) {
     const capturedAt = new Date((payment.created_at ?? 0) * 1000);
@@ -1803,8 +2400,44 @@ export async function auditCapturedPayments(options?: {
       continue;
     }
 
-    // Student Pass payments are not orders and have no order row by design.
-    if (payment?.notes?.subscription_type === 'student_pass') continue;
+    // ── Student Pass payments ──
+    //
+    // These used to be skipped outright, and the comment said "not orders and
+    // have no order row by design" — which was true, and was exactly why a
+    // double-charged pass was invisible to the one check that walks from
+    // Razorpay inward. They have a row now, so they are audited like anything
+    // else.
+    if (payment?.notes?.subscription_type === 'student_pass') {
+      const purchase = await findPassPurchase(payment);
+      if (purchase) continue;
+
+      // No purchase row. Either a genuine orphan, or a pass sold before this
+      // table existed — and those are indistinguishable by inspection, so the
+      // floor decides. Anything older than the first purchase we ever recorded
+      // predates the table and is not something a human can act on.
+      if (passRecordsBegan === undefined) {
+        const first = await prisma.studentPassPurchase.findFirst({
+          orderBy: { createdAt: 'asc' },
+          select: { createdAt: true },
+        });
+        // Null until the first pass is sold after this ships; that reads as "no
+        // pass payment is auditable yet", which is correct.
+        passRecordsBegan = first?.createdAt ?? null;
+      }
+
+      if (!passRecordsBegan || capturedAt < passRecordsBegan) continue;
+
+      orphans.push({
+        paymentId: payment.id,
+        amountPaise: payment.amount ?? 0,
+        capturedAt,
+        claimedOrderId: payment?.notes?.purchaseId ?? null,
+        razorpayOrderId: payment?.order_id ?? null,
+        email: payment.email ?? null,
+        contact: payment.contact ?? null,
+      });
+      continue;
+    }
 
     const claimedOrderId: string | null = payment?.notes?.orderId ?? payment?.notes?.order_id ?? null;
     const razorpayOrderId: string | null = payment?.order_id ?? null;
@@ -1841,6 +2474,7 @@ export async function auditCapturedPayments(options?: {
     checked: captured.length - skippedTooRecent,
     skippedTooRecent,
     orphans,
+    truncated,
   };
 }
 
@@ -2029,4 +2663,25 @@ export async function reconcileStuckRefunds(options?: {
   }
 
   return result;
+}
+
+/**
+ * Abandon Student Pass checkouts that expired unpaid.
+ *
+ * Not required for correctness — `createStudentPassOrder` expires a stale
+ * checkout lazily when the student comes back, and the partial unique index is
+ * what actually guarantees one open checkout at a time. This exists so the
+ * table tells the truth for everything that reads it without going through that
+ * path: the orphan audit, and anyone looking at why a purchase is still open.
+ *
+ * The row is kept, only its status changes. A Razorpay order outlives our idea
+ * of it, and a capture arriving later still has to find the purchase it belongs
+ * to — which is the whole reason this table exists.
+ */
+export async function abandonExpiredPassCheckouts(now: Date = new Date()): Promise<number> {
+  const result = await prisma.studentPassPurchase.updateMany({
+    where: { status: 'OPEN', expiresAt: { lt: now } },
+    data: { status: 'ABANDONED' },
+  });
+  return result.count;
 }

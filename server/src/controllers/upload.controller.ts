@@ -129,6 +129,33 @@ async function assertOrderStillAcceptsFileChanges(
 }
 
 /**
+ * Resolve a client-supplied file index to a slot on the order.
+ *
+ * `metadata` arrives as untyped JSON on a multipart field, so `fileIndex` is
+ * whatever the caller wrote. Used directly as a subscript, a *string* naming an
+ * array property sails through a `!targetOrderFile` bounds check —
+ * `files["length"]` is a number and `files["constructor"]` is a function, both
+ * truthy — and execution carries on with an object whose `id`, `uploadId` and
+ * `fileStoragePath` are all undefined. Every guard downstream reads those, so
+ * they all pass, and the request only fails at the Prisma write: bytes pushed to
+ * R2 and a 500 where a 400 belonged.
+ *
+ * Coerced and range-checked here so the refusal happens before any of that.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function resolveFileSlot(files: any[], rawIndex: unknown): any {
+  const index = typeof rawIndex === 'number' ? rawIndex : Number(rawIndex);
+
+  if (!Number.isInteger(index) || index < 0 || index >= files.length) {
+    throw ApiError.badRequest(
+      `Order file index ${String(rawIndex)} is out of bounds — this order has ${files.length} file slot(s).`
+    );
+  }
+
+  return files[index];
+}
+
+/**
  * POST /api/v1/uploads/single
  * Upload a single file. Returns the storage key and metadata.
  */
@@ -157,8 +184,7 @@ export async function uploadSingle(req: Request, res: Response, next: NextFuncti
       if (!order) throw ApiError.notFound('Order not found');
       if (order.userId !== req.user?.userId && req.user?.userType !== 'ADMIN') throw ApiError.forbidden('Not your order');
       
-      targetOrderFile = order.files[metadata.fileIndex];
-      if (!targetOrderFile) throw ApiError.badRequest('Order file index out of bounds');
+      targetOrderFile = resolveFileSlot(order.files, metadata.fileIndex);
       // Same upload arriving again is a retry, not an overwrite — it falls
       // through to the idempotent return below. Without this exception that
       // return was unreachable, because a slot filled by the attempt being
@@ -277,6 +303,17 @@ export async function uploadMultiple(req: Request, res: Response, next: NextFunc
       throw ApiError.badRequest('uploadIds array matching files length is required');
     }
 
+    // Checked alongside the length, and for the same reason `fileIndexes` are
+    // checked for duplicates below. `OrderFile.uploadId` is unique, so writing
+    // one id to two slots violates the constraint *inside the transaction* — the
+    // batch rolls back, the objects are deleted again, and the caller gets a 500
+    // with a Prisma constraint message after their files have already been
+    // uploaded. A client whose retry regenerates ids incorrectly produces this
+    // as readily as a hostile one.
+    if (new Set(uploadIds).size !== uploadIds.length) {
+      throw ApiError.badRequest('Each file needs its own uploadId — the list contains duplicates.');
+    }
+
     const { prisma } = await import('../utils/prisma');
     
     let targetOrder: any = null;
@@ -293,8 +330,7 @@ export async function uploadMultiple(req: Request, res: Response, next: NextFunc
       // `fileIndexes[i]`, `uploadIds[i]` and `files[i]` describe the same file.
       for (let i = 0; i < metadata.fileIndexes.length; i++) {
         const idx = metadata.fileIndexes[i] as number;
-        const orderFile = targetOrder.files[idx];
-        if (!orderFile) throw ApiError.badRequest(`Order file index ${idx} out of bounds`);
+        const orderFile = resolveFileSlot(targetOrder.files, idx);
 
         // A slot already holding *this* upload is the same file arriving a
         // second time — a retry, which must be idempotent rather than an error.
@@ -393,7 +429,7 @@ export async function uploadMultiple(req: Request, res: Response, next: NextFunc
             tx as never, targetOrder.id, req.user?.userType, 'replaced'
           );
           for (let i = 0; i < pending.length; i++) {
-            const orderFile = targetOrder.files[pending[i].fileIndex];
+            const orderFile = resolveFileSlot(targetOrder.files, pending[i].fileIndex);
             const result = results[i];
             const count = pageCounts[i];
             await tx.orderFile.update({
@@ -533,6 +569,55 @@ export async function downloadFile(req: Request, res: Response, next: NextFuncti
 }
 
 /**
+ * Refuse a ticket-attachment deletion by anyone but its uploader or an admin.
+ *
+ * Called only after `verifyStorageAccess` has already established that the
+ * caller is a party to the ticket, so this narrows an existing grant rather
+ * than standing alone.
+ *
+ * The uploader is derived rather than stored: `TicketAttachment.messageId` names
+ * the reply the file arrived with, so its sender is the uploader; a null
+ * `messageId` means the file was attached when the ticket was raised, and those
+ * belong to the raiser.
+ */
+async function assertMayDeleteTicketAttachment(
+  storageKey: string,
+  userId: string,
+  userType: string
+): Promise<void> {
+  if (userType === 'ADMIN') return;
+
+  const { prisma } = await import('../utils/prisma');
+
+  const attachment = await prisma.ticketAttachment.findFirst({
+    where: { storageKey },
+    select: { messageId: true, ticket: { select: { raisedBy: true } } },
+  });
+
+  // Nothing to protect — `verifyStorageAccess` has already refused an unlinked
+  // key, so reaching here means the row went between the two reads.
+  if (!attachment) return;
+
+  let uploaderId: string | null = attachment.ticket.raisedBy;
+
+  if (attachment.messageId) {
+    const message = await prisma.ticketMessage.findUnique({
+      where: { id: attachment.messageId },
+      select: { senderId: true },
+    });
+    // A message that no longer exists leaves the uploader unknowable, and an
+    // unknown owner must not resolve to "anyone who can see it".
+    uploaderId = message?.senderId ?? null;
+  }
+
+  if (uploaderId !== userId) {
+    throw ApiError.forbidden(
+      'Only the person who attached this file, or an admin, can remove it.'
+    );
+  }
+}
+
+/**
  * DELETE /api/v1/uploads/:storageKey
  */
 export async function deleteFileHandler(req: Request, res: Response, next: NextFunction) {
@@ -562,6 +647,18 @@ export async function deleteFileHandler(req: Request, res: Response, next: NextF
 
     if (orderFile) {
       assertOrderAcceptsFileChanges(orderFile.order, req.user.userType, 'removed');
+    } else {
+      // A ticket attachment. `verifyStorageAccess` granted this key to *either*
+      // party — which is right for reading, because the shop has to see a
+      // complaint's files to answer it, and wrong for destroying. Reused as a
+      // delete predicate it let the subject of a complaint remove the
+      // complainant's evidence: one request, no OTP, and — because the row is
+      // hard-deleted below — no trace afterwards that the file ever existed.
+      //
+      // Deleting is therefore the uploader's own right, or an admin's. An
+      // attachment carries the reply it arrived with; one attached when the
+      // ticket was raised has no message and belongs to the raiser.
+      await assertMayDeleteTicketAttachment(storageKey, req.user.userId, req.user.userType);
     }
 
     await storageService.deleteFile(storageKey);

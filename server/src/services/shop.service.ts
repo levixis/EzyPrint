@@ -402,7 +402,7 @@ export async function getShopAggregate(shopId: string, ownerUserId: string, isAd
   }
 
   // Compute aggregate from orders
-  const [orderStats, payoutStats, pendingPayoutCount] = await Promise.all([
+  const [orderStats, payoutStats, pendingPayoutCount, pendingPayoutValue] = await Promise.all([
     prisma.order.groupBy({
       by: ['status'],
       where: { shopId },
@@ -437,10 +437,69 @@ export async function getShopAggregate(shopId: string, ownerUserId: string, isAd
      * nothing outstanding read as its busiest.
      */
     prisma.payout.count({ where: { shopId, status: 'PENDING' } }),
+    /**
+     * The *value* of what is still waiting on an admin, to go with the count
+     * beside it.
+     *
+     * This field held `shop.pendingBalance` — the clearing balance, which is
+     * money earned inside the settlement window and has nothing to do with
+     * payouts at all. Read next to `pendingPayoutCount` it produced "₹X across N
+     * pending payouts" from two unrelated numbers. Nothing renders it yet, which
+     * is exactly why it is worth correcting before something starts trusting the
+     * name.
+     */
+    prisma.payout.aggregate({
+      where: { shopId, status: 'PENDING' },
+      _sum: { amount: true },
+    }),
   ]);
 
+  /**
+   * What this shop has actually given back, net of reversals.
+   *
+   * Revenue used to be handled by excluding REFUNDED orders wholesale, which is
+   * wrong in both directions once partial refunds exist: a ₹100 refund on a ₹500
+   * order removed all ₹500 from revenue, and a refund that the gateway later
+   * *failed* — reversed in the ledger, order returned to COMPLETED — removed
+   * nothing even while the deduction stood.
+   *
+   * The ledger already holds the answer to the paisa, so revenue is now the page
+   * cost of every order that reached the shop, minus what the ledger says was
+   * handed back. The two figures come from the same place the shop's balance
+   * does, so the dashboard and the books can no longer disagree.
+   *
+   * Reversals are matched on the `:reversal` key rather than on the ADJUSTMENT
+   * type, for the same reason `shopShareOfRefund` does it: ADJUSTMENT is a
+   * general-purpose correction, and the first unrelated one would otherwise
+   * inflate revenue.
+   */
+  const [deducted, reversed] = await Promise.all([
+    prisma.ledgerEntry.aggregate({
+      where: { shopId, type: 'REFUND_DEDUCTION', status: { not: 'VOID' } },
+      _sum: { amount: true },
+    }),
+    prisma.ledgerEntry.aggregate({
+      where: {
+        shopId,
+        type: 'ADJUSTMENT',
+        status: { not: 'VOID' },
+        eventId: { endsWith: ':reversal' },
+      },
+      _sum: { amount: true },
+    }),
+  ]);
+
+  const refundedToStudents = Math.max(
+    0,
+    (deducted._sum.amount ?? 0) - (reversed._sum.amount ?? 0)
+  );
+
   const validOrderStatuses = ['PENDING_APPROVAL', 'PRINTING', 'READY_FOR_PICKUP', 'COMPLETED', 'REFUNDED'];
-  const revenueStatuses = ['PENDING_APPROVAL', 'PRINTING', 'READY_FOR_PICKUP', 'COMPLETED'];
+  // REFUNDED is included now, and the refund is subtracted from the total below
+  // instead. Excluding the order discarded its whole page cost however little
+  // came back, and could not see a partial refund on an order that is still
+  // COMPLETED at all. Netting is the only treatment that is right for both.
+  const revenueStatuses = ['PENDING_APPROVAL', 'PRINTING', 'READY_FOR_PICKUP', 'COMPLETED', 'REFUNDED'];
   const activeStatuses = ['PENDING_APPROVAL', 'PRINTING', 'READY_FOR_PICKUP'];
 
   let totalOrders = 0;
@@ -476,6 +535,11 @@ export async function getShopAggregate(shopId: string, ownerUserId: string, isAd
     }
   }
 
+  // Never negative: a refund can exceed what an order earned only when a
+  // reversal has been missed, and a negative headline figure on a dashboard
+  // reads as a bug in the dashboard rather than as one in the ledger.
+  totalRevenue = Math.max(0, totalRevenue - refundedToStudents);
+
   // Upsert aggregate for caching
   const aggregate = await prisma.shopAggregate.upsert({
     where: { shopId },
@@ -487,7 +551,7 @@ export async function getShopAggregate(shopId: string, ownerUserId: string, isAd
       totalRevenue,
       totalBaseFees,
       totalPaidOut: payoutStats._sum.amount || 0,
-      pendingPayouts: shop.pendingBalance,
+      pendingPayouts: pendingPayoutValue._sum.amount || 0,
       pendingPayoutCount,
     },
     update: {
@@ -497,7 +561,7 @@ export async function getShopAggregate(shopId: string, ownerUserId: string, isAd
       totalRevenue,
       totalBaseFees,
       totalPaidOut: payoutStats._sum.amount || 0,
-      pendingPayouts: shop.pendingBalance,
+      pendingPayouts: pendingPayoutValue._sum.amount || 0,
       pendingPayoutCount,
     },
   });

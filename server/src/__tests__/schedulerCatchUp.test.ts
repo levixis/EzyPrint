@@ -56,9 +56,17 @@ const mockDispatchOutbox = jest.fn().mockResolvedValue(0);
 jest.mock('../services/settlement.service', () => ({ runSettlementSweep: mockRunSettlementSweep }));
 jest.mock('../services/payment.service', () => ({
   reconcilePayments: jest.fn().mockResolvedValue({ checked: 0, reconciled: 0, retriedWebhooks: 0 }),
-  auditCapturedPayments: jest.fn().mockResolvedValue({ orphans: [] }),
+  auditCapturedPayments: jest.fn().mockResolvedValue({ orphans: [], truncated: false, checked: 0 }),
   reconcileStuckRefunds: jest.fn().mockResolvedValue({ checked: 0, confirmed: 0, failed: 0, stillPending: 0, stranded: [], errors: 0 }),
+  expireStaleUnpaidOrders: jest.fn().mockResolvedValue({ examined: 0, cancelled: 0, stillPaid: 0, skipped: 0 }),
+  abandonExpiredPassCheckouts: jest.fn().mockResolvedValue(0),
 }));
+// The retention job's other halves. Unstubbed, these reach the real Prisma
+// client through a double that has none of their tables, and the job fails —
+// which this suite would then report as the scheduler not dispatching work.
+jest.mock('../services/token.service', () => ({ cleanupExpiredTokens: jest.fn().mockResolvedValue(0) }));
+jest.mock('../services/otp.service', () => ({ sweepExpiredOtps: jest.fn().mockResolvedValue(0) }));
+jest.mock('../services/notification.service', () => ({ sweepReadNotifications: jest.fn().mockResolvedValue(0) }));
 jest.mock('../services/realtime.service', () => ({
   dispatchOutbox: mockDispatchOutbox,
   pruneOutbox: jest.fn().mockResolvedValue(0),

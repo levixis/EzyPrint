@@ -48,6 +48,28 @@ export const UNSETTLED_REFUND_STATUSES: RefundRequestStatus[] = [
 ];
 
 /**
+ * How long a RESOLVED ticket keeps its evidence before the sweep collects it.
+ *
+ * RESOLVED is not a settlement — `ticket.service`'s own permission table says
+ * so: a shop may mark a ticket RESOLVED but may not CLOSE it, precisely because
+ * *"a party to a dispute should not be able to file it away"*, and the raiser
+ * may reopen it. Purging on RESOLVED contradicted that. It let the subject of a
+ * complaint delete the complainant's evidence — and, because an open ticket is
+ * what pins the related order's documents, the printed file as well.
+ *
+ * So RESOLVED starts a clock instead. Seven days is long enough for a student
+ * who disagrees to say so, and short enough that a genuinely settled ticket does
+ * not hold documents for a month. CLOSED is unaffected: only the raiser or an
+ * admin can set it, and it means the person who complained is satisfied.
+ */
+export const RESOLVED_TICKET_GRACE_DAYS = 7;
+
+/** The moment before which a RESOLVED ticket has run out its grace period. */
+export function resolvedTicketCutoff(now: Date = new Date()): Date {
+  return new Date(now.getTime() - RESOLVED_TICKET_GRACE_DAYS * 24 * 60 * 60 * 1000);
+}
+
+/**
  * Whether someone is still disputing this order.
  *
  * Deleting on completion is right for the ordinary case — the shop printed it
@@ -60,15 +82,25 @@ export const UNSETTLED_REFUND_STATUSES: RefundRequestStatus[] = [
  * a claim is open, and the sweep removes them once it closes. No blanket
  * retention window, and no order keeps its documents for longer than the
  * argument about it lasts.
+ *
+ * A RESOLVED ticket counts as open until its grace period runs out. Without
+ * that, a shop marking a complaint against itself RESOLVED released the order's
+ * documents to the very next retention sweep.
  */
-async function hasOpenDispute(orderId: string): Promise<boolean> {
+async function hasOpenDispute(orderId: string, now: Date = new Date()): Promise<boolean> {
   const [refund, ticket] = await Promise.all([
     prisma.refundRequest.findFirst({
       where: { orderId, status: { in: UNSETTLED_REFUND_STATUSES } },
       select: { id: true },
     }),
     prisma.ticket.findFirst({
-      where: { relatedOrderId: orderId, status: { in: ['OPEN', 'IN_REVIEW'] } },
+      where: {
+        relatedOrderId: orderId,
+        OR: [
+          { status: { in: ['OPEN', 'IN_REVIEW'] } },
+          { status: 'RESOLVED', updatedAt: { gte: resolvedTicketCutoff(now) } },
+        ],
+      },
       select: { id: true },
     }),
   ]);
@@ -183,43 +215,67 @@ export interface SweepResult {
  * their removal. Without this the bucket keeps documents that every other part
  * of the system considers gone.
  */
-export async function sweepUndeletedFiles(batchSize = 50): Promise<SweepResult> {
-  // Orders under an open complaint are excluded in the query rather than
-  // skipped after selection. Skipping would let a handful of long-running
-  // disputes occupy every slot in the batch and stall cleanup for everything
-  // else. `relatedOrderId` is a plain column rather than a relation, so open
-  // tickets are gathered first and excluded by id.
-  const disputedByTicket = await prisma.ticket.findMany({
-    where: { status: { in: ['OPEN', 'IN_REVIEW'] }, relatedOrderId: { not: null } },
-    select: { relatedOrderId: true },
-  });
-  const disputedOrderIds = disputedByTicket
-    .map((t) => t.relatedOrderId)
-    .filter((id): id is string => Boolean(id));
-
-  const orders = await prisma.order.findMany({
+export async function sweepUndeletedFiles(batchSize = 50, now: Date = new Date()): Promise<SweepResult> {
+  // Candidates first, then the ticket exclusion, in that order.
+  //
+  // Orders under an open complaint must be excluded *before* the batch is cut,
+  // not skipped after — skipping would let a handful of long-running disputes
+  // occupy every slot and stall cleanup for everything else. But the previous
+  // shape read every contested ticket in the system into memory and sent the
+  // whole list back as a `notIn`, which grows with unresolved disputes and
+  // eventually exceeds Postgres' 65,535 bound-parameter ceiling. `file-retention`
+  // failing is precisely what leaves student documents in the bucket.
+  //
+  // Over-fetching and then filtering keeps both properties: the parameter list
+  // is bounded by the candidate batch rather than by the dispute backlog, and
+  // the headroom means contested orders do not crowd out the rest.
+  // `relatedOrderId` is a plain column rather than a relation, which is why this
+  // is two queries at all.
+  const candidates = await prisma.order.findMany({
     where: {
       status: { in: TERMINAL_ORDER_STATUSES },
       files: { some: { isFileDeleted: false, fileStoragePath: { not: null } } },
-      id: { notIn: disputedOrderIds },
       OR: [
         { refundRequest: null },
         { refundRequest: { status: { notIn: UNSETTLED_REFUND_STATUSES } } },
       ],
     },
     select: { id: true },
-    take: batchSize,
+    take: batchSize * 4,
   });
+
+  const contested = await prisma.ticket.findMany({
+    where: {
+      relatedOrderId: { in: candidates.map((o) => o.id) },
+      OR: [
+        { status: { in: ['OPEN', 'IN_REVIEW'] } },
+        { status: 'RESOLVED', updatedAt: { gte: resolvedTicketCutoff(now) } },
+      ],
+    },
+    select: { relatedOrderId: true },
+  });
+  const contestedOrderIds = new Set(contested.map((t) => t.relatedOrderId));
+
+  const orders = candidates
+    .filter((o) => !contestedOrderIds.has(o.id))
+    .slice(0, batchSize);
 
   let filesRemoved = 0;
   for (const order of orders) {
     filesRemoved += await purgeOrderFiles(order.id);
   }
 
+  // CLOSED is final — only the raiser or an admin can set it, and it means the
+  // person who complained is satisfied. RESOLVED is a claim by whoever made it,
+  // reopenable by the raiser, so it waits out its grace period here rather than
+  // being collected the moment a shop asserts it.
   const tickets = await prisma.ticket.findMany({
     where: {
-      status: { in: ['RESOLVED', 'CLOSED'] },
       attachmentsCleanedAt: null,
+      OR: [
+        { status: 'CLOSED' },
+        { status: 'RESOLVED', updatedAt: { lt: resolvedTicketCutoff(now) } },
+      ],
     },
     select: { id: true },
     take: batchSize,
