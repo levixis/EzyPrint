@@ -48,6 +48,7 @@ jest.mock('../services/notify.service', () => ({
 }));
 
 import { settleClaimedRefund } from '../services/refund.service';
+import { resolveRefundSchema } from '../validators/schemas';
 
 /**
  * A claim carried to PROCESSING_REFUND, whose gateway call comes back
@@ -332,5 +333,45 @@ describe('Retrying a refund', () => {
     await settle();
 
     expect(global.fetch).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The endpoint no longer takes an amount.
+ *
+ * `resolveRefundSchema` accepted a partial `refundAmount` that the rest of the
+ * system could not honour: the order was marked fully REFUNDED whatever came
+ * back, revenue lost the whole page cost, and the remainder could never be
+ * refunded afterwards because `RefundRequest.orderId` is unique and the ledger
+ * event id keys on an attempt number that only advances on a gateway failure.
+ *
+ * Nothing in the app ever sent one — every UI reference reads it back for
+ * display — so removing it closes a state that was only reachable by hand.
+ */
+describe('resolveRefundSchema', () => {
+  const parse = (body: Record<string, unknown>) =>
+    resolveRefundSchema.safeParse({ body });
+
+  const valid = { action: 'APPROVE', otp: '123456' };
+
+  test('an ordinary approval still parses', () => {
+    expect(parse(valid).success).toBe(true);
+  });
+
+  test('a refundAmount is stripped rather than honoured', () => {
+    // Zod strips unknown keys, and `validate` writes the parsed body back — so
+    // a caller sending one gets a full refund, not a partial one.
+    const result = resolveRefundSchema.safeParse({ body: { ...valid, refundAmount: 100 } });
+
+    expect(result.success).toBe(true);
+    expect(result.success && 'refundAmount' in result.data.body).toBe(false);
+  });
+
+  test('the OTP is still required', () => {
+    expect(parse({ action: 'APPROVE' }).success).toBe(false);
+  });
+
+  test('a denial still parses', () => {
+    expect(parse({ action: 'DENY', otp: '123456', adminNote: 'not eligible' }).success).toBe(true);
   });
 });

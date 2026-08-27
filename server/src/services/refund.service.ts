@@ -214,17 +214,22 @@ export async function settleClaimedRefund(
   /**
    * Whether this refund returns the whole order, or only part of it.
    *
-   * The admin resolve route accepts a partial `refundAmount`, and the order was
-   * promoted to REFUNDED regardless — so a ₹100 refund on a ₹500 order left both
-   * dashboards saying the student had their money back while ₹400 was kept, and
-   * dropped the order's entire page cost out of the shop's revenue while the
-   * ledger had only debited the ₹100 share. Two screens and the books
-   * disagreeing about one order.
+   * No endpoint here issues a partial refund any more — `resolveRefundSchema`
+   * stopped accepting an amount, because the rest of the system could not
+   * honour one. This guard is not left over from that; it covers the case that
+   * remains.
    *
-   * A partial refund therefore leaves the order in whatever terminal state it
-   * already holds. `refundAmount` on the order records how much came back, which
-   * is the honest answer, and `getShopAggregate` nets the ledger deduction off
-   * revenue rather than discarding the order.
+   * A refund issued straight from the Razorpay dashboard can be partial, and
+   * `applyRefundProcessed` writes whatever the gateway reports onto the order.
+   * Promoting to REFUNDED regardless is what made a ₹100 refund on a ₹500 order
+   * tell both dashboards the student had their money back while ₹400 was kept,
+   * and drop the order's whole page cost out of revenue while the ledger had
+   * debited only the ₹100 share.
+   *
+   * So a partial refund leaves the order in whatever terminal state it already
+   * holds. `refundAmount` on the order records how much came back, which is the
+   * honest answer, and `getShopAggregate` nets the ledger deduction off revenue
+   * rather than discarding the order.
    */
   const isFullRefund = amount >= request.order.totalPrice;
 

@@ -173,7 +173,7 @@ router.post('/:id/escalate', authenticate, authorize('STUDENT'), async (req, res
 // Admin resolves
 router.post('/:id/resolve', authenticate, authorize('ADMIN'), validate(resolveRefundSchema), async (req, res, next) => {
   try {
-    const { action, adminNote, refundAmount, otp } = req.body; // action: 'APPROVE' | 'DENY'
+    const { action, adminNote, otp } = req.body; // action: 'APPROVE' | 'DENY'
     const id = req.params.id as string;
     if (!req.user) throw ApiError.unauthorized();
 
@@ -204,15 +204,15 @@ router.post('/:id/resolve', authenticate, authorize('ADMIN'), validate(resolveRe
       );
     }
 
-    const requestedAmount = refundAmount || initialRequest.order.totalPrice;
-    if (action === 'APPROVE') {
-      if (requestedAmount > initialRequest.order.totalPrice) {
-        throw ApiError.badRequest('Refund cannot exceed order total');
-      }
-      if (initialRequest.status === 'PROCESSING_REFUND' && initialRequest.refundAmount && initialRequest.refundAmount !== requestedAmount) {
-        throw ApiError.badRequest('Cannot change refund amount for a request that is already processing');
-      }
-    }
+    // A refund returns the whole order. The endpoint no longer takes an amount —
+    // see `resolveRefundSchema` for why — so the only question left is whether
+    // this request already carries one.
+    //
+    // It might: a re-drive of a stalled PROCESSING_REFUND must keep the sum
+    // already sent to the gateway, or the Razorpay idempotency key and the
+    // amount behind it stop agreeing. Falling back to the order total covers
+    // every fresh approval.
+    const requestedAmount = initialRequest.refundAmount ?? initialRequest.order.totalPrice;
 
     // Step-up verification, scoped to this refund request. Both branches move
     // money or close out a student's claim.
