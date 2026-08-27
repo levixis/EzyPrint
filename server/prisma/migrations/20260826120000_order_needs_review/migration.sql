@@ -1,0 +1,41 @@
+-- ─────────────────────────────────────────────────────────────
+-- Give "this order needs a human" its own columns.
+--
+-- Two additive, nullable columns. No backfill, no rewrite, no index, no
+-- constraint, no default. Nothing existing is read or changed, so this cannot
+-- affect an order, a balance, a payment or an auth record, and a currently
+-- deployed server — which does not know the columns exist — is unaffected by it.
+--
+-- WHY
+--
+-- `flagForReview` marks an order that needs looking at and alerts the admins
+-- once. The "once" was implemented by writing the sentinel 'amount_mismatch'
+-- into `paymentVerifiedVia` and refusing to write it twice.
+--
+-- But `paymentVerifiedVia` is provenance: it records *which of the three paths*
+-- confirmed a payment — 'signature', 'webhook' or 'recovery'. Reusing it as a
+-- flag meant flagging an already-fulfilled order overwrote that answer. The
+-- column that says how a payment was verified was therefore destroyed for
+-- precisely the orders someone was about to investigate.
+--
+-- The dedup shape is unchanged and moves onto `needsReviewReason`: an order is
+-- re-flagged only when the reason differs from the one already recorded, so the
+-- reconciliation sweep revisiting the same stuck order every fifteen minutes
+-- stays silent while a genuinely different problem still announces.
+--
+-- NULL SEMANTICS
+--
+-- Null means "not flagged". Every existing row carries null, which is correct:
+-- an order flagged before this shipped recorded that fact by overwriting
+-- `paymentVerifiedVia`, and inventing a `flaggedForReviewAt` for it now would
+-- be manufacturing a timestamp rather than recording one. Those rows are still
+-- identifiable by `paymentVerifiedVia = 'amount_mismatch'`, and are the reason
+-- that value is left in place rather than migrated away.
+--
+-- The practical consequence is that an order flagged before this deploy may be
+-- flagged once more after it. One duplicate alert per already-flagged order, at
+-- most, and only for orders a human was already meant to be looking at.
+-- ─────────────────────────────────────────────────────────────
+
+ALTER TABLE "orders" ADD COLUMN "needsReviewReason" TEXT;
+ALTER TABLE "orders" ADD COLUMN "flaggedForReviewAt" TIMESTAMP(3);
