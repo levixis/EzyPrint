@@ -354,11 +354,28 @@ export async function updateTicketStatus(
     actorUserId: changedByUserId,
   });
 
-  // The dispute is over, so the evidence attached to it can go. The
-  // conversation stays — that is the record of what was decided. Fired after
-  // the commit so a storage failure cannot undo the resolution; the sweep
-  // retries anything left behind.
-  if (newStatus === 'RESOLVED' || newStatus === 'CLOSED') {
+  /**
+   * The dispute is over, so the evidence attached to it can go. The
+   * conversation stays — that is the record of what was decided. Fired after
+   * the commit so a storage failure cannot undo the resolution; the sweep
+   * retries anything left behind.
+   *
+   * Which states count as over is narrower than it was. This fired on any
+   * RESOLVED, and a shop may set RESOLVED (see TICKET_TRANSITIONS above) — so
+   * the subject of a complaint could delete the complainant's photographs, and
+   * with them the related order's documents, by pressing one button. That
+   * contradicted this file's own stated rule twenty lines up: *a party to a
+   * dispute should not be able to file it away*, which is exactly why a shop
+   * may not CLOSE.
+   *
+   * So: CLOSED always, because only the raiser or an admin can set it and it
+   * means the complainant is satisfied. RESOLVED only from an admin, who has no
+   * stake in the outcome. A shop marking RESOLVED now starts the grace period
+   * in `cleanup.service` instead, which the raiser can interrupt by reopening.
+   */
+  const resolvedByNeutralParty = newStatus === 'RESOLVED' && changedByUserType === 'ADMIN';
+
+  if (newStatus === 'CLOSED' || resolvedByNeutralParty) {
     purgeTicketAttachments(ticketId).catch((error) => {
       console.error(`[ticket] attachment cleanup failed for ${ticketId}, leaving it to the sweep:`, error);
     });

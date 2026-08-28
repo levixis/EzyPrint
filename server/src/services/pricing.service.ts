@@ -40,7 +40,7 @@ const DOUBLE_SIDED_SHEET_MULTIPLIER = 1.5;
 const STUDENT_PASS_FEE_WAIVER_CEILING = 3000;
 
 /** How long a Student Pass lasts from activation. */
-const PASS_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
+export const PASS_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
 
 /**
  * Whether a Student Pass is still live.

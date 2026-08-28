@@ -55,6 +55,22 @@ function refundGatewayKey(requestId: string, attempt: number): string {
   return attempt <= 1 ? requestId : `${requestId}-retry-${attempt}`;
 }
 
+/**
+ * The part of Razorpay's refund response this reads.
+ *
+ * Narrow on purpose, like `RazorpayPayment` in payment.service: naming only the
+ * fields we depend on means a change to any of them is a compile error here
+ * rather than an `undefined` that quietly reads as a pending refund.
+ *
+ * `id` is not optional because a 2xx without one is not a response this code can
+ * act on — it is what gets stored as the refund to reconcile against later.
+ */
+interface RazorpayRefundResponse {
+  id: string;
+  status?: string;
+  error?: { description?: string };
+}
+
 async function callRazorpayRefund(
   paymentId: string,
   amountPaise: number,
@@ -74,7 +90,7 @@ async function callRazorpayRefund(
     body: JSON.stringify({ amount: amountPaise, notes: { orderId } }),
   });
 
-  const data = await response.json() as any;
+  const data = await response.json() as RazorpayRefundResponse;
 
   if (!response.ok) {
     // Leaving the request in PROCESSING_REFUND is deliberate: the money may or
@@ -211,6 +227,28 @@ export async function settleClaimedRefund(
   /** True once the money is known to have moved, not merely to have been sent. */
   const isConfirmed = finalStatus !== 'PROCESSING_REFUND';
 
+  /**
+   * Whether this refund returns the whole order, or only part of it.
+   *
+   * No endpoint here issues a partial refund any more — `resolveRefundSchema`
+   * stopped accepting an amount, because the rest of the system could not
+   * honour one. This guard is not left over from that; it covers the case that
+   * remains.
+   *
+   * A refund issued straight from the Razorpay dashboard can be partial, and
+   * `applyRefundProcessed` writes whatever the gateway reports onto the order.
+   * Promoting to REFUNDED regardless is what made a ₹100 refund on a ₹500 order
+   * tell both dashboards the student had their money back while ₹400 was kept,
+   * and drop the order's whole page cost out of revenue while the ledger had
+   * debited only the ₹100 share.
+   *
+   * So a partial refund leaves the order in whatever terminal state it already
+   * holds. `refundAmount` on the order records how much came back, which is the
+   * honest answer, and `getShopAggregate` nets the ledger deduction off revenue
+   * rather than discarding the order.
+   */
+  const isFullRefund = amount >= request.order.totalPrice;
+
   const outboxIds: string[] = [];
   // Only the delivery that actually moved the row may announce it — a repeat
   // delivery reaches the guard below and must stay silent rather than tell the
@@ -253,10 +291,13 @@ export async function settleClaimedRefund(
       where: { id: request.orderId },
       data: {
         // `setOrderRefunded` controls the *status*, but only once the refund is
-        // confirmed. A cancellation keeps CANCELLED regardless — it is the more
-        // meaningful record of why the order ended, and VALID_TRANSITIONS has
-        // no CANCELLED -> REFUNDED edge anyway.
-        ...(options.setOrderRefunded && isConfirmed ? { status: 'REFUNDED' as const } : {}),
+        // confirmed and only when it returns the whole order. A cancellation
+        // keeps CANCELLED regardless — it is the more meaningful record of why
+        // the order ended, and VALID_TRANSITIONS has no CANCELLED -> REFUNDED
+        // edge anyway.
+        ...(options.setOrderRefunded && isConfirmed && isFullRefund
+          ? { status: 'REFUNDED' as const }
+          : {}),
         // Falls back to the request id when nothing went through the gateway,
         // so an offline settlement is still recorded as settled rather than
         // reading as unrefunded.
@@ -593,6 +634,30 @@ export async function shopRefundOrder(params: {
 
     const nextStatus: RefundRequestStatus = escalationReason ? 'APPROVED_BY_SHOP' : 'PROCESSING_REFUND';
 
+    /**
+     * Stamp the attempt's start time here, inside the lock, when this refund is
+     * actually going ahead.
+     *
+     * The count above reads `adminResolvedAt`, and this transaction used not to
+     * write it — `settleClaimedRefund` did, in a *different* transaction, after
+     * the Razorpay round trip. So the advisory lock was serialising a read of a
+     * value written outside it: every request that started while an earlier one
+     * was still at the gateway counted zero prior refunds, and ten fired
+     * together all passed a cap none of them could see the other against. A cap
+     * that only holds when requests happen to be sequential is not a cap.
+     *
+     * Not stamped when escalating: `APPROVED_BY_SHOP` is a request for an admin
+     * to decide, and nothing has been resolved. It is excluded from the counted
+     * statuses above for the same reason.
+     *
+     * `settleClaimedRefund` still writes it on success, moving it forward by the
+     * gateway round trip. Both values land on the same IST day, which is the
+     * only granularity anything here reads it at, and the earlier one is the
+     * more honest answer to `reconcileStuckRefunds`'s question — "how long has
+     * this attempt been in flight".
+     */
+    const attemptStartedAt = escalationReason ? {} : { adminResolvedAt: new Date() };
+
     // Take over an open claim if the student already raised one, so a shop
     // approving and a student requesting cannot produce two rows for one order
     // — `orderId` is unique, and a settled claim is never reopened.
@@ -603,6 +668,7 @@ export async function shopRefundOrder(params: {
         shopResponse: reason,
         shopRespondedAt: new Date(),
         refundAmount: amount,
+        ...attemptStartedAt,
       },
     });
 
@@ -622,6 +688,7 @@ export async function shopRefundOrder(params: {
           shopRespondedAt: new Date(),
           refundAmount: amount,
           status: nextStatus,
+          ...attemptStartedAt,
         },
         select: { id: true },
       });

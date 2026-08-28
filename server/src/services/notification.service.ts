@@ -1,6 +1,7 @@
 import { prisma } from '../utils/prisma';
 import { ApiError } from '../utils/ApiError';
 import type { NotificationType } from '@prisma/client';
+import { env } from '../config/env';
 
 /**
  * Notification Service — in-app notifications for users.
@@ -81,4 +82,26 @@ export async function markAllAsRead(userId: string) {
     data: { read: true },
   });
   return { markedCount: result.count };
+}
+
+/**
+ * Delete read notifications past the retention window.
+ *
+ * This table is written by every `notify.*` call and was deleted from only when
+ * a user's account was removed, so it grew monotonically with platform activity
+ * and nothing was watching it.
+ *
+ * Read ones only. An unread notification is something the recipient has not seen
+ * yet, and ageing it out silently is worse than keeping the row — the whole
+ * point of the record is that it survives until someone looks at it. What is
+ * being reclaimed here is the far larger population of notifications that have
+ * already done their job; the durable account of what happened lives in the
+ * order, ledger entry or ticket each one points at.
+ */
+export async function sweepReadNotifications(now: Date = new Date()): Promise<number> {
+  const cutoff = new Date(now.getTime() - env.NOTIFICATION_RETENTION_DAYS * 24 * 60 * 60 * 1000);
+  const result = await prisma.notification.deleteMany({
+    where: { read: true, createdAt: { lt: cutoff } },
+  });
+  return result.count;
 }

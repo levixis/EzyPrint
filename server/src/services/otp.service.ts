@@ -122,3 +122,26 @@ export async function consumeOtp(userId: string, actionId: string, otp: string):
   const remaining = MAX_FAILED_ATTEMPTS - updated.failedAttempts;
   throw ApiError.badRequest(`Invalid verification code. ${remaining} attempt(s) remaining.`);
 }
+
+/**
+ * Delete verification codes nobody used.
+ *
+ * A code is removed when it is consumed, and when an expired one is presented —
+ * but a code that is issued and simply never used is removed by nothing. The
+ * `@@unique([userId, actionId])` pair bounds this per user *per action*, and the
+ * action ids that matter are per record (`payout_<id>`, `refund_<id>`), so the
+ * table grows with payout and refund volume rather than with user count.
+ *
+ * Only rows past their expiry, so a live code is never taken from under someone
+ * mid-verification. A lockout row is kept until `lockUntil` passes as well —
+ * deleting it early would hand a locked-out caller a clean slate.
+ */
+export async function sweepExpiredOtps(now: Date = new Date()): Promise<number> {
+  const result = await prisma.adminOtp.deleteMany({
+    where: {
+      expiresAt: { lt: now },
+      OR: [{ lockUntil: null }, { lockUntil: { lt: now } }],
+    },
+  });
+  return result.count;
+}

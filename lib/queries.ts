@@ -238,11 +238,23 @@ export const paymentApi = {
     orderId: string;
   }) => api.post<{ verified: boolean }>('/payments/verify', data),
 
-  /** Student Pass has no local order row, so it uses its own pair of endpoints. */
+  /**
+   * Open — or re-open — a Student Pass checkout.
+   *
+   * `paid` comes back when the server found an earlier checkout the student had
+   * actually paid for and applied it, rather than minting a second one. The
+   * caller must show that instead of opening a gateway sheet, exactly as the
+   * order path does — see `createOrder`'s `paid` handling in StudentOrderList.
+   */
   createPassOrder: () =>
-    api.post<{ razorpayOrderId: string; amount: number; currency: string; key: string }>(
-      '/payments/pass/create-order'
-    ),
+    api.post<{
+      razorpayOrderId: string;
+      amount: number;
+      currency: string;
+      key: string;
+      paid?: boolean;
+      message?: string;
+    }>('/payments/pass/create-order'),
 
   verifyPass: (data: {
     razorpay_order_id: string;

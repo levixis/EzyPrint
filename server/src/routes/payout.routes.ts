@@ -48,18 +48,44 @@ async function tellShop(
 const rupees = (paise: number) => `₹${(paise / 100).toFixed(2)}`;
 
 /**
- * Payout states a cancellation may act on.
+ * Payout states a cancellation may act on, **per role**.
  *
- * PENDING — the shop or an admin changing their mind before approval.
- * DISPUTED — the shop has reported the money never arrived, and returning the
- *   reservation to their balance is the resolution the admin dashboard offers
- *   on that row. Only PENDING was allowed, so that button always failed.
+ * The two entries are not the same kind of act, and that is why they are no
+ * longer one list.
  *
- * Deliberately excludes IN_TRANSIT and PAID: money has left, or is said to
- * have left, and crediting the balance back while it is in flight would pay
- * the shop twice.
+ * PENDING is housekeeping. The reservation still holds the money — nothing has
+ * left — so cancelling is the shop withdrawing its own un-approved request, and
+ * the compensating credit is the exact reversal of the debit taken at request
+ * time. Either side may do it.
+ *
+ * DISPUTED is a *judgement*. It is only reachable from PAID or IN_TRANSIT, so an
+ * admin has already sent the money; the compensating credit is therefore not a
+ * reversal but a decision that the transfer never arrived and the shop should be
+ * paid again. That decision cannot belong to the party being paid.
+ *
+ * Both lists exclude IN_TRANSIT and PAID: money has left, or is said to have
+ * left, and crediting the balance back while it is in flight pays the shop twice.
+ *
+ * Exported because this is an access-control decision and it is worth being able
+ * to assert it directly — the previous test asserted a copy of the list declared
+ * in the test file, which cannot fail when the route changes.
  */
-const CANCELLABLE_PAYOUT_STATUSES: PayoutStatus[] = ['PENDING', 'DISPUTED'];
+export const CANCELLABLE_PAYOUT_STATUSES_BY_ROLE: Record<string, PayoutStatus[]> = {
+  SHOP_OWNER: ['PENDING'],
+  ADMIN: ['PENDING', 'DISPUTED'],
+};
+
+/**
+ * Which payout states `userType` may cancel. Unknown roles cancel nothing.
+ *
+ * The route is mounted `authorize('SHOP_OWNER', 'ADMIN')`, so an unknown role
+ * cannot reach it — the empty default is there so that adding a third role to
+ * that list is a route that refuses rather than one that inherits the admin's
+ * powers by omission.
+ */
+export function cancellablePayoutStatusesFor(userType: string | undefined): PayoutStatus[] {
+  return CANCELLABLE_PAYOUT_STATUSES_BY_ROLE[userType ?? ''] ?? [];
+}
 
 const router = Router();
 
@@ -277,6 +303,18 @@ router.post('/:id/approve', authenticate, authorize('ADMIN'), sensitiveLimiter, 
     const { adminNote, otp } = req.body;
     const payoutId = req.params.id as string;
 
+    // State first, then the code — the ordering `/cancel` and `/mark-paid`
+    // already use. `consumeOtp` deletes the code atomically and cannot be rolled
+    // back, so approving a payout that is not PENDING used to burn the OTP on a
+    // refusal and send the admin back for a fresh email to fail identically.
+    const existing = await prisma.payout.findUnique({ where: { id: payoutId } });
+    if (!existing) throw ApiError.notFound('Payout not found');
+    if (existing.status !== 'PENDING') {
+      throw ApiError.badRequest(
+        `This payout is ${existing.status.toLowerCase().replace(/_/g, ' ')}, not awaiting approval.`
+      );
+    }
+
     // Step-up verification. Approving a payout moves real money, so it must not
     // rest on session auth alone.
     await otpService.consumeOtp(req.user.userId, `payout_${payoutId}`, otp);
@@ -394,8 +432,19 @@ router.post('/:id/reject', authenticate, authorize('ADMIN'), sensitiveLimiter, v
   try {
     if (!req.user) throw ApiError.unauthorized();
     const { adminNote, otp } = req.body;
+    const payoutId = req.params.id as string;
 
-    await otpService.consumeOtp(req.user.userId, `payout_${req.params.id}`, otp);
+    // Checked before the code is spent, like every other OTP-gated route here.
+    const existing = await prisma.payout.findUnique({ where: { id: payoutId } });
+    if (!existing) throw ApiError.notFound('Payout not found');
+    if (existing.status !== 'PENDING') {
+      throw ApiError.badRequest(
+        `This payout is ${existing.status.toLowerCase().replace(/_/g, ' ')}, not awaiting approval, ` +
+        `so it cannot be rejected.`
+      );
+    }
+
+    await otpService.consumeOtp(req.user.userId, `payout_${payoutId}`, otp);
 
     const outboxIds: string[] = [];
 
@@ -462,9 +511,40 @@ router.post('/:id/cancel', authenticate, authorize('SHOP_OWNER', 'ADMIN'), sensi
       }
     }
 
-    if (!CANCELLABLE_PAYOUT_STATUSES.includes(existing.status)) {
+    // Per role, not per payout. A shop withdrawing its own un-approved request is
+    // housekeeping; resolving a DISPUTED payout is a decision that money already
+    // sent never arrived, and it credits the shop a second time for the same
+    // payout. Granting the second to the party being paid turned
+    // request -> approve -> dispute -> cancel -> request into a way to be paid
+    // twice, with no admin involved at any step.
+    const cancellable = cancellablePayoutStatusesFor(req.user.userType);
+
+    if (!cancellable.includes(existing.status)) {
+      const state = existing.status.toLowerCase().replace(/_/g, ' ');
       throw ApiError.badRequest(
-        `A payout that is ${existing.status.toLowerCase().replace(/_/g, ' ')} cannot be cancelled.`
+        existing.status === 'DISPUTED'
+          ? 'A disputed payout is resolved by an admin, not cancelled here. ' +
+            'We have your report and someone is looking at it.'
+          : `A payout that is ${state} cannot be cancelled.`
+      );
+    }
+
+    // The reservation says whether money has actually left, independently of the
+    // payout's own status. PENDING means the debit is still held against this
+    // payout and cancelling reverses it; anything else means it was approved and
+    // sent, so the credit below is a re-payment rather than a reversal. Checked
+    // rather than inferred from the status, because these two facts are written
+    // by different statements and a payout row that disagrees with its own
+    // reservation is exactly the case worth refusing.
+    const reservation = await prisma.ledgerEntry.findUnique({
+      where: { eventId: `payout:${payoutId}:reservation` },
+      select: { status: true },
+    });
+
+    if (reservation?.status !== 'PENDING' && req.user.userType !== 'ADMIN') {
+      throw ApiError.forbidden(
+        'This payout has already been sent, so it cannot be cancelled here. ' +
+        'If the money has not arrived, report it and an admin will resolve it.'
       );
     }
 
@@ -482,7 +562,7 @@ router.post('/:id/cancel', authenticate, authorize('SHOP_OWNER', 'ADMIN'), sensi
       // transaction, so an admin approving in the meantime must lose the race
       // rather than have their approval silently cancelled.
       const updated = await tx.payout.updateMany({
-        where: { id: payout.id, status: { in: CANCELLABLE_PAYOUT_STATUSES } },
+        where: { id: payout.id, status: { in: cancellable } },
         data: { status: 'CANCELLED' }
       });
       if (updated.count === 0) throw ApiError.badRequest('This payout was changed by someone else just now. Reload and try again.');

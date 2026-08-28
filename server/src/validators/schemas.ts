@@ -453,6 +453,33 @@ export const respondRefundSchema = z.object({
   }),
 });
 
+/**
+ * Resolving a refund. Deliberately no `refundAmount`.
+ *
+ * The field used to accept a partial sum, and the rest of the system could not
+ * honour one. `settleClaimedRefund` marked the order fully REFUNDED whatever
+ * came back, so a ₹100 refund on a ₹500 order told both dashboards the student
+ * had their money while ₹400 was kept; `getShopAggregate` dropped the order's
+ * whole page cost out of revenue while the ledger had debited only the ₹100
+ * share; and the remaining ₹400 could never be refunded afterwards, because
+ * `RefundRequest.orderId` is unique and the ledger event id keys on an attempt
+ * number that only advances on a gateway *failure*, so a top-up would collide
+ * with the first refund's entry.
+ *
+ * Those first two are fixed. The third needs a refund to have a row of its own
+ * — a `RefundDisbursement` child of the request, with the ledger key hanging
+ * off it — which is a product decision about whether partial refunds are
+ * offered at all, not a bug fix.
+ *
+ * Until that decision is made the honest thing is to stop accepting an input
+ * the system cannot honour. Nothing in the app ever sent one: every UI
+ * reference to `refundAmount` reads it back for display. So this removes an
+ * inconsistent state that was only ever reachable by hand-crafting an API call.
+ *
+ * A refund issued straight from the Razorpay dashboard can still be partial, and
+ * the capture path handles that correctly — see `isFullRefund` in
+ * `settleClaimedRefund`.
+ */
 export const resolveRefundSchema = z.object({
   body: z.object({
     action: z.enum(['APPROVE', 'DENY']),
@@ -460,7 +487,6 @@ export const resolveRefundSchema = z.object({
     // one-time code like every other money-moving admin action.
     otp: z.string().regex(/^\d{6}$/, 'Enter the 6-digit verification code'),
     adminNote: z.string().max(1000).optional(),
-    refundAmount: z.number().int('Amount must be a whole number of paise').positive().optional(),
   }),
 });
 

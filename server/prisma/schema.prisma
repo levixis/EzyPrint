@@ -132,6 +132,21 @@ enum RefundRequestStatus {
   REFUND_FAILED
 }
 
+/// Lifecycle of one Student Pass checkout.
+enum StudentPassPurchaseStatus {
+  /// Minted at the gateway, awaiting payment. At most one per user — see the
+  /// partial unique index in the migration.
+  OPEN
+  /// Captured and applied to the student's pass.
+  PAID
+  /// Expired without payment, or given up on. The row is kept, not deleted:
+  /// a late capture must still find the purchase it belongs to.
+  ABANDONED
+  /// Captured but refused — the sum did not match the price. Money moved and
+  /// nothing was delivered, so this needs a human.
+  REFUSED
+}
+
 enum ReactivationRequestStatus {
   pending
   approved
@@ -157,8 +172,14 @@ model User {
 
   // Student Pass
   hasStudentPass         Boolean   @default(false)
+  /// Start of the 30-day window currently in force.
+  ///
+  /// May be in the *future*: a second purchase while a pass is live stacks, so
+  /// the new window begins where the live one ends. `isStudentPassActive` asks
+  /// `now < activatedAt + PASS_DURATION_MS`, which stays true across the gap.
   studentPassActivatedAt DateTime?
   studentPassPaymentId   String?
+
 
   // Push notification tokens
   fcmTokens String[] @default([])
@@ -179,6 +200,7 @@ model User {
   refundRequests    RefundRequest[] @relation("RefundStudent")
   reactivationRequests ReactivationRequest[]
   refreshTokens     RefreshToken[]
+  passPurchases     StudentPassPurchase[]
   referralCodesIssued ReferralCode[] @relation("ReferralCreator")
   referralCodeUsed    ReferralCode?  @relation("ReferralUser")
 
@@ -304,7 +326,25 @@ model Order {
   razorpayOrderId   String? @unique
   razorpayPaymentId String?
   paymentAttemptedAt DateTime?
+  /// Which path confirmed this payment: 'signature', 'webhook', 'recovery', or
+  /// 'signature_mismatch' / 'webhook_failed' when one refused it.
+  ///
+  /// Provenance only. `flagForReview` used to overwrite this with
+  /// 'amount_mismatch' to dedup its own alert, which destroyed the record of how
+  /// a payment was verified for exactly the orders under investigation. The flag
+  /// has its own columns below now.
   paymentVerifiedVia String?
+
+  /// Why this order needs a human, in the words the alert used.
+  ///
+  /// Doubles as the alert's dedup key: the reconciliation sweep revisits the same
+  /// stuck order every fifteen minutes, and re-mailing the admins each time is
+  /// how an alert becomes something you mute. A *different* reason still
+  /// announces, because a second, distinct problem on one order is news.
+  needsReviewReason String?
+  /// When it was first flagged. Never cleared automatically — an operator
+  /// resolving the underlying problem is what ends it.
+  flaggedForReviewAt DateTime?
 
   /// Hash of the file set this order's price was computed from, stamped at the
   /// moment the Razorpay order is created and never rewritten.
@@ -796,6 +836,67 @@ model WebhookEvent {
   @@index([processed, attempts])
   @@index([razorpayOrderId])
   @@map("webhook_events")
+}
+
+/// One Student Pass checkout.
+///
+/// A pass purchase used to have no row at all. A print order is protected from
+/// being paid for twice by two things — the compare-and-swap on
+/// `orders.paymentAttemptedAt` and the unique index on
+/// `orders.razorpayOrderId` — and a pass had neither, because there was nothing
+/// to put them on. The only guard was "is a pass currently active", which is
+/// false for every first purchase and every renewal after expiry, so two
+/// checkouts started in that state both minted a real gateway order and both
+/// could be captured.
+///
+/// This is that missing row, and it carries all four things the absence cost:
+///
+///  - a partial unique index on `userId WHERE status = 'OPEN'`, so a second
+///    open checkout is refused by Postgres rather than by a timer;
+///  - `razorpayOrderId @unique`, so one gateway order maps to one purchase;
+///  - a durable record of *every* payment, so a second capture can no longer
+///    overwrite the first beyond recovery; and
+///  - something for `auditCapturedPayments` to check a pass payment against,
+///    which is why it no longer has to skip them.
+model StudentPassPurchase {
+  id     String                    @id @default(cuid())
+  userId String
+  status StudentPassPurchaseStatus @default(OPEN)
+
+  /// Null only between claiming the checkout and the gateway answering. Unique
+  /// so one Razorpay order can never belong to two purchases; Postgres permits
+  /// many NULLs in a unique index, so in-flight rows are unaffected.
+  razorpayOrderId   String? @unique
+  /// Set when the payment is captured. Unique for the same reason.
+  razorpayPaymentId String? @unique
+  /// What the pass cost when this checkout was minted. Read back at capture, so
+  /// a price change mid-checkout is judged against what the student was quoted
+  /// rather than against what the price happens to be when the webhook lands.
+  amountPaise       Int
+
+  /// When an unpaid checkout stops holding the one open slot.
+  expiresAt DateTime
+  /// Start of the pass window this purchase bought. Null until it is applied.
+  appliedFrom DateTime?
+  /// Why a captured purchase was refused, for the human who has to sort it out.
+  refusedReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // ── Relations ──
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status])
+  /// Drives the sweep that abandons checkouts nobody paid for.
+  @@index([status, expiresAt])
+  @@map("student_pass_purchases")
+  // A partial unique index enforces one *open* checkout per user:
+  //   CREATE UNIQUE INDEX ... ON ("userId") WHERE "status" = 'OPEN'
+  // Declared in migration 20260827090000_student_pass_purchase because Prisma's
+  // schema language cannot express a partial index. Resolved purchases are
+  // deliberately unconstrained — a student may buy a pass every month for
+  // years, and each of those is a record worth keeping.
 }
 
 /// Earnings report metadata (the actual report files are stored in S3/R2)
