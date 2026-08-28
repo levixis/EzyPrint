@@ -55,6 +55,22 @@ function refundGatewayKey(requestId: string, attempt: number): string {
   return attempt <= 1 ? requestId : `${requestId}-retry-${attempt}`;
 }
 
+/**
+ * The part of Razorpay's refund response this reads.
+ *
+ * Narrow on purpose, like `RazorpayPayment` in payment.service: naming only the
+ * fields we depend on means a change to any of them is a compile error here
+ * rather than an `undefined` that quietly reads as a pending refund.
+ *
+ * `id` is not optional because a 2xx without one is not a response this code can
+ * act on — it is what gets stored as the refund to reconcile against later.
+ */
+interface RazorpayRefundResponse {
+  id: string;
+  status?: string;
+  error?: { description?: string };
+}
+
 async function callRazorpayRefund(
   paymentId: string,
   amountPaise: number,
@@ -74,7 +90,7 @@ async function callRazorpayRefund(
     body: JSON.stringify({ amount: amountPaise, notes: { orderId } }),
   });
 
-  const data = await response.json() as any;
+  const data = await response.json() as RazorpayRefundResponse;
 
   if (!response.ok) {
     // Leaving the request in PROCESSING_REFUND is deliberate: the money may or

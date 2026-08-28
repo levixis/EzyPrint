@@ -9,6 +9,7 @@
 import { computeBalanceMovement, shopShareOfRefund } from '../services/ledger.service';
 import { computeAvailableAt } from '../services/settlement.service';
 import { env } from '../config/env';
+import type { Prisma } from '@prisma/client';
 
 /** A shop with no money anywhere. Amounts are paise. */
 const empty = { pendingBalance: 0, ledgerBalance: 0, debtAmount: 0 };
@@ -203,16 +204,22 @@ describe('Shop liability for a refund', () => {
   const txWithEarning = (
     amount: number | null,
     ledger: { deducted?: number; reversed?: number } = {}
-  ) => ({
-    ledgerEntry: {
-      findUnique: async () => (amount === null ? null : { amount }),
-      aggregate: async ({ where }: { where: { type: string } }) => ({
-        _sum: {
-          amount: where.type === 'REFUND_DEDUCTION' ? ledger.deducted ?? 0 : ledger.reversed ?? 0,
-        },
-      }),
-    },
-  });
+  ) =>
+    // Cast because this is a fake: `shopShareOfRefund` takes a real
+    // `Prisma.TransactionClient` — it used to take `any`, which let a stub like
+    // this pass silently and let the production signature say nothing about what
+    // it needs. The two reads below are the whole of what it touches, and saying
+    // so out loud here is better than loosening the type it is called with.
+    ({
+      ledgerEntry: {
+        findUnique: async () => (amount === null ? null : { amount }),
+        aggregate: async ({ where }: { where: { type: string } }) => ({
+          _sum: {
+            amount: where.type === 'REFUND_DEDUCTION' ? ledger.deducted ?? 0 : ledger.reversed ?? 0,
+          },
+        }),
+      },
+    } as unknown as Prisma.TransactionClient);
 
   test('a full refund debits the shop only its earnings, not the base fee', async () => {
     // Real production order: page=300 + base=200 = total=500.

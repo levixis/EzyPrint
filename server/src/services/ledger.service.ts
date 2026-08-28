@@ -1,7 +1,7 @@
 import { prisma } from '../utils/prisma';
 import { ApiError } from '../utils/ApiError';
 import { enqueueShopEvent, publishQueued, type RealtimeEventType } from './realtime.service';
-import type { LedgerEntryType, LedgerCounterparty, LedgerCreatedBy, LedgerEntryStatus } from '@prisma/client';
+import type { Prisma, LedgerEntryType, LedgerCounterparty, LedgerCreatedBy, LedgerEntryStatus } from '@prisma/client';
 
 /**
  * Ledger Service — financial tracking for shops.
@@ -119,7 +119,7 @@ function eventTypeFor(type: LedgerEntryType): RealtimeEventType {
  * compare-and-swap.
  */
 export async function shopShareOfRefund(
-  tx: any,
+  tx: Prisma.TransactionClient,
   orderId: string,
   refundAmount: number
 ): Promise<number> {
